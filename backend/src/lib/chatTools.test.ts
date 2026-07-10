@@ -11,6 +11,7 @@ import {
     fetchUserPdfAnnotations,
     resolveSearchDocumentIds,
     sanitizeAssistantVisibleText,
+    validateCitationContract,
     type DocIndex,
     type DocStore,
 } from "./chatTools";
@@ -285,6 +286,51 @@ test("extractAnnotations supports multiple refs and page ranges", () => {
   assert.equal(annotations[0].quote, "conditions precedent are listed");
   assert.equal(annotations[1].document_id, "document-b");
   assert.equal(annotations[1].filename, "shareholders-agreement.pdf");
+});
+
+test("citation contract fails closed on duplicate or out-of-order refs", () => {
+  const text = `Waterfall [3]. Legal uncertainty [2].
+
+<CITATIONS>
+[
+  {"ref":2,"doc_id":"doc-0","page":2,"quote":"uncertainty"},
+  {"ref":3,"doc_id":"doc-0","page":3,"quote":"waterfall"},
+  {"ref":2,"doc_id":"doc-0","page":3,"quote":"control"}
+]
+</CITATIONS>`;
+  const citations = [
+    { ref: 2, doc_id: "doc-0", page: 2, quote: "uncertainty" },
+    { ref: 3, doc_id: "doc-0", page: 3, quote: "waterfall" },
+    { ref: 2, doc_id: "doc-0", page: 3, quote: "control" },
+  ];
+
+  const result = validateCitationContract(text, citations, docIndex);
+
+  assert.deepEqual(result.citations, []);
+  assert.deepEqual(
+    result.errors.map((error) => error.code),
+    ["duplicate_ref", "invalid_ref_sequence"],
+  );
+});
+
+test("citation contract accepts exactly one sequential marker per source", () => {
+  const text = `Waterfall [1]. Control [2].
+
+<CITATIONS>
+[
+  {"ref":1,"doc_id":"doc-0","page":2,"quote":"waterfall"},
+  {"ref":2,"doc_id":"doc-0","page":3,"quote":"control"}
+]
+</CITATIONS>`;
+  const citations = [
+    { ref: 1, doc_id: "doc-0", page: 2, quote: "waterfall" },
+    { ref: 2, doc_id: "doc-0", page: 3, quote: "control" },
+  ];
+
+  const result = validateCitationContract(text, citations, docIndex);
+
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(result.citations, citations);
 });
 
 test("extractAnnotations ignores malformed citation blocks without crashing", () => {

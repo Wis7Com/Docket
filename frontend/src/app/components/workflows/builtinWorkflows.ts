@@ -31,11 +31,11 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         user_id: null,
         is_system: true,
         created_at: "",
-        title: "Issue Comparison Table",
+        title: "Issue-by-Issue Comparison",
         type: "assistant",
         practice: "General Transactions",
         prompt_md:
-            "## Issue Comparison Table\n\n" +
+            "## Issue-by-Issue Comparison\n\n" +
             "Compare two or more selected documents, or two sides' briefs, issue-by-issue. If it is unclear which documents or sides the user wants compared, ask once before proceeding.\n\n" +
             "Use this retrieval sequence:\n" +
             "1. Identify the comparison documents or sides from AVAILABLE DOCUMENTS or with list_documents.\n" +

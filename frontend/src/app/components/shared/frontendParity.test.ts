@@ -42,7 +42,7 @@ const annotationB: DocketCitationAnnotation = {
     "transfer restrictions begin[[PAGE_BREAK]]and continue after the break",
 };
 
-test("preprocessCitations preserves click-through citation metadata order", () => {
+test("preprocessCitations preserves click-through metadata and marks missing refs unresolved", () => {
   const citationsList: DocketCitationAnnotation[] = [];
   const rendered = preprocessCitations(
     "The borrower has a CP obligation [1, 2]. Missing refs stay visible [9].",
@@ -52,7 +52,7 @@ test("preprocessCitations preserves click-through citation metadata order", () =
 
   assert.equal(
     rendered,
-    "The borrower has a CP obligation `§0§`\u200B`§1§`\u200B. Missing refs stay visible [9].",
+    "The borrower has a CP obligation `§0§`\u200B`§1§`\u200B. Missing refs stay visible `§unresolved:9§`\u200B.",
   );
   assert.deepEqual(
     citationsList.map((ann) => ({
@@ -165,6 +165,42 @@ test("highlightQuote finds whitespace-normalized text across PDF text divs", asy
   assert.match(
     (textDivs[2] as unknown as FakeElement).innerHTML,
     /<span class="pdf-text-highlight">of authority\s*<\/span>/,
+  );
+});
+
+test("highlightQuote preserves Korean and compatibility characters", async () => {
+  const textDivs = [
+    new FakeElement("DAO의 자율적 본성은"),
+    new FakeElement(" 법인격 개념과 양립하기 어렵다."),
+  ] as unknown as HTMLElement[];
+
+  const found = await highlightQuote(
+    textDivs,
+    "DAO의 자율적 본성은 법인격 개념과 양립하기 어렵다",
+  );
+
+  assert.equal(found, true);
+  assert.match(
+    (textDivs[0] as unknown as FakeElement).innerHTML,
+    /pdf-text-highlight">DAO의 자율적 본성/,
+  );
+});
+
+test("PDF citation startup does not measure every page before rendering the target", () => {
+  const source = fs.readFileSync(
+    new URL("./DocView.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(
+    source,
+    /pageSizesRef\.current = Array\.from\(\s*\{ length: doc\.numPages \}/,
+    "all page placeholders should be initialized from the first-page size",
+  );
+  assert.doesNotMatch(
+    source,
+    /for \(let pageNum = 2; pageNum <= doc\.numPages; pageNum\+\+\)[\s\S]{0,500}await getPageOrNull\(pageNum\)/,
+    "citation startup must not await every PDF page before scheduling the target page",
   );
 });
 

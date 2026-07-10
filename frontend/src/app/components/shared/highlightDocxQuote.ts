@@ -1,19 +1,6 @@
+import { normalizeQuoteText, quoteMatchSegments } from "./quoteTextMatch";
+
 const HIGHLIGHT_CLASS = "docx-text-highlight";
-
-function onlyLetters(s: string): string {
-    return s.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
-}
-
-function toOrigPos(text: string, strippedPos: number): number {
-    let count = 0;
-    for (let k = 0; k < text.length; k++) {
-        if (/[a-zA-Z0-9]/.test(text[k])) {
-            if (count === strippedPos) return k;
-            count++;
-        }
-    }
-    return text.length;
-}
 
 function collectTextNodes(root: HTMLElement): Text[] {
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -60,18 +47,18 @@ export function highlightDocxQuote(
 ): HTMLElement | null {
     clearDocxQuoteHighlights(root);
     if (!quote) return null;
-    const segments = quote
-        .split(/\.{3}|…/)
-        .map(onlyLetters)
-        .filter((s) => s.length > 0);
+    const segments = quoteMatchSegments(quote);
     if (segments.length === 0) return null;
 
     const textNodes = collectTextNodes(root);
     const nodeStartInFull: number[] = [];
     const nodeStrippedLen: number[] = [];
+    const nodeOffsets: ReturnType<typeof normalizeQuoteText>[] = [];
     let fullStripped = "";
     for (const node of textNodes) {
-        const stripped = onlyLetters(node.data);
+        const normalized = normalizeQuoteText(node.data);
+        nodeOffsets.push(normalized);
+        const stripped = normalized.text;
         nodeStartInFull.push(fullStripped.length);
         nodeStrippedLen.push(stripped.length);
         fullStripped += stripped;
@@ -93,9 +80,10 @@ export function highlightDocxQuote(
 
             const localStart = Math.max(0, matchPos - start);
             const localEnd = Math.min(nodeStrippedLen[i], matchEnd - start);
-            const text = textNodes[i].data;
-            const origStart = toOrigPos(text, localStart);
-            const origEnd = toOrigPos(text, localEnd);
+            const offsets = nodeOffsets[i];
+            const origStart =
+                offsets.originalStarts[localStart] ?? textNodes[i].data.length;
+            const origEnd = offsets.originalEnds[localEnd - 1] ?? origStart;
             if (origStart >= origEnd) continue;
             ranges.push({ nodeIdx: i, origStart, origEnd });
         }

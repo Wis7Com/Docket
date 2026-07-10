@@ -1057,6 +1057,14 @@ export function DocView({
 
         const page = await runtime.doc.getPage(pageNum);
         if (!isCurrentPdfRuntime(runtime)) return null;
+        // Page sizes are measured lazily. Initial citation navigation must not
+        // await getPage() for every page in a several-hundred-page PDF before
+        // the cited page can be painted.
+        const naturalViewport = page.getViewport({ scale: 1 });
+        pageSizesRef.current[pageNum - 1] = {
+            width: naturalViewport.width,
+            height: naturalViewport.height,
+        };
         const viewport = page.getViewport({ scale: runtime.scale });
         resetWrapperToPlaceholder(wrapper, pageNum, runtime.scale);
         wrapper.innerHTML = "";
@@ -1481,16 +1489,17 @@ export function DocView({
             };
             onRenderProgressRef.current?.(1, doc.numPages);
 
-            for (let pageNum = 2; pageNum <= doc.numPages; pageNum++) {
-                const page = await getPageOrNull(pageNum);
-                if (!page || !isCurrentRender()) return;
-                const viewport = page.getViewport({ scale: 1 });
-                pageSizesRef.current[pageNum - 1] = {
-                    width: viewport.width,
-                    height: viewport.height,
-                };
-                onRenderProgressRef.current?.(pageNum, doc.numPages);
-            }
+            // Use the first page as a temporary placeholder size. Individual
+            // dimensions are measured only when that page enters the render
+            // window, so a citation on page 700 can appear without waiting
+            // for pages 2–699 to be fetched first.
+            pageSizesRef.current = Array.from(
+                { length: doc.numPages },
+                () => ({
+                    width: firstViewport.width,
+                    height: firstViewport.height,
+                }),
+            );
 
             const scale = computePdfScale(container);
 
@@ -1510,7 +1519,6 @@ export function DocView({
                 fragment.appendChild(wrapper);
             }
             container.appendChild(fragment);
-            onRenderProgressRef.current?.(doc.numPages, doc.numPages);
             pdfRuntimeRef.current = { doc, lib, scale, renderRun, container };
             scheduleWindowRender(initialPage);
 

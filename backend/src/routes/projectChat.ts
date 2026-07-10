@@ -516,7 +516,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
     try {
         write(`data: ${JSON.stringify({ type: "chat_id", chatId })}\n\n`);
 
-        const { fullText, events } = await runLLMStream({
+        const { fullText, events, citations } = await runLLMStream({
             apiMessages,
             docStore,
             docIndex,
@@ -533,7 +533,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
             disabledTools: normalizedDisabledTools,
         });
 
-        const annotations = extractAnnotations(fullText, docIndex, events);
+        const annotations = extractAnnotations(fullText, docIndex, events, citations);
         await db.from("chat_messages").insert({
             chat_id: chatId,
             role: "assistant",

@@ -10,6 +10,7 @@ import {
   BASELINE_INDEX_SCHEMA_VERSION,
   bumpDocumentVersionContentRevision,
   cancelProjectIndexing,
+  deterministicChunkId,
   drainIndexQueueForTests,
   enqueueDocumentIndex,
   ensureProjectBaselineCurrent,
@@ -30,6 +31,20 @@ before(() => {
 after(() => {
   closeDb();
   if (testRoot) fs.rmSync(testRoot, { recursive: true, force: true });
+});
+
+test("deterministic chunk ids are stable for an identical document version", () => {
+  const source = {
+    documentId: "document-a",
+    versionId: "version-a",
+    chunkIndex: 4,
+    content: "Exact evidence used by a citation.",
+  };
+  assert.equal(deterministicChunkId(source), deterministicChunkId(source));
+  assert.notEqual(
+    deterministicChunkId(source),
+    deterministicChunkId({ ...source, content: "Changed evidence." }),
+  );
 });
 
 function insertDocument(args: {

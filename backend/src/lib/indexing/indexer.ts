@@ -45,6 +45,24 @@ const pausedSemanticProjectIds = new Set<string>();
 let embeddingProcessing = false;
 let embeddingPauseCount = 0;
 
+export function deterministicChunkId(args: {
+  documentId: string;
+  versionId: string;
+  chunkIndex: number;
+  content: string;
+}): string {
+  return crypto
+    .createHash("sha256")
+    .update(args.documentId)
+    .update("\0")
+    .update(args.versionId)
+    .update("\0")
+    .update(String(args.chunkIndex))
+    .update("\0")
+    .update(args.content)
+    .digest("hex");
+}
+
 function jobKey(documentId: string, versionId: string | null): string {
   const ctx = getCurrentDatabaseContext();
   return `${ctx.dbPath}:${documentId}:${versionId ?? "current"}`;
@@ -260,7 +278,15 @@ export async function indexDocumentVersion(args: {
 
     insertedChunkIds = [];
     for (const chunk of extracted.chunks) {
-      const chunkId = crypto.randomUUID();
+      // Citation references need to survive a no-op re-index of the same
+      // document version. A random UUID made an otherwise identical chunk
+      // impossible to resolve after re-indexing.
+      const chunkId = deterministicChunkId({
+        documentId: extracted.document_id,
+        versionId: extracted.version_id,
+        chunkIndex: chunk.chunk_index,
+        content: chunk.content,
+      });
       insertedChunkIds.push(chunkId);
       insertChunk.run(
         chunkId,

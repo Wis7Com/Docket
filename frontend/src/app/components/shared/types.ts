@@ -218,6 +218,10 @@ export interface DocketCitationAnnotation {
     filename: string;
     page: number | string;
     quote: string;
+    /** Verified indexed source provenance, when this citation came from search. */
+    chunk_id?: string;
+    quote_start?: number;
+    quote_end?: number;
 }
 
 const PAGE_BREAK_SENTINEL = "[[PAGE_BREAK]]";

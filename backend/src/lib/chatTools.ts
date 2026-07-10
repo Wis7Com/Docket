@@ -1,4 +1,5 @@
 import path from "path";
+import { getDb } from "../db/sqlite";
 import {
     downloadFile,
     generatedDocKey,
@@ -123,7 +124,7 @@ After your complete response, append a <CITATIONS> block containing a JSON array
 
 <CITATIONS>
 [
-  {"ref": 1, "doc_id": "doc-0", "page": 3, "quote": "exact verbatim text from the document"},
+  {"ref": 1, "doc_id": "doc-0", "page": 3, "quote": "exact verbatim text from the document", "chunk_id": "copy only the exact chunk_id returned by indexed search/read"},
   {"ref": 2, "doc_id": "doc-1", "page": "41-42", "quote": "Section 4.2 describes the procedure [[PAGE_BREAK]] in all material respects."}
 ]
 </CITATIONS>
@@ -137,6 +138,8 @@ Rules:
 - "page" refers to the sequential [Page N] marker in the text you were given (1-indexed from the first page). IGNORE any page numbers printed inside the document itself (footers, roman numerals, etc.)
 - For a single-page quote, set "page" to an integer. If a quote is one continuous sentence that spans two pages, set "page" to "N-M" and insert [[PAGE_BREAK]] in the quote at the page break. Otherwise, use separate citations for text on different pages
 - Put the <CITATIONS> block at the very end of the response. Omit it entirely if there are no citations
+- A citation marker and a citation entry are a one-to-one relationship. Never reuse a ref, omit a ref, or add an unused entry. If you cannot supply a complete, exact citation, omit that marker instead.
+- When an indexed search/read result includes a chunk_id, copy that exact chunk_id into the citation entry. Never invent a chunk_id, page, or quote. The server verifies citations against the indexed source text and will discard any mismatch.
 
 DOCX GENERATION:
 If asked to draft or generate a document, use the generate_docx tool to produce a downloadable Word document. Always use this tool rather than just displaying the document content inline when the user asks for a document to be created.
@@ -579,6 +582,9 @@ type ParsedCitation = {
     doc_id: string;
     page: number | string;
     quote: string;
+    chunk_id?: string;
+    quote_start?: number;
+    quote_end?: number;
 };
 
 function normalizeCitation(raw: unknown): ParsedCitation | null {
@@ -596,7 +602,32 @@ function normalizeCitation(raw: unknown): ParsedCitation | null {
         if (!Number.isFinite(n)) return null;
         page = n;
     }
-    return { ref: c.ref, doc_id: c.doc_id, page, quote: c.quote };
+    const chunkId =
+        typeof c.chunk_id === "string" && c.chunk_id.trim()
+            ? c.chunk_id.trim()
+            : undefined;
+    const quoteStart =
+        typeof c.quote_start === "number" &&
+        Number.isInteger(c.quote_start) &&
+        c.quote_start >= 0
+            ? c.quote_start
+            : undefined;
+    const quoteEnd =
+        typeof c.quote_end === "number" &&
+        Number.isInteger(c.quote_end) &&
+        c.quote_end > (quoteStart ?? -1)
+            ? c.quote_end
+            : undefined;
+    if ((quoteStart === undefined) !== (quoteEnd === undefined)) return null;
+    return {
+        ref: c.ref,
+        doc_id: c.doc_id,
+        page,
+        quote: c.quote,
+        chunk_id: chunkId,
+        quote_start: quoteStart,
+        quote_end: quoteEnd,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -2056,6 +2087,7 @@ export async function runToolCalls(
                 doc_id: labelByDocumentId.get(result.document_id) ?? result.document_id,
                 document_id: result.document_id,
                 version_id: result.version_id,
+                chunk_id: result.chunk_id,
                 filename: result.filename,
                 file_type: result.file_type,
                 page: result.page_number,
@@ -2154,6 +2186,7 @@ export async function runToolCalls(
                               chunk.document_id,
                           document_id: chunk.document_id,
                           version_id: chunk.version_id,
+                          chunk_id: chunk.chunk_id,
                           filename: chunk.filename,
                           file_type: chunk.file_type,
                           page: chunk.page_number,
@@ -2854,6 +2887,187 @@ function parseCitations(text: string): ParsedCitation[] {
     }
 }
 
+type CitationValidationError = {
+    code:
+        | "duplicate_ref"
+        | "invalid_ref_sequence"
+        | "unknown_document"
+        | "quote_not_found"
+        | "invalid_chunk_span";
+    ref?: number;
+};
+
+function markerRefs(text: string): number[] {
+    const body = stripCitationBlock(text);
+    const refs: number[] = [];
+    for (const match of body.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g)) {
+        refs.push(
+            ...match[1]
+                .split(",")
+                .map((value) => Number.parseInt(value.trim(), 10)),
+        );
+    }
+    return refs;
+}
+
+/**
+ * Reject structurally ambiguous citations before they reach the renderer.
+ * A ref is deliberately a one-use handle: reusing it for a different claim
+ * would otherwise make the UI pick an arbitrary source.
+ */
+export function validateCitationContract(
+    text: string,
+    citations: ParsedCitation[],
+    docIndex: DocIndex,
+): { citations: ParsedCitation[]; errors: CitationValidationError[] } {
+    const errors: CitationValidationError[] = [];
+    const refs = markerRefs(text);
+    const citationRefs = citations.map((citation) => citation.ref);
+    const uniqueRefs = new Set(citationRefs);
+
+    if (uniqueRefs.size !== citationRefs.length) {
+        for (const ref of uniqueRefs) {
+            if (citationRefs.filter((value) => value === ref).length > 1) {
+                errors.push({ code: "duplicate_ref", ref });
+            }
+        }
+    }
+
+    const expected = Array.from({ length: citations.length }, (_, index) => index + 1);
+    if (
+        refs.length !== expected.length ||
+        refs.some((ref, index) => ref !== expected[index]) ||
+        citationRefs.some((ref, index) => ref !== expected[index])
+    ) {
+        errors.push({ code: "invalid_ref_sequence" });
+    }
+
+    for (const citation of citations) {
+        if (!resolveDoc(citation.doc_id, docIndex)) {
+            errors.push({ code: "unknown_document", ref: citation.ref });
+        }
+    }
+
+    return errors.length > 0 ? { citations: [], errors } : { citations, errors };
+}
+
+type CitationEvidenceRow = {
+    chunk_id: string;
+    page_number: number | null;
+    content: string;
+};
+
+function normaliseCitationText(value: string): string {
+    return value
+        .normalize("NFKC")
+        .replace(/\u00ad/g, "")
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/[\u201c\u201d]/g, '"')
+        .replace(/[\u2010-\u2015]/g, "-")
+        .replace(/-\s+/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLocaleLowerCase();
+}
+
+function citationEvidenceRows(
+    citation: ParsedCitation,
+    doc: NonNullable<ReturnType<typeof resolveDoc>>,
+): CitationEvidenceRow[] {
+    try {
+        const db = getDb();
+        const versionId = doc.version_id ?? null;
+        if (citation.chunk_id) {
+            return db
+                .prepare(
+                    `SELECT id AS chunk_id, page_number, content
+                     FROM document_index_chunks
+                     WHERE id = ? AND document_id = ?
+                       AND (? IS NULL OR version_id = ?)
+                     LIMIT 1`,
+                )
+                .all(citation.chunk_id, doc.document_id, versionId, versionId) as CitationEvidenceRow[];
+        }
+        return db
+            .prepare(
+                `SELECT id AS chunk_id, page_number, content
+                 FROM document_index_chunks
+                 WHERE document_id = ? AND (? IS NULL OR version_id = ?)
+                 ORDER BY CASE WHEN page_number = ? THEN 0 ELSE 1 END, chunk_index ASC`,
+            )
+            .all(
+                doc.document_id,
+                versionId,
+                versionId,
+                typeof citation.page === "number" ? citation.page : -1,
+            ) as CitationEvidenceRow[];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Verify quotations against the source index. Metadata such as page and span
+ * is derived from the matching source chunk rather than trusted from a model.
+ */
+export function validateCitationEvidence(
+    citations: ParsedCitation[],
+    docIndex: DocIndex,
+): { citations: ParsedCitation[]; errors: CitationValidationError[] } {
+    const verified: ParsedCitation[] = [];
+    const errors: CitationValidationError[] = [];
+
+    for (const citation of citations) {
+        const doc = resolveDoc(citation.doc_id, docIndex);
+        if (!doc) {
+            errors.push({ code: "unknown_document", ref: citation.ref });
+            continue;
+        }
+        const expectedQuote = normaliseCitationText(citation.quote);
+        const match = citationEvidenceRows(citation, doc).find((row) => {
+            if (
+                citation.quote_start !== undefined &&
+                citation.quote_end !== undefined
+            ) {
+                const span = row.content.slice(citation.quote_start, citation.quote_end);
+                return normaliseCitationText(span) === expectedQuote;
+            }
+            return (
+                row.content.includes(citation.quote) ||
+                normaliseCitationText(row.content).includes(expectedQuote)
+            );
+        });
+        if (!match) {
+            errors.push({ code: "quote_not_found", ref: citation.ref });
+            continue;
+        }
+
+        const start =
+            citation.quote_start ?? match.content.indexOf(citation.quote);
+        const end =
+            citation.quote_end ??
+            (start >= 0 ? start + citation.quote.length : undefined);
+        if (
+            citation.chunk_id &&
+            (start === undefined || end === undefined || start < 0)
+        ) {
+            errors.push({ code: "invalid_chunk_span", ref: citation.ref });
+            continue;
+        }
+        verified.push({
+            ...citation,
+            chunk_id: match.chunk_id,
+            quote_start: start !== undefined && start >= 0 ? start : undefined,
+            quote_end: end,
+            // This intentionally corrects a model-provided page when the
+            // verified quote is in a different indexed page.
+            page: match.page_number ?? citation.page,
+        });
+    }
+
+    return { citations: verified, errors };
+}
+
 function stripCitationBlock(text: string): string {
     return text.replace(CITATIONS_BLOCK_RE, "").trimEnd();
 }
@@ -2988,7 +3202,11 @@ export async function runLLMStream(params: {
     scopedDocumentIds?: string[];
     documentResultMaxChars?: number;
     disabledTools?: string[];
-}): Promise<{ fullText: string; events: AssistantEvent[] }> {
+}): Promise<{
+    fullText: string;
+    events: AssistantEvent[];
+    citations: unknown[];
+}> {
     const { apiMessages, docStore, docIndex, userId, db, write, extraTools, workflowStore, tabularStore, buildCitations, model, apiKeys, projectId, scopedDocumentIds } = params;
     const offeredTools = extraTools?.length
         ? [...TOOLS, ...WORKFLOW_TOOLS, ...extraTools]
@@ -3243,9 +3461,18 @@ export async function runLLMStream(params: {
 
     flushText();
 
+    const parsedCitations = parseCitations(fullText);
+    const contract = validateCitationContract(fullText, parsedCitations, docIndex);
+    const evidence = validateCitationEvidence(contract.citations, docIndex);
+    if (contract.errors.length || evidence.errors.length) {
+        console.warn("[citations] discarded or repaired invalid citations", {
+            contractErrors: contract.errors,
+            evidenceErrors: evidence.errors,
+        });
+    }
     const citations = buildCitations
         ? buildCitations(fullText)
-        : parseCitations(fullText).map((c) => {
+        : evidence.citations.map((c) => {
               const docInfo = resolveDoc(c.doc_id, docIndex);
               return {
                   ref: c.ref,
@@ -3256,6 +3483,9 @@ export async function runLLMStream(params: {
                   filename: docInfo?.filename ?? c.doc_id,
                   page: c.page,
                   quote: c.quote,
+                  chunk_id: c.chunk_id,
+                  quote_start: c.quote_start,
+                  quote_end: c.quote_end,
               };
           });
     const sanitizedVisibleText = sanitizeAssistantVisibleText(
@@ -3285,7 +3515,7 @@ export async function runLLMStream(params: {
     write(`data: ${JSON.stringify({ type: "citations", citations })}\n\n`);
     write("data: [DONE]\n\n");
 
-    return { fullText, events };
+    return { fullText, events, citations };
 }
 
 // ---------------------------------------------------------------------------
@@ -3296,8 +3526,11 @@ export function extractAnnotations(
     fullText: string,
     docIndex: DocIndex,
     events?: { type: string } & Record<string, unknown>[] | unknown[],
+    validatedCitations?: unknown[],
 ): unknown[] {
-    const out: unknown[] = parseCitations(fullText).map((c) => {
+    const sourceCitations = validatedCitations ?? parseCitations(fullText);
+    const out: unknown[] = sourceCitations.map((raw) => {
+        const c = raw as ParsedCitation;
         const docInfo = resolveDoc(c.doc_id, docIndex);
         return {
             type: "citation_data",
@@ -3309,6 +3542,9 @@ export function extractAnnotations(
             filename: docInfo?.filename ?? c.doc_id,
             page: c.page,
             quote: c.quote,
+            ...(c.chunk_id ? { chunk_id: c.chunk_id } : {}),
+            ...(c.quote_start !== undefined ? { quote_start: c.quote_start } : {}),
+            ...(c.quote_end !== undefined ? { quote_end: c.quote_end } : {}),
         };
     });
     if (Array.isArray(events)) {

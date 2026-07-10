@@ -923,6 +923,18 @@ function MarkdownContent({
                     ),
                     code: ({ node, children, ...props }) => {
                         const text = String(children);
+                        const unresolvedMatch = text.match(/^§unresolved:(\d+)§$/);
+                        if (unresolvedMatch) {
+                            return (
+                                <span
+                                    role="status"
+                                    title={`Citation ${unresolvedMatch[1]} is unavailable because its source could not be verified.`}
+                                    className="mx-0.5 inline-flex items-center justify-center rounded-full w-4 h-4 text-[10px] font-medium align-super bg-amber-100 text-amber-900"
+                                >
+                                    ?
+                                </span>
+                            );
+                        }
                         const citMatch = text.match(/^§(\d+)§$/);
                         if (citMatch) {
                             const idx = parseInt(citMatch[1]);
@@ -941,7 +953,7 @@ function MarkdownContent({
                                         className="mx-0.5 inline-flex items-center justify-center rounded-full w-4 h-4 text-[10px] font-medium transition-colors align-super bg-gray-100 text-gray-900 hover:bg-gray-200"
                                         title={tooltipText}
                                     >
-                                        {idx + 1}
+                                        {annotation.ref}
                                     </button>
                                 );
                             }

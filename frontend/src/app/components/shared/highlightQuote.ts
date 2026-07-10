@@ -1,3 +1,5 @@
+import { normalizeQuoteText, quoteMatchSegments } from "./quoteTextMatch";
+
 let pdfjsLib: typeof import("pdfjs-dist") | null = null;
 
 export async function getPdfJs() {
@@ -16,29 +18,11 @@ export const STANDARD_FONT_DATA_URL =
 const HIGHLIGHT_CLASS = "pdf-text-highlight";
 const ORIGINAL_TEXT_ATTR = "data-original-text";
 
-// Strip everything except alphanumerics (a-z A-Z 0-9) for robust matching
-function onlyLetters(s: string): string {
-    return s.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
-}
-
 function escapeHtml(str: string): string {
     return str
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;");
-}
-
-// Given a position in the stripped (letters-only) version of `original`,
-// return the corresponding index in `original`.
-function strippedPosToOriginal(original: string, strippedPos: number): number {
-    let count = 0;
-    for (let i = 0; i < original.length; i++) {
-        if (/[a-zA-Z0-9]/.test(original[i])) {
-            if (count === strippedPos) return i;
-            count++;
-        }
-    }
-    return original.length;
 }
 
 export function clearHighlights(textDivs: HTMLElement[]) {
@@ -57,22 +41,22 @@ export async function highlightQuote(
     clearHighlights(textDivs);
 
     // Split on ellipsis variants to highlight each segment separately
-    const segments = quote
-        .split(/\.{3}|…/)
-        .map((s) => onlyLetters(s))
-        .filter((s) => s.length > 0);
+    const segments = quoteMatchSegments(quote);
 
     // Build the stripped full text and track each div's start position within it.
     // Also keep original div texts for display.
     const divOrigTexts: string[] = []; // original text for innerHTML slicing
-    const divStripped: string[] = []; // letters-only version for matching
+    const divStripped: string[] = []; // unicode-normalized version for matching
+    const divOffsets: ReturnType<typeof normalizeQuoteText>[] = [];
     const divStartInFull: number[] = []; // start index in fullStripped
     let fullStripped = "";
 
     for (let i = 0; i < textDivs.length; i++) {
         const orig = textDivs[i].textContent ?? "";
         divOrigTexts.push(orig);
-        const stripped = onlyLetters(orig);
+        const normalized = normalizeQuoteText(orig);
+        divOffsets.push(normalized);
+        const stripped = normalized.text;
         divStripped.push(stripped);
         divStartInFull.push(fullStripped.length);
         fullStripped += stripped;
@@ -110,8 +94,10 @@ export async function highlightQuote(
         const orig = divOrigTexts[idx];
 
         // Map stripped positions back to original character positions
-        const origStart = strippedPosToOriginal(orig, strStart);
-        const origEnd = strippedPosToOriginal(orig, strEnd);
+        const positions = divOffsets[idx];
+        const origStart = positions.originalStarts[strStart] ?? orig.length;
+        const origEnd =
+            positions.originalEnds[strEnd - 1] ?? origStart;
 
         div.setAttribute(ORIGINAL_TEXT_ATTR, orig);
         div.innerHTML =
