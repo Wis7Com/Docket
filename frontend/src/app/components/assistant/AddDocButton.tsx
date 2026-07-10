@@ -1,0 +1,132 @@
+"use client";
+
+import { useRef, useState } from "react";
+import {
+    PlusIcon,
+    Upload,
+    LayoutGridIcon,
+    Loader2Icon,
+    FolderOpen,
+} from "lucide-react";
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+    uploadProjectDocument,
+    uploadStandaloneDocument,
+} from "@/app/lib/docketApi";
+import type { DocketDocument } from "../shared/types";
+
+interface Props {
+    onSelectDoc: (doc: DocketDocument) => void;
+    onBrowseAll: () => void;
+    selectedDocIds?: string[];
+    onProjectsClick?: () => void;
+    projectId?: string;
+}
+
+export function AddDocButton({
+    onSelectDoc,
+    onBrowseAll,
+    selectedDocIds = [],
+    onProjectsClick,
+    projectId,
+}: Props) {
+    const [isOpen, setIsOpen] = useState(false);
+    const [uploading, setUploading] = useState(false);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+
+    const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const files = Array.from(e.target.files || []);
+        if (!files.length) return;
+        setUploading(true);
+        try {
+            const uploaded = await Promise.all(
+                files.map((file) =>
+                    projectId
+                        ? uploadProjectDocument(projectId, file)
+                        : uploadStandaloneDocument(file),
+                ),
+            );
+            uploaded.forEach((doc) => onSelectDoc(doc));
+        } catch (err) {
+            console.error("Upload failed:", err);
+        } finally {
+            setUploading(false);
+            if (fileInputRef.current) fileInputRef.current.value = "";
+        }
+    };
+
+    return (
+        <>
+            <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.docx,.doc,.txt"
+                multiple
+                className="hidden"
+                onChange={handleUpload}
+            />
+            <DropdownMenu onOpenChange={setIsOpen}>
+                <DropdownMenuTrigger asChild>
+                    <button
+                        data-session-check="chat-add-trigger"
+                        className={`flex h-8 w-8 items-center justify-center rounded-lg text-sm transition-colors cursor-pointer ${
+                            selectedDocIds.length > 0
+                                ? "text-black hover:bg-gray-100"
+                                : "text-gray-400 hover:text-gray-700 hover:bg-gray-100"
+                        } ${isOpen ? "bg-gray-100" : ""}`}
+                        title="Add files"
+                        aria-label="Add files"
+                    >
+                        <PlusIcon
+                            className={`h-4 w-4 shrink-0 transition-transform duration-300 ${isOpen ? "rotate-[135deg]" : ""}`}
+                        />
+                    </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                    className="w-44 z-50"
+                    side="bottom"
+                    align="start"
+                >
+                    <DropdownMenuItem
+                        className="cursor-pointer"
+                        disabled={uploading}
+                        onSelect={(e) => {
+                            e.preventDefault();
+                            fileInputRef.current?.click();
+                        }}
+                    >
+                        {uploading ? (
+                            <Loader2Icon className="h-4 w-4 mr-2 animate-spin text-gray-400" />
+                        ) : (
+                            <Upload className="h-4 w-4 mr-2 text-gray-500" />
+                        )}
+                        <span className="text-sm">
+                            {uploading ? "Uploading…" : "Upload files"}
+                        </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                        className="cursor-pointer"
+                        onClick={onBrowseAll}
+                    >
+                        <LayoutGridIcon className="h-4 w-4 mr-2 text-gray-500" />
+                        <span className="text-sm">Browse all</span>
+                    </DropdownMenuItem>
+                    {onProjectsClick && (
+                        <DropdownMenuItem
+                            className="cursor-pointer"
+                            onClick={onProjectsClick}
+                        >
+                            <FolderOpen className="h-4 w-4 mr-2 text-gray-500" />
+                            <span className="text-sm">Open project</span>
+                        </DropdownMenuItem>
+                    )}
+                </DropdownMenuContent>
+            </DropdownMenu>
+        </>
+    );
+}

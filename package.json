@@ -1,0 +1,110 @@
+{
+  "name": "docket-desktop",
+  "version": "0.2.0",
+  "description": "Docket — local desktop AI legal platform (Electron shell over the upstream Mike Next.js + Express app)",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "main": "dist-electron/main.js",
+  "//engines": "Build with an even-numbered Node LTS (20/22/24). Node 26 (Current) breaks @electron/rebuild: yargs' extensionless CJS entry is loaded as ESM under Node 26. Pinned in .nvmrc / .node-version.",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "scripts": {
+    "predev": "node scripts/check-node-version.js && node scripts/ensure-dev-native-modules.js",
+    "dev": "concurrently -k -n FRONTEND,ELECTRON -c blue,magenta \"npm:dev:frontend\" \"npm:dev:electron\"",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:electron": "wait-on http://localhost:3000 && npm run build:electron && cross-env NODE_ENV=development electron .",
+    "electron:lock-only": "npm run build:electron && cross-env NODE_ENV=development electron .",
+    "install:all": "npm install && npm --prefix frontend install && npm --prefix backend install",
+    "build:electron": "npm run icons && tsc -p tsconfig.electron.json && node scripts/copy-electron-assets.js",
+    "build:frontend": "npm --prefix frontend run build && node scripts/stage-frontend.js",
+    "build:backend": "npm --prefix backend run build && node scripts/stage-backend.js",
+    "prebuild": "node scripts/check-node-version.js",
+    "build": "npm run build:electron && npm run build:backend && npm run build:frontend",
+    "pretest:electron-session": "node scripts/check-node-version.js && node scripts/ensure-dev-native-modules.js",
+    "test:electron-session": "npm run build:electron && node scripts/electron-session-check.js",
+    "pretest:e2e-interactive": "node scripts/check-node-version.js",
+    "test:e2e-interactive": "npm run build:electron && node scripts/interactive-e2e.js",
+    "fetch:libreoffice": "node scripts/fetch-libreoffice.js",
+    "dist": "npm run fetch:libreoffice && npm run build && electron-builder",
+    "dist:trace": "npm run fetch:libreoffice && npm run build && electron-builder --publish never",
+    "prerebuild-native": "node scripts/check-node-version.js",
+    "rebuild-native": "electron-builder install-app-deps",
+    "icons": "bash scripts/generate-app-icons.sh",
+    "desktop:launcher": "bash scripts/create-desktop-launcher.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "playwright-core": "^1.61.1",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3",
+    "wait-on": "^8.0.1"
+  },
+  "build": {
+    "appId": "com.docket.desktop",
+    "productName": "Docket",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "dist-electron/**/*",
+      "assets/icons/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/.dist-bundle/dist",
+        "to": "backend/dist"
+      },
+      {
+        "from": "backend/.dist-bundle/node_modules",
+        "to": "backend/node_modules"
+      },
+      {
+        "from": "backend/.dist-bundle/migrations",
+        "to": "backend/migrations"
+      },
+      {
+        "from": "backend/.dist-bundle/package.json",
+        "to": "backend/package.json"
+      },
+      {
+        "from": "frontend/.next/standalone",
+        "to": "frontend/.next/standalone"
+      },
+      {
+        "from": "vendor/libreoffice",
+        "to": "libreoffice"
+      }
+    ],
+    "mac": {
+      "icon": "assets/icons/docket-local.icns"
+    },
+    "linux": {
+      "icon": "assets/icons/docket-local.png"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Docket-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "shortcutName": "Docket"
+    }
+  }
+}
