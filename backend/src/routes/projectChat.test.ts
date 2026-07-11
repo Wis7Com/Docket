@@ -27,6 +27,8 @@ test("annotation prompt requires the dedicated tool instead of document search",
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /summary is computed over the complete filtered result set/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /do not accumulate every raw annotation/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /read_annotation_context/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /indexed_quote/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /chunk_id/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /user's current message/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /colors exact-hex filter/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /user notes.*not document facts/);

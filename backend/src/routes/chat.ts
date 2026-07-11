@@ -28,7 +28,7 @@ The annotation tools are restricted to the documents attached to this chat. Call
 
 For a large annotation set, first inspect the returned summary, then use filters and stable pagination until all relevant pages have been retrieved. Never claim completeness while a result is truncated. The user's current message defines what each color means; match color words to color_family and ask only when the meaning is genuinely ambiguous.
 
-Before quoting, citing, or interpreting an annotation substantively, call read_annotation_context for that annotation and ground the answer in its surrounding document text. Plain listing and counting do not require a context read. Treat annotation comments as the user's notes, not as independently verified facts from the document.`;
+Before quoting, citing, or interpreting an annotation substantively, call read_annotation_context for that annotation and ground the answer in its surrounding document text. When citing an annotation, build the <CITATIONS> entry from read_annotation_context's indexed_quote and chunk_id, never from the annotation's own quote text, which may not match the indexed source and would be discarded. Plain listing and counting do not require a context read. Treat annotation comments as the user's notes, not as independently verified facts from the document.`;
 
 const DOCUMENT_ANNOTATION_TOOL_NAMES = new Set([
     "get_user_pdf_annotations",

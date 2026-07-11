@@ -2147,6 +2147,7 @@ export async function fetchUserPdfAnnotations(args: {
 }
 
 export type AnnotationContextChunk = {
+    chunk_id?: string;
     chunk_index: number;
     page_number: number | null;
     content: string;
@@ -2166,7 +2167,7 @@ function defaultAnnotationContextLoader(
     try {
         return getDb()
             .prepare(
-                `SELECT chunk_index, page_number, content, start_char, end_char
+                `SELECT id AS chunk_id, chunk_index, page_number, content, start_char, end_char
                  FROM document_index_chunks
                  WHERE document_id = ? AND (? IS NULL OR version_id = ?)
                  ORDER BY chunk_index ASC`,
@@ -2177,17 +2178,47 @@ function defaultAnnotationContextLoader(
     }
 }
 
-function mergeAnnotationChunks(chunks: AnnotationContextChunk[]): string {
+type MergedAnnotationChunkSegment = {
+    chunk: AnnotationContextChunk;
+    mergedStart: number;
+    mergedEnd: number;
+    contentStart: number;
+};
+
+function mergeAnnotationChunksWithSegments(chunks: AnnotationContextChunk[]): {
+    text: string;
+    segments: MergedAnnotationChunkSegment[];
+} {
     let text = "";
     let lastEnd: number | null = null;
+    const segments: MergedAnnotationChunkSegment[] = [];
     for (const chunk of [...chunks].sort((a, b) => a.chunk_index - b.chunk_index)) {
         const overlap = lastEnd === null ? 0 : Math.max(0, lastEnd - chunk.start_char);
-        const suffix = chunk.content.slice(Math.min(overlap, chunk.content.length));
+        const contentStart = Math.min(overlap, chunk.content.length);
+        const suffix = chunk.content.slice(contentStart);
         if (text && suffix && lastEnd !== null && chunk.start_char > lastEnd) text += "\n";
+        const mergedStart = text.length;
         text += suffix;
+        segments.push({
+            chunk,
+            mergedStart,
+            mergedEnd: text.length,
+            contentStart,
+        });
         lastEnd = Math.max(lastEnd ?? chunk.end_char, chunk.end_char);
     }
-    return text.trim();
+    const leadingWhitespace = text.length - text.trimStart().length;
+    const trimmedText = text.trim();
+    return {
+        text: trimmedText,
+        segments: segments
+            .map((segment) => ({
+                ...segment,
+                mergedStart: Math.max(0, segment.mergedStart - leadingWhitespace),
+                mergedEnd: Math.max(0, segment.mergedEnd - leadingWhitespace),
+            }))
+            .filter((segment) => segment.mergedStart < trimmedText.length),
+    };
 }
 
 function normalizedTextWithOffsets(value: string): { text: string; offsets: number[] } {
@@ -2217,7 +2248,14 @@ export function extractAnnotationContext(args: {
     page: number;
     chunks: AnnotationContextChunk[];
     radius: number;
-}): { before: string; after: string; located: boolean; page_text?: string } {
+}): {
+    before: string;
+    after: string;
+    located: boolean;
+    page_text?: string;
+    chunk_id?: string;
+    indexed_quote?: string;
+} {
     const pageChunks = args.chunks.filter((chunk) => chunk.page_number === args.page);
     const pageIndexes = new Set(pageChunks.map((chunk) => chunk.chunk_index));
     const expandedChunks = args.chunks.filter((chunk) =>
@@ -2225,11 +2263,14 @@ export function extractAnnotationContext(args: {
         pageIndexes.has(chunk.chunk_index - 1) ||
         pageIndexes.has(chunk.chunk_index + 1),
     );
-    const pageText = mergeAnnotationChunks(pageChunks);
-    const expandedText = mergeAnnotationChunks(expandedChunks.length ? expandedChunks : pageChunks);
+    const pageMerge = mergeAnnotationChunksWithSegments(pageChunks);
+    const expandedMerge = mergeAnnotationChunksWithSegments(
+        expandedChunks.length ? expandedChunks : pageChunks,
+    );
+    const pageText = pageMerge.text;
     const quote = normalizedTextWithOffsets(args.quote ?? "").text;
-    const locate = (candidate: string) => {
-        const normalized = normalizedTextWithOffsets(candidate);
+    const locate = (merged: ReturnType<typeof mergeAnnotationChunksWithSegments>) => {
+        const normalized = normalizedTextWithOffsets(merged.text);
         if (!quote || !normalized.text) return null;
         let matchIndex = normalized.text.indexOf(quote);
         let matchLength = quote.length;
@@ -2246,13 +2287,36 @@ export function extractAnnotationContext(args: {
             normalized.offsets.length - 1,
             matchIndex + matchLength - 1,
         )] ?? originalStart) + 1;
+        const segment = merged.segments.find(
+            (candidate) => originalStart >= candidate.mergedStart && originalStart < candidate.mergedEnd,
+        );
+        const localStart = segment
+            ? segment.contentStart + originalStart - segment.mergedStart
+            : -1;
+        const localEnd = segment
+            ? Math.min(
+                segment.chunk.content.length,
+                segment.contentStart + originalEnd - segment.mergedStart,
+            )
+            : -1;
+        let indexedQuote = segment && localStart >= 0
+            ? segment.chunk.content.slice(localStart, Math.max(localStart + 1, localEnd))
+            : "";
+        const words = [...indexedQuote.matchAll(/\S+/gu)];
+        if (words.length > 50) {
+            const lastWord = words[49];
+            indexedQuote = indexedQuote.slice(0, (lastWord.index ?? 0) + lastWord[0].length);
+        }
         return {
-            before: candidate.slice(Math.max(0, originalStart - args.radius), originalStart),
-            after: candidate.slice(originalEnd, originalEnd + args.radius),
+            before: merged.text.slice(Math.max(0, originalStart - args.radius), originalStart),
+            after: merged.text.slice(originalEnd, originalEnd + args.radius),
             located: true as const,
+            ...(segment?.chunk.chunk_id && indexedQuote
+                ? { chunk_id: segment.chunk.chunk_id, indexed_quote: indexedQuote }
+                : {}),
         };
     };
-    const match = locate(pageText) ?? locate(expandedText);
+    const match = locate(pageMerge) ?? locate(expandedMerge);
     if (match) return match;
     return {
         before: "",
@@ -3444,8 +3508,11 @@ export function validateCitationContract(
 
 type CitationEvidenceRow = {
     chunk_id: string;
+    chunk_index: number;
     page_number: number | null;
     content: string;
+    start_char: number;
+    end_char: number;
 };
 
 function normaliseCitationText(value: string): string {
@@ -3462,39 +3529,100 @@ function normaliseCitationText(value: string): string {
 }
 
 function citationEvidenceRows(
-    citation: ParsedCitation,
     doc: NonNullable<ReturnType<typeof resolveDoc>>,
 ): CitationEvidenceRow[] {
     try {
-        const db = getDb();
         const versionId = doc.version_id ?? null;
-        if (citation.chunk_id) {
-            return db
-                .prepare(
-                    `SELECT id AS chunk_id, page_number, content
-                     FROM document_index_chunks
-                     WHERE id = ? AND document_id = ?
-                       AND (? IS NULL OR version_id = ?)
-                     LIMIT 1`,
-                )
-                .all(citation.chunk_id, doc.document_id, versionId, versionId) as CitationEvidenceRow[];
-        }
-        return db
+        return getDb()
             .prepare(
-                `SELECT id AS chunk_id, page_number, content
+                `SELECT id AS chunk_id, chunk_index, page_number, content, start_char, end_char
                  FROM document_index_chunks
                  WHERE document_id = ? AND (? IS NULL OR version_id = ?)
-                 ORDER BY CASE WHEN page_number = ? THEN 0 ELSE 1 END, chunk_index ASC`,
+                 ORDER BY chunk_index ASC`,
             )
-            .all(
-                doc.document_id,
-                versionId,
-                versionId,
-                typeof citation.page === "number" ? citation.page : -1,
-            ) as CitationEvidenceRow[];
+            .all(doc.document_id, versionId, versionId) as CitationEvidenceRow[];
     } catch {
         return [];
     }
+}
+
+type CitationEvidenceMatch = CitationEvidenceRow & {
+    quote_start?: number;
+    quote_end?: number;
+    merged: boolean;
+};
+
+function mergedCitationEvidenceMatch(
+    citation: ParsedCitation,
+    rows: CitationEvidenceRow[],
+    expectedQuote: string,
+): CitationEvidenceMatch | undefined {
+    if (citation.quote_start !== undefined || citation.quote_end !== undefined) {
+        return undefined;
+    }
+    const anchorChunk = citation.chunk_id
+        ? rows.find((row) => row.chunk_id === citation.chunk_id)
+        : undefined;
+    if (citation.chunk_id && !anchorChunk) return undefined;
+    const citationPage = typeof citation.page === "number"
+        ? citation.page
+        : Number.parseInt(citation.page, 10);
+    const pages = [anchorChunk?.page_number ?? citationPage];
+    for (const page of pages) {
+        const pageIndexes = new Set(
+            rows.filter((row) => row.page_number === page).map((row) => row.chunk_index),
+        );
+        const windowRows = rows.filter((row) =>
+            pageIndexes.has(row.chunk_index) ||
+            pageIndexes.has(row.chunk_index - 1) ||
+            pageIndexes.has(row.chunk_index + 1),
+        );
+        const merged = mergeAnnotationChunksWithSegments(windowRows.map((row) => ({
+            chunk_id: row.chunk_id,
+            chunk_index: row.chunk_index,
+            page_number: row.page_number,
+            content: row.content,
+            start_char: row.start_char,
+            end_char: row.end_char,
+        })));
+        const normalizedText = normaliseCitationText(merged.text);
+        const matchIndex = normalizedText.indexOf(expectedQuote);
+        if (matchIndex < 0) continue;
+        const matchEnd = matchIndex + expectedQuote.length;
+        const segmentsWithNormalizedEnds = merged.segments.map((segment) => ({
+            segment,
+            normalizedEnd: normaliseCitationText(
+                merged.text.slice(0, segment.mergedEnd),
+            ).length,
+        }));
+        const segment = segmentsWithNormalizedEnds.find(
+            (candidate) => candidate.normalizedEnd > matchIndex,
+        )?.segment;
+        if (!segment?.chunk.chunk_id) continue;
+        if (citation.chunk_id && segment.chunk.chunk_id !== citation.chunk_id) {
+            continue;
+        }
+        const source = rows.find((row) => row.chunk_id === segment.chunk.chunk_id);
+        if (!source) continue;
+        const endSegment = segmentsWithNormalizedEnds.find(
+            (candidate) => candidate.normalizedEnd >= matchEnd,
+        )?.segment;
+        const withinSingleChunk = endSegment === segment;
+        const normalizedChunk = normaliseCitationText(segment.chunk.content);
+        const normalizedChunkStart = normalizedChunk.indexOf(expectedQuote);
+        const exactChunkStart = segment.chunk.content.indexOf(citation.quote);
+        return {
+            ...source,
+            ...(withinSingleChunk && exactChunkStart >= 0 && normalizedChunkStart >= 0
+                ? {
+                    quote_start: exactChunkStart,
+                    quote_end: exactChunkStart + citation.quote.length,
+                }
+                : {}),
+            merged: true,
+        };
+    }
+    return undefined;
 }
 
 /**
@@ -3507,6 +3635,7 @@ export function validateCitationEvidence(
 ): { citations: ParsedCitation[]; errors: CitationValidationError[] } {
     const verified: ParsedCitation[] = [];
     const errors: CitationValidationError[] = [];
+    const rowsByDocument = new Map<string, CitationEvidenceRow[]>();
 
     for (const citation of citations) {
         const doc = resolveDoc(citation.doc_id, docIndex);
@@ -3515,7 +3644,23 @@ export function validateCitationEvidence(
             continue;
         }
         const expectedQuote = normaliseCitationText(citation.quote);
-        const match = citationEvidenceRows(citation, doc).find((row) => {
+        const cacheKey = `${doc.document_id}:${doc.version_id ?? ""}`;
+        let documentRows = rowsByDocument.get(cacheKey);
+        if (!documentRows) {
+            documentRows = citationEvidenceRows(doc);
+            rowsByDocument.set(cacheKey, documentRows);
+        }
+        const citationPage = typeof citation.page === "number"
+            ? citation.page
+            : Number.parseInt(citation.page, 10);
+        const candidateRows = citation.chunk_id
+            ? documentRows.filter((row) => row.chunk_id === citation.chunk_id)
+            : [...documentRows].sort((a, b) => {
+                if (a.page_number === citationPage) return -1;
+                if (b.page_number === citationPage) return 1;
+                return a.chunk_index - b.chunk_index;
+            });
+        const singleChunkMatch = candidateRows.find((row) => {
             if (
                 citation.quote_start !== undefined &&
                 citation.quote_end !== undefined
@@ -3528,18 +3673,26 @@ export function validateCitationEvidence(
                 normaliseCitationText(row.content).includes(expectedQuote)
             );
         });
+        const match: CitationEvidenceMatch | undefined = singleChunkMatch
+            ? { ...singleChunkMatch, merged: false }
+            : mergedCitationEvidenceMatch(citation, documentRows, expectedQuote);
         if (!match) {
             errors.push({ code: "quote_not_found", ref: citation.ref });
             continue;
         }
 
-        const start =
-            citation.quote_start ?? match.content.indexOf(citation.quote);
-        const end =
-            citation.quote_end ??
-            (start >= 0 ? start + citation.quote.length : undefined);
+        const start = match.merged
+            ? match.quote_start
+            : citation.quote_start ?? match.content.indexOf(citation.quote);
+        const end = match.merged
+            ? match.quote_end
+            : citation.quote_end ??
+                (start !== undefined && start >= 0
+                    ? start + citation.quote.length
+                    : undefined);
         if (
             citation.chunk_id &&
+            !match.merged &&
             (start === undefined || end === undefined || start < 0)
         ) {
             errors.push({ code: "invalid_chunk_span", ref: citation.ref });

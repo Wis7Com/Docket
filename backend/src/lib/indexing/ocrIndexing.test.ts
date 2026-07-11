@@ -13,6 +13,7 @@ import type { OcrEngine, OcrResult } from "../ocr/types";
 import { indexDocumentVersion } from "./indexer";
 import { searchProjectIndex } from "./search";
 import {
+  extractAnnotationContext,
   reassembleIndexedDocumentText,
   runToolCalls,
   validateCitationEvidence,
@@ -197,4 +198,138 @@ test("scanned PDF indexing feeds search, citation evidence, and full-read fallba
   assert.match(toolContent, /^\[Page 1\]\n/);
   assert.equal((toolContent.match(/word450/g) ?? []).length, 1);
   assert.match(toolContent, /word719$/);
+
+  db.prepare(
+    `INSERT INTO document_index_chunks
+      (id, document_id, version_id, chunk_index, page_number, content, start_char, end_char, token_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run("boundary-start", documentId, versionId, 100, 2, "before boundary overlap", 0, 23, 3);
+  db.prepare(
+    `INSERT INTO document_index_chunks
+      (id, document_id, version_id, chunk_index, page_number, content, start_char, end_char, token_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run("boundary-end", documentId, versionId, 101, 2, "overlap phrase after", 16, 36, 3);
+
+  const spanningContext = extractAnnotationContext({
+    quote: "boundary overlap phrase",
+    page: 2,
+    radius: 20,
+    chunks: [
+      {
+        chunk_id: "boundary-start",
+        chunk_index: 100,
+        page_number: 2,
+        content: "before boundary overlap",
+        start_char: 0,
+        end_char: 23,
+      },
+      {
+        chunk_id: "boundary-end",
+        chunk_index: 101,
+        page_number: 2,
+        content: "overlap phrase after",
+        start_char: 16,
+        end_char: 36,
+      },
+    ],
+  });
+  assert.equal(spanningContext.located, true);
+  assert.equal(spanningContext.chunk_id, "boundary-start");
+  assert.equal(
+    "before boundary overlap".includes(spanningContext.indexed_quote ?? ""),
+    true,
+  );
+  const indexedQuoteEvidence = validateCitationEvidence(
+    [{
+      ref: 1,
+      doc_id: "doc-0",
+      page: 2,
+      quote: spanningContext.indexed_quote ?? "",
+      chunk_id: spanningContext.chunk_id,
+    }],
+    {
+      "doc-0": {
+        document_id: documentId,
+        filename: "scan.pdf",
+        version_id: versionId,
+      },
+    },
+  );
+  assert.deepEqual(indexedQuoteEvidence.errors, []);
+  assert.equal(indexedQuoteEvidence.citations.length, 1);
+
+  const spanningEvidence = validateCitationEvidence(
+    [{
+      ref: 1,
+      doc_id: "doc-0",
+      page: 2,
+      quote: "boundary overlap phrase",
+      chunk_id: "boundary-start",
+    }],
+    {
+      "doc-0": {
+        document_id: documentId,
+        filename: "scan.pdf",
+        version_id: versionId,
+      },
+    },
+  );
+  assert.deepEqual(spanningEvidence.errors, []);
+  assert.equal(spanningEvidence.citations[0].chunk_id, "boundary-start");
+  assert.equal(spanningEvidence.citations[0].page, 2);
+  assert.equal(spanningEvidence.citations[0].quote_start, undefined);
+  assert.equal(spanningEvidence.citations[0].quote_end, undefined);
+
+  const wrongChunkEvidence = validateCitationEvidence(
+    [{
+      ref: 1,
+      doc_id: "doc-0",
+      page: 2,
+      quote: "boundary overlap phrase",
+      chunk_id: "boundary-end",
+    }],
+    {
+      "doc-0": {
+        document_id: documentId,
+        filename: "scan.pdf",
+        version_id: versionId,
+      },
+    },
+  );
+  assert.deepEqual(wrongChunkEvidence.citations, []);
+  assert.deepEqual(wrongChunkEvidence.errors, [{ code: "quote_not_found", ref: 1 }]);
+
+  const wrongSpanEvidence = validateCitationEvidence(
+    [{
+      ref: 1,
+      doc_id: "doc-0",
+      page: 2,
+      quote: "before",
+      chunk_id: "boundary-start",
+      quote_start: 7,
+      quote_end: 13,
+    }],
+    {
+      "doc-0": {
+        document_id: documentId,
+        filename: "scan.pdf",
+        version_id: versionId,
+      },
+    },
+  );
+  assert.deepEqual(wrongSpanEvidence.citations, []);
+  assert.deepEqual(wrongSpanEvidence.errors, [{ code: "quote_not_found", ref: 1 }]);
+
+  const missingEvidence = validateCitationEvidence(
+    [{ ref: 1, doc_id: "doc-0", page: 2, quote: "not present in any indexed chunk" }],
+    {
+      "doc-0": {
+        document_id: documentId,
+        filename: "scan.pdf",
+        version_id: versionId,
+      },
+    },
+  );
+  assert.deepEqual(missingEvidence.citations, []);
+  assert.deepEqual(missingEvidence.errors, [{ code: "quote_not_found", ref: 1 }]);
 });

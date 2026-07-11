@@ -276,25 +276,34 @@ test("fetchUserPdfAnnotations paginates 900 rows without duplicates or the old c
 test("annotation context locates same-page and cross-chunk quotes", () => {
   assert.deepEqual(extractAnnotationContext({
     quote: "target phrase", page: 1, radius: 7,
-    chunks: [{ chunk_index: 0, page_number: 1, content: "prefix target phrase suffix", start_char: 0, end_char: 27 }],
-  }), { before: "prefix ", after: " suffix", located: true });
+    chunks: [{ chunk_id: "chunk-single", chunk_index: 0, page_number: 1, content: "prefix target phrase suffix", start_char: 0, end_char: 27 }],
+  }), {
+    before: "prefix ", after: " suffix", located: true,
+    chunk_id: "chunk-single", indexed_quote: "target phrase",
+  });
   const spanning = extractAnnotationContext({
-    quote: "boundary phrase", page: 2, radius: 20,
+    quote: "boundary overlap phrase", page: 2, radius: 20,
     chunks: [
-      { chunk_index: 0, page_number: 2, content: "before boundary ", start_char: 0, end_char: 16 },
-      { chunk_index: 1, page_number: 3, content: "phrase after", start_char: 16, end_char: 28 },
+      { chunk_id: "chunk-start", chunk_index: 0, page_number: 2, content: "before boundary overlap", start_char: 0, end_char: 23 },
+      { chunk_id: "chunk-end", chunk_index: 1, page_number: 2, content: "overlap phrase after", start_char: 16, end_char: 36 },
     ],
   });
   assert.equal(spanning.located, true);
   assert.match(spanning.before, /before/);
   assert.match(spanning.after, /after/);
+  assert.equal(spanning.chunk_id, "chunk-start");
+  assert.equal(spanning.indexed_quote, "boundary overlap");
+  assert.equal("before boundary overlap".includes(spanning.indexed_quote ?? ""), true);
 });
 
 test("annotation context returns bounded page text when a quote is absent", () => {
-  assert.deepEqual(extractAnnotationContext({
+  const context = extractAnnotationContext({
     quote: "missing", page: 5, radius: 5,
-    chunks: [{ chunk_index: 2, page_number: 5, content: "abcdefghijklmno", start_char: 0, end_char: 15 }],
-  }), { before: "", after: "", located: false, page_text: "abcdefghij" });
+    chunks: [{ chunk_id: "chunk-fallback", chunk_index: 2, page_number: 5, content: "abcdefghijklmno", start_char: 0, end_char: 15 }],
+  });
+  assert.deepEqual(context, { before: "", after: "", located: false, page_text: "abcdefghij" });
+  assert.equal("chunk_id" in context, false);
+  assert.equal("indexed_quote" in context, false);
 });
 
 test("readAnnotationContexts caps ids and radius and prevents cross-document access", async () => {
@@ -307,12 +316,15 @@ test("readAnnotationContexts caps ids and radius and prevents cross-document acc
   const result = await readAnnotationContexts({
     userId: "user-a", db: annotationDb(rows), docIndex,
     annotationIds: [...rows.map((row) => row.id), "outside"], radius: 9999,
-    loadChunks: () => [{ chunk_index: 0, page_number: 1, content: rows.map((row) => row.quote).join(" -- "), start_char: 0, end_char: 500 }],
+    loadChunks: () => [{ chunk_id: "annotations-chunk", chunk_index: 0, page_number: 1, content: rows.map((row) => row.quote).join(" -- "), start_char: 0, end_char: 500 }],
   });
   assert.equal(result.requested, 20);
   assert.equal(result.returned, 20);
   assert.equal(result.radius, 2000);
   assert.equal((result.contexts as Array<{ annotation_id: string }>).some((row) => row.annotation_id === "outside"), false);
+  const firstContext = (result.contexts as Array<{ chunk_id?: string; indexed_quote?: string }>)[0];
+  assert.equal(firstContext.chunk_id, "annotations-chunk");
+  assert.equal(firstContext.indexed_quote, "quote 0");
 });
 
 test("filterDocContext preserves original slugs while filtering every context map", () => {

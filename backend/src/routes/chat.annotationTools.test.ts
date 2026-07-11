@@ -27,5 +27,7 @@ test("document annotation prompt describes scope, pagination, and grounding", ()
   assert.match(DOCUMENT_ANNOTATION_TOOL_PROMPT, /summary/);
   assert.match(DOCUMENT_ANNOTATION_TOOL_PROMPT, /truncated/);
   assert.match(DOCUMENT_ANNOTATION_TOOL_PROMPT, /read_annotation_context/);
+  assert.match(DOCUMENT_ANNOTATION_TOOL_PROMPT, /indexed_quote/);
+  assert.match(DOCUMENT_ANNOTATION_TOOL_PROMPT, /chunk_id/);
   assert.match(DOCUMENT_ANNOTATION_TOOL_PROMPT, /user's notes/);
 });
