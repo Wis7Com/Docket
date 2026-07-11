@@ -1,6 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Upload,
@@ -23,7 +29,6 @@ import {
   RefreshCw,
   Table2,
   Trash2,
-  Users,
   X,
   Search,
 } from "lucide-react";
@@ -52,7 +57,6 @@ import {
   deletePdfAnnotation,
   exportAnnotatedPdf,
   rescanDocument,
-  getProjectPeople,
   addProjectSourceFolder,
   listProjectSourceFolders,
   rescanProjectSourceFolder,
@@ -84,7 +88,6 @@ import { ToolbarTabs } from "@/app/components/shared/ToolbarTabs";
 import { RenameableTitle } from "@/app/components/shared/RenameableTitle";
 import { RowActions } from "@/app/components/shared/RowActions";
 import { AddDocumentsModal } from "@/app/components/shared/AddDocumentsModal";
-import { PeopleModal } from "@/app/components/shared/PeopleModal";
 import { OwnerOnlyModal } from "@/app/components/shared/OwnerOnlyModal";
 import { useAuth } from "@/contexts/AuthContext";
 import { DocViewModal } from "@/app/components/shared/DocViewModal";
@@ -861,7 +864,11 @@ function DocAnnotationRows({
             onContextMenu={(e) => {
               e.preventDefault();
               e.stopPropagation();
-              setMenu({ x: e.clientX, y: e.clientY, annotationId: ann.id });
+              setMenu({
+                x: e.clientX,
+                y: e.clientY,
+                annotationId: ann.id,
+              });
             }}
             title={
               ann.comment?.trim() && ann.quote?.trim()
@@ -894,7 +901,9 @@ function DocAnnotationRows({
             <div className="flex min-w-0 flex-1 items-center gap-2 p-2 pl-6">
               <span
                 className="h-3.5 w-3.5 shrink-0 rounded-[3px] flex items-center justify-center text-[8px] font-semibold text-white"
-                style={{ backgroundColor: ann.color || "#facc15" }}
+                style={{
+                  backgroundColor: ann.color || "#facc15",
+                }}
               >
                 {ann.annotation_type === "comment" ? "C" : "A"}
               </span>
@@ -961,7 +970,6 @@ export function ProjectPage({ projectId }: Props) {
   const [rescanningSourceFolderId, setRescanningSourceFolderId] = useState<
     string | null
   >(null);
-  const [peopleModalOpen, setPeopleModalOpen] = useState(false);
   const [ownerOnlyAction, setOwnerOnlyAction] = useState<string | null>(null);
   const { user } = useAuth();
   const [viewingDoc, setViewingDoc] = useState<DocketDocument | null>(null);
@@ -1354,8 +1362,9 @@ export function ProjectPage({ projectId }: Props) {
   ) {
     const quote = buildSearchOpenQuote(result, projectSearchDisplayQuery);
     const page = result.page_number ?? null;
-    const version =
-      result.version_id ? { id: result.version_id, label: "Search result" } : null;
+    const version = result.version_id
+      ? { id: result.version_id, label: "Search result" }
+      : null;
     openDocumentViewer(doc, {
       filename: result.filename || doc.filename,
       version,
@@ -1485,7 +1494,9 @@ export function ProjectPage({ projectId }: Props) {
             | undefined)
         : undefined;
     if (!bridge?.authorizeProjectFolder) {
-      setFolderAccessError("Folder access can only be repaired in the desktop app.");
+      setFolderAccessError(
+        "Folder access can only be repaired in the desktop app.",
+      );
       return;
     }
 
@@ -1504,7 +1515,9 @@ export function ProjectPage({ projectId }: Props) {
       setProjectReloadNonce((value) => value + 1);
     } catch (err) {
       setFolderAccessError(
-        err instanceof Error ? err.message : "Could not reconnect project folder",
+        err instanceof Error
+          ? err.message
+          : "Could not reconnect project folder",
       );
     } finally {
       setFolderAccessBusy(false);
@@ -1524,15 +1537,22 @@ export function ProjectPage({ projectId }: Props) {
           await Promise.all([
             listProjectChats(projectId).catch(() => [] as DocketChat[]),
             listTabularReviews(projectId).catch(() => []),
-            listProjectSourceFolders(projectId).catch(
-              () => [] as DocketSourceFolder[],
-            ),
+            listProjectSourceFolders(projectId),
             getProjectIndexStatus(projectId).catch(() => null),
           ]);
-        return { proj, projectChats, projectReviews, linkedFolders, status };
+        return {
+          proj,
+          projectChats,
+          projectReviews,
+          linkedFolders,
+          status,
+        };
       })
       .then(({ proj, projectChats, projectReviews, linkedFolders, status }) => {
         if (cancelled) return;
+        if (linkedFolders.length === 0) {
+          throw new Error("Project root source folder is missing");
+        }
         setProject(proj);
         const loadedFolders = proj.folders ?? [];
         setFolders(loadedFolders);
@@ -1793,9 +1813,7 @@ export function ProjectPage({ projectId }: Props) {
       setSourceFolderPath("");
       setTimeout(() => void refreshIndexStatus(), 300);
     } catch (err) {
-      setSourceFolderError(
-        (err as Error).message || "Could not open folder.",
-      );
+      setSourceFolderError((err as Error).message || "Could not open folder.");
     } finally {
       setSourceFolderBusy(false);
     }
@@ -1914,11 +1932,10 @@ export function ProjectPage({ projectId }: Props) {
     try {
       const docs =
         project?.documents?.filter((d) => d.status === "ready") || [];
-      const review = await createTabularReview({
+      const review = await createTabularReview(projectId, {
         title: title || undefined,
         document_ids: documentIds ?? docs.map((d) => d.id),
         columns_config: columnsConfig ?? [],
-        project_id: projectId,
       });
       router.push(`/projects/${projectId}/tabular-reviews/${review.id}`);
     } finally {
@@ -1928,12 +1945,6 @@ export function ProjectPage({ projectId }: Props) {
 
   async function handleTitleCommit(newName: string) {
     if (!newName || newName === project?.name) return;
-    // Server-side this would 404 silently for non-owners; surface a
-    // clear permission warning instead.
-    if (project && project.is_owner === false) {
-      setOwnerOnlyAction("rename this project");
-      return;
-    }
     setProject((prev) => (prev ? { ...prev, name: newName } : prev));
     await updateProject(projectId, { name: newName });
   }
@@ -1965,7 +1976,7 @@ export function ProjectPage({ projectId }: Props) {
     setProjectReviews((prev) =>
       prev.map((r) => (r.id === reviewId ? { ...r, title: trimmed } : r)),
     );
-    await updateTabularReview(reviewId, { title: trimmed });
+    await updateTabularReview(projectId, reviewId, { title: trimmed });
   }
 
   /**
@@ -2147,21 +2158,11 @@ export function ProjectPage({ projectId }: Props) {
   async function handleDeleteSelectedReviews() {
     const ids = [...selectedReviewIds];
     setActionsOpen(false);
-    const owned = ids.filter((id) => {
-      const r = projectReviews.find((rr) => rr.id === id);
-      return !r || !user?.id || r.user_id === user.id;
-    });
-    const blocked = ids.length - owned.length;
     setSelectedReviewIds([]);
     await Promise.all(
-      owned.map((id) => deleteTabularReview(id).catch(() => {})),
+      ids.map((id) => deleteTabularReview(projectId, id).catch(() => {})),
     );
-    setProjectReviews((prev) => prev.filter((r) => !owned.includes(r.id)));
-    if (blocked > 0) {
-      setOwnerOnlyAction(
-        `delete ${blocked} of the selected reviews — only the review creator can delete a review`,
-      );
-    }
+    setProjectReviews((prev) => prev.filter((r) => !ids.includes(r.id)));
   }
 
   // ── Drag & drop ───────────────────────────────────────────────────────────
@@ -2436,7 +2437,9 @@ export function ProjectPage({ projectId }: Props) {
                   loading={loadingAnnotationDocIds.has(doc.id)}
                   annotations={annotationsByDocId.get(doc.id) ?? []}
                   onOpen={(ann) =>
-                    openDocumentViewer(doc, { annotation: ann })
+                    openDocumentViewer(doc, {
+                      annotation: ann,
+                    })
                   }
                   onDelete={(annotationId) =>
                     void handleDeleteAnnotation(doc.id, annotationId)
@@ -2476,7 +2479,10 @@ export function ProjectPage({ projectId }: Props) {
               <div
                 draggable
                 onDragStart={(e) => {
-                  e.dataTransfer.setData("application/docket-folder", folder.id);
+                  e.dataTransfer.setData(
+                    "application/docket-folder",
+                    folder.id,
+                  );
                   e.dataTransfer.effectAllowed = "move";
                   e.stopPropagation();
                 }}
@@ -2642,7 +2648,9 @@ export function ProjectPage({ projectId }: Props) {
           {projectLoadError ? (
             <>
               <AlertCircle className="mx-auto mb-3 h-6 w-6 text-red-500" />
-              <p className="font-medium text-gray-900">Project cannot be opened</p>
+              <p className="font-medium text-gray-900">
+                Project cannot be opened
+              </p>
               <p className="mt-2 text-sm text-gray-500">{projectLoadError}</p>
               {registeredProject?.path ? (
                 <div className="mt-4 space-y-3">
@@ -2810,6 +2818,31 @@ export function ProjectPage({ projectId }: Props) {
     </div>
   );
 
+  const renderCancelQueuedIndexing = (compact: boolean) => (
+    <IndexActionTooltip
+      id="cancel-queued-indexing-tooltip"
+      text="Remove all queued document text-indexing jobs for this project. A document already being indexed will finish. This does not pause embedding."
+    >
+      <button
+        data-session-check="cancel-queued-indexing"
+        type="button"
+        aria-describedby="cancel-queued-indexing-tooltip"
+        disabled={
+          indexBusy || compactBusy || (indexStatus?.queued_jobs ?? 0) === 0
+        }
+        onClick={() => void handleCancelIndexing()}
+        className={`flex items-center gap-1 rounded font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300 ${
+          compact
+            ? "h-6 border border-gray-200 bg-white px-2 text-[11px] text-gray-500 hover:text-gray-800"
+            : "h-7 border border-gray-200 px-2 text-xs text-gray-600"
+        }`}
+      >
+        <X className="h-3 w-3" />
+        Cancel Queued Indexing
+      </button>
+    </IndexActionTooltip>
+  );
+
   return (
     <div className="flex-1 overflow-y-auto bg-white flex flex-col h-full">
       {/* Page header */}
@@ -2864,14 +2897,6 @@ export function ProjectPage({ projectId }: Props) {
             onChange={setSearch}
             placeholder="Search…"
           />
-          <button
-            onClick={() => setPeopleModalOpen(true)}
-            className="flex h-8 w-8 items-center justify-center text-sm text-gray-500 transition-colors hover:text-gray-900 cursor-pointer"
-            title="People with access"
-            aria-label="People with access"
-          >
-            <Users className="h-4 w-4" />
-          </button>
           <div className="relative group">
             <button
               onClick={() => !creatingChat && handleNewChat()}
@@ -2927,7 +2952,7 @@ export function ProjectPage({ projectId }: Props) {
         actions={<>{toolbarActions}</>}
       />
 
-      {tab === "documents" && sourceFolders.length > 0 && (
+      {tab === "documents" && (
         <div className="border-b border-gray-100 px-8 py-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs font-medium text-gray-500">
@@ -2979,6 +3004,7 @@ export function ProjectPage({ projectId }: Props) {
                 </div>
               );
             })}
+            {renderCancelQueuedIndexing(true)}
           </div>
         </div>
       )}
@@ -2992,8 +3018,7 @@ export function ProjectPage({ projectId }: Props) {
               </span>
               {indexStatus && (
                 <>
-                  {currentIndexProgress &&
-                  currentIndexProgress.total > 0 ? (
+                  {currentIndexProgress && currentIndexProgress.total > 0 ? (
                     <CircularProgressPill
                       label="indexing"
                       percent={currentIndexProgress.percent}
@@ -3199,21 +3224,6 @@ export function ProjectPage({ projectId }: Props) {
                     <Database className="h-3 w-3" />
                   )}
                   Compact Database
-                </button>
-              </IndexActionTooltip>
-              <IndexActionTooltip
-                id="cancel-indexing-tooltip"
-                text="Cancel document text indexing. Semantic embedding continues; use Pause Embedding to stop it."
-              >
-                <button
-                  type="button"
-                  aria-describedby="cancel-indexing-tooltip"
-                  disabled={indexBusy || compactBusy}
-                  onClick={() => void handleCancelIndexing()}
-                  className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
-                >
-                  <X className="h-3 w-3" />
-                  Cancel
                 </button>
               </IndexActionTooltip>
             </div>
@@ -3597,9 +3607,9 @@ export function ProjectPage({ projectId }: Props) {
                                       onExportAnnotated={
                                         doc.file_type === "pdf"
                                           ? () =>
-                                                void handleExportAnnotatedClick(
-                                                    doc,
-                                                )
+                                              void handleExportAnnotatedClick(
+                                                doc,
+                                              )
                                           : undefined
                                       }
                                       onRescan={() =>
@@ -3679,7 +3689,10 @@ export function ProjectPage({ projectId }: Props) {
                   <div
                     ref={contextMenuRef}
                     className="fixed z-50 w-44 rounded-lg border border-gray-100 bg-white shadow-lg overflow-hidden text-xs"
-                    style={{ top: contextMenu.y, left: contextMenu.x }}
+                    style={{
+                      top: contextMenu.y,
+                      left: contextMenu.x,
+                    }}
                     onClick={(e) => e.stopPropagation()}
                   >
                     <button
@@ -3986,21 +3999,13 @@ export function ProjectPage({ projectId }: Props) {
                       >
                         <RowActions
                           onRename={() => {
-                            if (user?.id && review.user_id !== user.id) {
-                              setOwnerOnlyAction("rename this tabular review");
-                              return;
-                            }
                             setRenameReviewValue(
                               review.title ?? "Untitled Review",
                             );
                             setRenamingReviewId(review.id);
                           }}
                           onDelete={async () => {
-                            if (user?.id && review.user_id !== user.id) {
-                              setOwnerOnlyAction("delete this tabular review");
-                              return;
-                            }
-                            await deleteTabularReview(review.id);
+                            await deleteTabularReview(projectId, review.id);
                             setProjectReviews((prev) =>
                               prev.filter((r) => r.id !== review.id),
                             );
@@ -4067,42 +4072,6 @@ export function ProjectPage({ projectId }: Props) {
         open={!!ownerOnlyAction}
         action={ownerOnlyAction ?? undefined}
         onClose={() => setOwnerOnlyAction(null)}
-      />
-
-      <PeopleModal
-        open={peopleModalOpen}
-        onClose={() => setPeopleModalOpen(false)}
-        resource={project}
-        fetchPeople={getProjectPeople}
-        currentUserEmail={user?.email ?? null}
-        breadcrumb={[
-          "Projects",
-          project
-            ? project.name +
-              (project.cm_number ? ` (${project.cm_number})` : "")
-            : "",
-          "People",
-        ]}
-        // Only owners may modify the member list. Without this prop
-        // PeopleModal renders read-only — non-owners can still see
-        // who has access but the add/remove controls are hidden.
-        onSharedWithChange={
-          project.is_owner === false
-            ? undefined
-            : async (next) => {
-                const updated = await updateProject(projectId, {
-                  shared_with: next,
-                });
-                setProject((prev) =>
-                  prev
-                    ? {
-                        ...prev,
-                        shared_with: updated.shared_with,
-                      }
-                    : prev,
-                );
-              }
-        }
       />
     </div>
   );

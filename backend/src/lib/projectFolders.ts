@@ -2,13 +2,21 @@ import * as path from "path";
 import * as fs from "fs";
 import type { createServerSupabase } from "./supabase";
 import { resolveSourceFolderPath, scanSourceFolder } from "./sourceFolders";
-import { toStoredSourceFolderPath } from "./sourceFolderPaths";
+import {
+  resolveStoredSourceFolderPath,
+  toStoredSourceFolderPath,
+} from "./sourceFolderPaths";
 import {
   ensureProjectRowInProjectDb,
+  getRegisteredProjectByPath,
   registerProjectFolder,
   refreshProjectRegistryCounts,
+  unregisterProject,
 } from "./projectRegistry";
-import { getCurrentDatabaseContext, runWithDatabaseContext } from "../db/sqlite";
+import {
+  getCurrentDatabaseContext,
+  runWithDatabaseContext,
+} from "../db/sqlite";
 import { isAllowedDocumentType } from "./documentTypes";
 
 type Supa = ReturnType<typeof createServerSupabase>;
@@ -17,7 +25,9 @@ const IMPORT_SKIP = new Set([".git", ".docket", "node_modules"]);
 
 function isInsideRoot(root: string, candidate: string): boolean {
   const rel = path.relative(root, candidate);
-  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+  return (
+    rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel)
+  );
 }
 
 function uniquePath(parent: string, name: string): string {
@@ -71,7 +81,8 @@ export async function addSourceFolderToProject(args: {
 }> {
   const requestedRoot = resolveSourceFolderPath(args.folderPath);
   const ctx = getCurrentDatabaseContext();
-  const projectRoot = ctx.kind === "project" ? fs.realpathSync(ctx.dataRoot) : null;
+  const projectRoot =
+    ctx.kind === "project" ? fs.realpathSync(ctx.dataRoot) : null;
   const root =
     projectRoot && !isInsideRoot(projectRoot, requestedRoot)
       ? copySupportedFilesIntoProject({
@@ -80,17 +91,54 @@ export async function addSourceFolderToProject(args: {
         })
       : requestedRoot;
   const storedRoot = toStoredSourceFolderPath(root);
-  const { data: sourceFolder, error: folderErr } = await args.db
+  const { data: existingFolders, error: existingErr } = await args.db
     .from("source_folders")
-    .insert({
-      project_id: args.projectId,
-      user_id: args.userId,
-      root_path: storedRoot,
-      display_name: path.basename(root),
-      last_scanned_at: new Date().toISOString(),
-    })
     .select("*")
-    .single();
+    .eq("project_id", args.projectId);
+  if (existingErr) throw new Error(existingErr.message);
+
+  const existing = (existingFolders ?? []).find((folder) => {
+    if (folder.root_path === storedRoot) return true;
+    try {
+      return (
+        resolveSourceFolderPath(
+          resolveStoredSourceFolderPath(folder.root_path as string),
+        ) === root
+      );
+    } catch {
+      return false;
+    }
+  });
+
+  const normalizedExisting =
+    existing && existing.root_path !== storedRoot
+      ? await args.db
+          .from("source_folders")
+          .update({
+            root_path: storedRoot,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", existing.id as string)
+          .select("*")
+          .single()
+      : null;
+
+  const inserted = normalizedExisting
+    ? normalizedExisting
+    : existing
+      ? { data: existing, error: null }
+      : await args.db
+          .from("source_folders")
+          .insert({
+            project_id: args.projectId,
+            user_id: args.userId,
+            root_path: storedRoot,
+            display_name: path.basename(root),
+            last_scanned_at: new Date().toISOString(),
+          })
+          .select("*")
+          .single();
+  const { data: sourceFolder, error: folderErr } = inserted;
   if (folderErr || !sourceFolder) {
     throw new Error(folderErr?.message ?? "Failed to open project folder");
   }
@@ -117,26 +165,32 @@ export async function createProjectFromFolder(args: {
 }> {
   void args.db;
   const root = resolveSourceFolderPath(args.folderPath);
+  const existedBefore = getRegisteredProjectByPath(root) !== null;
   const registryProject = registerProjectFolder({
     folderPath: root,
     userId: args.userId,
   });
-  const ctx = ensureProjectRowInProjectDb(registryProject);
 
-  return await runWithDatabaseContext(ctx, async () => {
-    const { createServerSupabase } = await import("./supabase");
-    const projectDb = createServerSupabase();
-    const { sourceFolder, scan } = await addSourceFolderToProject({
-      db: projectDb,
-      projectId: registryProject.id,
-      userId: args.userId,
-      folderPath: root,
+  try {
+    const ctx = ensureProjectRowInProjectDb(registryProject);
+    return await runWithDatabaseContext(ctx, async () => {
+      const { createServerSupabase } = await import("./supabase");
+      const projectDb = createServerSupabase();
+      const { sourceFolder, scan } = await addSourceFolderToProject({
+        db: projectDb,
+        projectId: registryProject.id,
+        userId: args.userId,
+        folderPath: root,
+      });
+      refreshProjectRegistryCounts(registryProject);
+      return {
+        project: registryProject as unknown as Record<string, unknown>,
+        sourceFolder,
+        scan,
+      };
     });
-    refreshProjectRegistryCounts(registryProject);
-    return {
-      project: registryProject as unknown as Record<string, unknown>,
-      sourceFolder,
-      scan,
-    };
-  });
+  } catch (err) {
+    if (!existedBefore) unregisterProject(registryProject.id);
+    throw err;
+  }
 }

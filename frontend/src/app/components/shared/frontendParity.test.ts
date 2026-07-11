@@ -124,7 +124,10 @@ test("expandCitationToEntries keeps the quote when there is no usable page (DOCX
   const entries = expandCitationToEntries(docxCitation);
   assert.equal(entries.length, 1);
   assert.equal(entries[0].page, undefined);
-  assert.equal(entries[0].quote, "Client agrees to the scope set out in Schedule 1");
+  assert.equal(
+    entries[0].quote,
+    "Client agrees to the scope set out in Schedule 1",
+  );
   assert.equal(entries[0].citation?.document_id, "document-c");
 });
 
@@ -313,7 +316,6 @@ test("project assistant renders the safe streamed error message", () => {
     "a stream closed by a backend restart should not look successful",
   );
 });
-
 
 test("PDF comments use an in-app editor instead of browser prompt", () => {
   const source = fs.readFileSync(
@@ -570,7 +572,10 @@ test("projects list route stays registry-only for fast desktop startup", () => {
     "utf8",
   );
   const listRouteStart = projectsRoute.indexOf('projectsRouter.get("/",');
-  const nextRouteStart = projectsRoute.indexOf("projectsRouter.post", listRouteStart);
+  const nextRouteStart = projectsRoute.indexOf(
+    "projectsRouter.post",
+    listRouteStart,
+  );
   const listRoute = projectsRoute.slice(listRouteStart, nextRouteStart);
 
   assert.match(
@@ -678,7 +683,10 @@ test("project assistant document tabs expose previous and next navigation", () =
 });
 
 test("PDF annotation custom colors replace a persisted seven-color palette slot", () => {
-  const docView = fs.readFileSync(new URL("./DocView.tsx", import.meta.url), "utf8");
+  const docView = fs.readFileSync(
+    new URL("./DocView.tsx", import.meta.url),
+    "utf8",
+  );
   const picker = fs.readFileSync(
     new URL("./PdfCustomColorPicker.tsx", import.meta.url),
     "utf8",
@@ -852,8 +860,28 @@ test("project index status shows circular indexing and embedding progress", () =
   );
   assert.match(
     source,
-    /Cancel document text indexing\. Semantic embedding continues; use Pause Embedding to stop it\./,
-    "cancel indexing should distinguish text indexing from semantic embedding",
+    /Remove all queued document text-indexing jobs for this project\. A document already being indexed will finish\. This does not pause embedding\./,
+    "cancel indexing should explain that it only removes queued text-indexing jobs",
+  );
+  assert.match(
+    source,
+    /Cancel Queued Indexing/,
+    "the cancel label should identify the exact work it can stop",
+  );
+  assert.match(
+    source,
+    /sourceFolders\.map[\s\S]*Rescan[\s\S]*renderCancelQueuedIndexing\(true\)/,
+    "source-folder projects should place queued-index cancellation beside rescan controls",
+  );
+  assert.doesNotMatch(
+    source,
+    /sourceFolders\.length === 0\s*\? renderCancelQueuedIndexing\(false\)/,
+    "folderless project fallbacks should not survive the source-folder invariant",
+  );
+  assert.match(
+    source,
+    /\(indexStatus\?\.queued_jobs \?\? 0\) === 0/,
+    "queued-index cancellation should be disabled when there are no queued jobs",
   );
   assert.match(
     source,

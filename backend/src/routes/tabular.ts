@@ -1,6 +1,4 @@
-import { Router } from "express";
-import * as path from "path";
-import Database from "better-sqlite3";
+import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
 import { downloadFile } from "../lib/storage";
@@ -14,13 +12,7 @@ import {
 } from "../lib/chatTools";
 import { completeText, streamChatWithTools } from "../lib/llm";
 import { getUserApiKeys, getUserModelSettings } from "../lib/userSettings";
-import {
-    checkProjectAccess,
-    ensureReviewAccess,
-    listAccessibleProjectIds,
-} from "../lib/access";
-import { listRegisteredProjects } from "../lib/projectRegistry";
-import { projectDataDir } from "../db/sqlite";
+import { checkProjectAccess, ensureReviewAccess } from "../lib/access";
 
 function formatPromptSuffix(format?: string, tags?: string[]): string {
     switch (format) {
@@ -47,236 +39,92 @@ function formatPromptSuffix(format?: string, tags?: string[]): string {
     }
 }
 
-export const tabularRouter = Router();
+export const tabularRouter = Router({ mergeParams: true });
 
-async function listVisibleTabularReviews(
+function routeProjectId(req: { params: Record<string, string> }): string {
+    return req.params.projectId;
+}
+
+async function validateSourceBackedDocuments(
     db: ReturnType<typeof createServerSupabase>,
-    userId: string,
-    userEmail: string | undefined,
-    projectIdFilter: string | null,
-): Promise<Record<string, unknown>[]> {
-    // Visible reviews = user's own + reviews in any accessible project.
-    const projectIds = await listAccessibleProjectIds(userId, userEmail, db);
-
-    if (projectIdFilter && !projectIds.includes(projectIdFilter)) {
-        // No access to that project — also covers "project doesn't exist".
-        return [];
-    }
-
-    let ownQuery = db
-        .from("tabular_reviews")
-        .select("*")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false });
-    if (projectIdFilter) ownQuery = ownQuery.eq("project_id", projectIdFilter);
-
-    const sharedProjectIds = projectIdFilter ? [projectIdFilter] : projectIds;
-    // Three sources to merge:
-    //  - own:           reviews this user created
-    //  - sharedProj:    reviews in a project the user has access to
-    //  - sharedDirect:  standalone reviews (project_id null) where the
-    //                   user's email is in tabular_reviews.shared_with
-    const [
-        { data: own, error: ownErr },
-        { data: shared, error: sharedErr },
-        { data: sharedDirect, error: sharedDirectErr },
-    ] = await Promise.all([
-        ownQuery,
-        sharedProjectIds.length > 0
-            ? db
-                  .from("tabular_reviews")
-                  .select("*")
-                  .in("project_id", sharedProjectIds)
-                  .neq("user_id", userId)
-                  .order("created_at", { ascending: false })
-            : Promise.resolve({
-                  data: [] as Record<string, unknown>[],
-                  error: null,
-              }),
-        // Skip the direct-share lookup when the caller is filtering to a
-        // specific project — direct shares are inherently project-id-null.
-        userEmail && !projectIdFilter
-            ? db
-                  .from("tabular_reviews")
-                  .select("*")
-                  .contains("shared_with", JSON.stringify([userEmail]))
-                  .neq("user_id", userId)
-                  .order("created_at", { ascending: false })
-            : Promise.resolve({
-                  data: [] as Record<string, unknown>[],
-                  error: null,
-              }),
-    ]);
-    if (ownErr) throw new Error(ownErr.message);
-    // Don't fail the whole list when an auxiliary share query errors — most
-    // commonly the tabular_reviews.shared_with column hasn't been migrated
-    // yet. Log and continue so the user still sees their own reviews.
-    if (sharedErr)
-        console.warn(
-            "[tabular] shared-by-project query failed:",
-            sharedErr.message,
-        );
-    if (sharedDirectErr)
-        console.warn(
-            "[tabular] shared-by-email query failed:",
-            sharedDirectErr.message,
-        );
-    const seen = new Set<string>();
-    const reviews: Record<string, unknown>[] = [];
-    for (const r of [
-        ...(own ?? []),
-        ...(shared ?? []),
-        ...(sharedDirect ?? []),
-    ]) {
-        const id = (r as { id: string }).id;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        reviews.push(r as Record<string, unknown>);
-    }
-
-    // Fetch distinct document counts per review
-    const reviewIds = reviews.map((r) => (r as { id: string }).id);
-    let docCounts: Record<string, number> = {};
-    if (reviewIds.length > 0) {
-        const { data: cells } = await db
-            .from("tabular_cells")
-            .select("review_id, document_id")
-            .in("review_id", reviewIds);
-        if (cells) {
-            const seen = new Set<string>();
-            for (const cell of cells) {
-                const key = `${cell.review_id}:${cell.document_id}`;
-                if (!seen.has(key)) {
-                    seen.add(key);
-                    docCounts[cell.review_id] =
-                        (docCounts[cell.review_id] ?? 0) + 1;
-                }
-            }
-        }
-    }
-
-    return reviews.map((r) => {
-        const id = (r as { id: string }).id;
-        return { ...r, document_count: docCounts[id] ?? 0 };
-    });
-}
-
-function sortReviewsByCreatedAt(reviews: Record<string, unknown>[]): void {
-    reviews.sort((a, b) => {
-        const aTime =
-            typeof a.created_at === "string"
-                ? Date.parse(a.created_at)
-                : Number.NaN;
-        const bTime =
-            typeof b.created_at === "string"
-                ? Date.parse(b.created_at)
-                : Number.NaN;
-        return (
-            (Number.isNaN(bTime) ? 0 : bTime) -
-            (Number.isNaN(aTime) ? 0 : aTime)
-        );
-    });
-}
-
-function readProjectTabularReviewsOnce(
-    projectPath: string,
     projectId: string,
-): Record<string, unknown>[] {
-    const dbPath = path.join(projectDataDir(projectPath), "project.db");
-    const db = new Database(dbPath, {
-        readonly: true,
-        fileMustExist: true,
-        timeout: 100,
-    });
-    try {
-        return db
-            .prepare(
-                `
-                SELECT
-                    reviews.*,
-                    (
-                        SELECT COUNT(DISTINCT cells.document_id)
-                        FROM tabular_cells AS cells
-                        WHERE cells.review_id = reviews.id
-                    ) AS document_count
-                FROM tabular_reviews AS reviews
-                WHERE reviews.project_id = ?
-                ORDER BY reviews.created_at DESC
-                `,
-            )
-            .all(projectId) as Record<string, unknown>[];
-    } finally {
-        db.close();
-    }
-}
+    documentIds: string[],
+): Promise<string[]> {
+    const uniqueIds = [...new Set(documentIds.filter(Boolean))];
+    if (uniqueIds.length === 0) return [];
 
-async function listVisibleTabularReviewsAcrossProjects(
-    userId: string,
-    userEmail: string | undefined,
-): Promise<Record<string, unknown>[]> {
-    const appReviews = await listVisibleTabularReviews(
-        createServerSupabase(),
-        userId,
-        userEmail,
-        null,
+    const [{ data: documents }, { data: folders }] = await Promise.all([
+        db
+            .from("documents")
+            .select("id, project_id, status")
+            .in("id", uniqueIds)
+            .eq("project_id", projectId),
+        db.from("source_folders").select("id").eq("project_id", projectId),
+    ]);
+    const folderIds = new Set((folders ?? []).map((folder) => folder.id));
+    const { data: links } = folderIds.size
+        ? await db
+              .from("linked_source_files")
+              .select("document_id, source_folder_id")
+              .in("document_id", uniqueIds)
+              .in("source_folder_id", [...folderIds])
+        : { data: [] as { document_id: string; source_folder_id: string }[] };
+    const linkedIds = new Set((links ?? []).map((link) => link.document_id));
+    const eligibleIds = new Set(
+        (documents ?? [])
+            .filter((document) => document.status === "ready")
+            .map((document) => document.id)
+            .filter((id) => linkedIds.has(id)),
     );
-    const projectRows = listRegisteredProjects(userId, userEmail);
-    const perProject = projectRows.map((project) => {
-        try {
-            return readProjectTabularReviewsOnce(project.path, project.id);
-        } catch (err) {
-            console.warn(
-                `[tabular] skipped unavailable project ${project.id}: ${(err as Error).message}`,
-            );
-            return [] as Record<string, unknown>[];
-        }
-    });
-
-    const seen = new Set<string>();
-    const merged: Record<string, unknown>[] = [];
-    for (const review of [appReviews, ...perProject].flat()) {
-        const id = (review as { id?: unknown }).id;
-        if (typeof id !== "string" || seen.has(id)) continue;
-        seen.add(id);
-        merged.push(review);
+    const invalidIds = uniqueIds.filter((id) => !eligibleIds.has(id));
+    if (invalidIds.length > 0) {
+        throw new Error(
+            `Documents must be ready and backed by this project's source folders: ${invalidIds.join(", ")}`,
+        );
     }
-    sortReviewsByCreatedAt(merged);
-    return merged;
+    return uniqueIds;
 }
 
-// GET /tabular-review
+// GET /projects/:projectId/tabular-reviews
 tabularRouter.get("/", requireAuth, async (req, res) => {
     try {
         const userId = res.locals.userId as string;
         const userEmail = res.locals.userEmail as string | undefined;
-
-        // Optional ?project_id= scopes results to a single project. Project-page
-        // callers pass it; the global tabular-reviews page omits it and receives
-        // a merged view over the app DB's standalone reviews plus registered
-        // project DBs. This keeps project contents self-contained without making
-        // the app registry duplicate review rows.
-        const projectIdFilter =
-            typeof req.query.project_id === "string" && req.query.project_id
-                ? (req.query.project_id as string)
-                : null;
-
-        if (!projectIdFilter) {
-            res.json(
-                await listVisibleTabularReviewsAcrossProjects(
-                    userId,
-                    userEmail,
-                ),
+        const projectId = routeProjectId(req);
+        const db = createServerSupabase();
+        const access = await checkProjectAccess(
+            projectId,
+            userId,
+            userEmail,
+            db,
+        );
+        if (!access.ok)
+            return void res.status(404).json({ detail: "Project not found" });
+        const { data: reviews, error } = await db
+            .from("tabular_reviews")
+            .select("*")
+            .eq("project_id", projectId)
+            .order("created_at", { ascending: false });
+        if (error) throw new Error(error.message);
+        const ids = (reviews ?? []).map((review) => review.id);
+        const { data: attachments } = ids.length
+            ? await db
+                  .from("tabular_review_documents")
+                  .select("review_id, document_id")
+                  .in("review_id", ids)
+            : { data: [] as { review_id: string; document_id: string }[] };
+        const counts = new Map<string, number>();
+        for (const attachment of attachments ?? []) {
+            counts.set(
+                attachment.review_id,
+                (counts.get(attachment.review_id) ?? 0) + 1,
             );
-            return;
         }
-
         res.json(
-            await listVisibleTabularReviews(
-                createServerSupabase(),
-                userId,
-                userEmail,
-                projectIdFilter,
-            ),
+            (reviews ?? []).map((review) => ({
+                ...review,
+                document_count: counts.get(review.id) ?? 0,
+            })),
         );
     } catch (err) {
         res.status(500).json({
@@ -288,29 +136,31 @@ tabularRouter.get("/", requireAuth, async (req, res) => {
     }
 });
 
-// POST /tabular-review
+// POST /projects/:projectId/tabular-reviews
 tabularRouter.post("/", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
-    const { title, document_ids, columns_config, workflow_id, project_id } =
-        req.body as {
-            title?: string;
-            document_ids: string[];
-            columns_config: { index: number; name: string; prompt: string }[];
-            workflow_id?: string;
-            project_id?: string;
-        };
+    const { title, document_ids, columns_config, workflow_id } = req.body as {
+        title?: string;
+        document_ids: string[];
+        columns_config: { index: number; name: string; prompt: string }[];
+        workflow_id?: string;
+    };
 
     const db = createServerSupabase();
-    if (project_id) {
-        const access = await checkProjectAccess(
-            project_id,
-            userId,
-            userEmail,
+    const projectId = routeProjectId(req);
+    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    if (!access.ok)
+        return void res.status(404).json({ detail: "Project not found" });
+    let eligibleDocumentIds: string[];
+    try {
+        eligibleDocumentIds = await validateSourceBackedDocuments(
             db,
+            projectId,
+            Array.isArray(document_ids) ? document_ids : [],
         );
-        if (!access.ok)
-            return void res.status(404).json({ detail: "Project not found" });
+    } catch (err) {
+        return void res.status(400).json({ detail: (err as Error).message });
     }
     const { data: review, error } = await db
         .from("tabular_reviews")
@@ -318,7 +168,7 @@ tabularRouter.post("/", requireAuth, async (req, res) => {
             user_id: userId,
             title: title ?? null,
             columns_config,
-            project_id: project_id ?? null,
+            project_id: projectId,
             workflow_id: workflow_id ?? null,
         })
         .select("*")
@@ -328,7 +178,23 @@ tabularRouter.post("/", requireAuth, async (req, res) => {
             .status(500)
             .json({ detail: error?.message ?? "Failed to create review" });
 
-    const cells = document_ids.flatMap((docId) =>
+    const attachments = eligibleDocumentIds.map((documentId) => ({
+        review_id: review.id,
+        document_id: documentId,
+    }));
+    if (attachments.length) {
+        const { error: attachmentError } = await db
+            .from("tabular_review_documents")
+            .insert(attachments);
+        if (attachmentError) {
+            await db.from("tabular_reviews").delete().eq("id", review.id);
+            return void res
+                .status(500)
+                .json({ detail: attachmentError.message });
+        }
+    }
+
+    const cells = eligibleDocumentIds.flatMap((docId) =>
         columns_config.map((col) => ({
             review_id: review.id,
             document_id: docId,
@@ -341,8 +207,11 @@ tabularRouter.post("/", requireAuth, async (req, res) => {
     res.status(201).json(review);
 });
 
-// POST /tabular-review/prompt (must come before /:reviewId routes)
-tabularRouter.post("/prompt", requireAuth, async (req, res) => {
+// POST /projects/:projectId/tabular-reviews/prompt (must come before /:reviewId routes)
+export async function generateTabularPromptHandler(
+    req: Request,
+    res: Response,
+) {
     const userId = res.locals.userId as string;
     const title =
         typeof req.body.title === "string" ? req.body.title.trim() : "";
@@ -410,19 +279,23 @@ tabularRouter.post("/prompt", requireAuth, async (req, res) => {
     } catch {
         res.status(502).json({ detail: "Failed to generate prompt from LLM" });
     }
-});
+}
 
-// GET /tabular-review/:reviewId
+tabularRouter.post("/prompt", requireAuth, generateTabularPromptHandler);
+
+// GET /projects/:projectId/tabular-reviews/:reviewId
 tabularRouter.get("/:reviewId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { reviewId } = req.params;
+    const projectId = routeProjectId(req);
     const db = createServerSupabase();
 
     const { data: review, error } = await db
         .from("tabular_reviews")
         .select("*")
         .eq("id", reviewId)
+        .eq("project_id", projectId)
         .single();
     if (error || !review)
         return void res.status(404).json({ detail: "Review not found" });
@@ -430,21 +303,17 @@ tabularRouter.get("/:reviewId", requireAuth, async (req, res) => {
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
 
-    const { data: cells } = await db
-        .from("tabular_cells")
-        .select("*")
-        .eq("review_id", reviewId);
-    const docIds = [...new Set((cells ?? []).map((c) => c.document_id))];
-    const docsResult =
-        docIds.length > 0
-            ? await db.from("documents").select("*").in("id", docIds)
-            : review.project_id
-              ? await db
-                    .from("documents")
-                    .select("*")
-                    .eq("project_id", review.project_id)
-                    .order("created_at", { ascending: true })
-              : { data: [] as Record<string, unknown>[] };
+    const [{ data: cells }, { data: attachments }] = await Promise.all([
+        db.from("tabular_cells").select("*").eq("review_id", reviewId),
+        db
+            .from("tabular_review_documents")
+            .select("document_id")
+            .eq("review_id", reviewId),
+    ]);
+    const docIds = (attachments ?? []).map((row) => row.document_id);
+    const docsResult = docIds.length
+        ? await db.from("documents").select("*").in("id", docIds)
+        : { data: [] as Record<string, unknown>[] };
 
     res.json({
         review: { ...review, is_owner: access.isOwner },
@@ -456,113 +325,24 @@ tabularRouter.get("/:reviewId", requireAuth, async (req, res) => {
     });
 });
 
-// GET /tabular-review/:reviewId/people
-// Owner email + display_name plus member display_names — the analog of
-// /projects/:id/people. Used by the standalone TR detail page's People
-// modal so the roster can show display_names alongside emails.
-tabularRouter.get("/:reviewId/people", requireAuth, async (req, res) => {
-    const userId = res.locals.userId as string;
-    const userEmail = res.locals.userEmail as string | undefined;
-    const { reviewId } = req.params;
-    const db = createServerSupabase();
-
-    const { data: review } = await db
-        .from("tabular_reviews")
-        .select("id, user_id, project_id, shared_with")
-        .eq("id", reviewId)
-        .single();
-    if (!review)
-        return void res.status(404).json({ detail: "Review not found" });
-    const access = await ensureReviewAccess(review, userId, userEmail, db);
-    if (!access.ok)
-        return void res.status(404).json({ detail: "Review not found" });
-
-    const sharedWith: string[] = (
-        Array.isArray(review.shared_with)
-            ? (review.shared_with as string[])
-            : []
-    ).map((e) => (e ?? "").toLowerCase());
-
-    // Same pattern as /projects/:id/people: walk auth.users to map emails
-    // to user_ids, then pull display_names from user_profiles by user_id.
-    const { data: usersData } = await db.auth.admin.listUsers({
-        perPage: 1000,
-    });
-    const allUsers = usersData?.users ?? [];
-    const userByEmail = new Map<string, { id: string; email: string }>();
-    const userById = new Map<string, { id: string; email: string }>();
-    for (const u of allUsers) {
-        if (!u.email) continue;
-        const lower = u.email.toLowerCase();
-        userByEmail.set(lower, { id: u.id, email: u.email });
-        userById.set(u.id, { id: u.id, email: u.email });
-    }
-
-    const memberUserIds: string[] = [];
-    for (const email of sharedWith) {
-        const u = userByEmail.get(email);
-        if (u) memberUserIds.push(u.id);
-    }
-
-    const profileIds = [review.user_id as string, ...memberUserIds].filter(
-        (x, i, arr) => arr.indexOf(x) === i,
-    );
-
-    const profileByUserId = new Map<string, string | null>();
-    if (profileIds.length > 0) {
-        const { data: profiles } = await db
-            .from("user_profiles")
-            .select("user_id, display_name")
-            .in("user_id", profileIds);
-        for (const p of profiles ?? []) {
-            profileByUserId.set(
-                p.user_id as string,
-                (p.display_name as string | null) ?? null,
-            );
-        }
-    }
-
-    const ownerInfo = userById.get(review.user_id as string);
-    res.json({
-        owner: {
-            user_id: review.user_id,
-            email: ownerInfo?.email ?? null,
-            display_name: profileByUserId.get(review.user_id as string) ?? null,
-        },
-        members: sharedWith.map((email) => {
-            const u = userByEmail.get(email);
-            const display_name = u ? (profileByUserId.get(u.id) ?? null) : null;
-            return { email, display_name };
-        }),
+// Review-level sharing does not exist; access follows the owning project.
+tabularRouter.all("/:reviewId/people", requireAuth, (_req, res) => {
+    res.status(410).json({
+        detail: "Tabular review members were removed",
+        code: "tabular_review_members_removed",
     });
 });
 
-// PATCH /tabular-review/:reviewId
+// PATCH /projects/:projectId/tabular-reviews/:reviewId
 tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { reviewId } = req.params;
+    const projectId = routeProjectId(req);
     const updates: Record<string, unknown> = {};
     if (req.body.title != null) updates.title = req.body.title;
     if (req.body.columns_config != null)
         updates.columns_config = req.body.columns_config;
-    if (req.body.project_id !== undefined)
-        updates.project_id = req.body.project_id;
-    // shared_with edits are owner-only — gated below after we know who's
-    // making the call. Normalize lowercase + dedupe + drop empties.
-    let sharedWithUpdate: string[] | undefined;
-    if (Array.isArray(req.body.shared_with)) {
-        const seen = new Set<string>();
-        const cleaned: string[] = [];
-        for (const raw of req.body.shared_with) {
-            if (typeof raw !== "string") continue;
-            const e = raw.trim().toLowerCase();
-            if (!e || seen.has(e)) continue;
-            seen.add(e);
-            cleaned.push(e);
-        }
-        sharedWithUpdate = cleaned;
-    }
     updates.updated_at = new Date().toISOString();
 
     const db = createServerSupabase();
@@ -570,6 +350,7 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
         .from("tabular_reviews")
         .select("*")
         .eq("id", reviewId)
+        .eq("project_id", projectId)
         .single();
     if (reviewError || !existingReview)
         return void res.status(404).json({ detail: "Review not found" });
@@ -581,12 +362,20 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
     );
     if (!access.ok)
         return void res.status(404).json({ detail: "Review not found" });
-    if (sharedWithUpdate !== undefined) {
-        if (!access.isOwner)
+
+    let validatedDocumentIds: string[] | null = null;
+    if (Array.isArray(req.body.document_ids)) {
+        try {
+            validatedDocumentIds = await validateSourceBackedDocuments(
+                db,
+                projectId,
+                req.body.document_ids as string[],
+            );
+        } catch (err) {
             return void res
-                .status(403)
-                .json({ detail: "Only the review owner can change sharing" });
-        updates.shared_with = sharedWithUpdate;
+                .status(400)
+                .json({ detail: (err as Error).message });
+        }
     }
 
     const { data: updatedReview, error: updateError } = await db
@@ -614,11 +403,37 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
             ),
         );
 
+        if (Array.isArray(req.body.columns_config)) {
+            const activeIndexes = new Set(
+                req.body.columns_config.map(
+                    (column: { index: number }) => column.index,
+                ),
+            );
+            const removedIndexes = [
+                ...new Set(
+                    (existingCells ?? [])
+                        .map((cell) => cell.column_index)
+                        .filter((index) => !activeIndexes.has(index)),
+                ),
+            ];
+            if (removedIndexes.length > 0) {
+                const { error: staleCellError } = await db
+                    .from("tabular_cells")
+                    .delete()
+                    .eq("review_id", reviewId)
+                    .in("column_index", removedIndexes);
+                if (staleCellError)
+                    return void res
+                        .status(500)
+                        .json({ detail: staleCellError.message });
+            }
+        }
+
         let documentIds: string[];
 
         if (Array.isArray(req.body.document_ids)) {
             // document_ids is the new source of truth — delete removed docs' cells
-            const newDocIds = req.body.document_ids as string[];
+            const newDocIds = validatedDocumentIds ?? [];
             const existingDocIds = (existingCells ?? []).map(
                 (cell) => cell.document_id,
             );
@@ -638,6 +453,39 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
                         .json({ detail: deleteError.message });
             }
 
+            const { data: existingAttachments } = await db
+                .from("tabular_review_documents")
+                .select("document_id")
+                .eq("review_id", reviewId);
+            const removedAttachmentIds = (existingAttachments ?? [])
+                .map((row) => row.document_id)
+                .filter((id) => !newDocIds.includes(id));
+            if (removedAttachmentIds.length > 0) {
+                await db
+                    .from("tabular_review_documents")
+                    .delete()
+                    .eq("review_id", reviewId)
+                    .in("document_id", removedAttachmentIds);
+            }
+            const attached = new Set(
+                (existingAttachments ?? []).map((row) => row.document_id),
+            );
+            const additions = newDocIds
+                .filter((id) => !attached.has(id))
+                .map((documentId) => ({
+                    review_id: reviewId,
+                    document_id: documentId,
+                }));
+            if (additions.length > 0) {
+                const { error: attachmentError } = await db
+                    .from("tabular_review_documents")
+                    .insert(additions);
+                if (attachmentError)
+                    return void res
+                        .status(500)
+                        .json({ detail: attachmentError.message });
+            }
+
             documentIds = newDocIds;
         } else {
             // No document change — derive from existing cells
@@ -646,13 +494,6 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
                     (existingCells ?? []).map((cell) => cell.document_id),
                 ),
             ];
-            if (documentIds.length === 0 && existingReview.project_id) {
-                const { data: projectDocs } = await db
-                    .from("documents")
-                    .select("id")
-                    .eq("project_id", existingReview.project_id);
-                documentIds = (projectDocs ?? []).map((doc) => doc.id);
-            }
         }
 
         const activeColumns = Array.isArray(req.body.columns_config)
@@ -686,7 +527,7 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
     res.json(updatedReview);
 });
 
-// DELETE /tabular-review/:reviewId
+// DELETE /projects/:projectId/tabular-reviews/:reviewId
 tabularRouter.delete("/:reviewId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const { reviewId } = req.params;
@@ -700,7 +541,7 @@ tabularRouter.delete("/:reviewId", requireAuth, async (req, res) => {
     res.status(204).send();
 });
 
-// POST /tabular-review/:reviewId/clear-cells
+// POST /projects/:projectId/tabular-reviews/:reviewId/clear-cells
 // Reset cells to an empty/pending state for the given document_ids. Does not
 // delete the rows — it blanks `content` and sets `status` back to "pending".
 tabularRouter.post("/:reviewId/clear-cells", requireAuth, async (req, res) => {
@@ -735,7 +576,7 @@ tabularRouter.post("/:reviewId/clear-cells", requireAuth, async (req, res) => {
     res.status(204).send();
 });
 
-// POST /tabular-review/:reviewId/regenerate-cell
+// POST /projects/:projectId/tabular-reviews/:reviewId/regenerate-cell
 tabularRouter.post(
     "/:reviewId/regenerate-cell",
     requireAuth,
@@ -846,7 +687,7 @@ tabularRouter.post(
     },
 );
 
-// POST /tabular-review/:reviewId/generate
+// POST /projects/:projectId/tabular-reviews/:reviewId/generate
 tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
@@ -1026,7 +867,7 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
     }
 });
 
-// GET /tabular-review/:reviewId/chats — list chats (metadata only, no messages)
+// GET /projects/:projectId/tabular-reviews/:reviewId/chats — list chats (metadata only, no messages)
 tabularRouter.get("/:reviewId/chats", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
@@ -1056,7 +897,7 @@ tabularRouter.get("/:reviewId/chats", requireAuth, async (req, res) => {
     res.json(chats ?? []);
 });
 
-// DELETE /tabular-review/:reviewId/chats/:chatId — delete a single chat
+// DELETE /projects/:projectId/tabular-reviews/:reviewId/chats/:chatId — delete a single chat
 tabularRouter.delete(
     "/:reviewId/chats/:chatId",
     requireAuth,
@@ -1076,7 +917,7 @@ tabularRouter.delete(
     },
 );
 
-// GET /tabular-review/:reviewId/chats/:chatId/messages — messages for a single chat
+// GET /projects/:projectId/tabular-reviews/:reviewId/chats/:chatId/messages — messages for a single chat
 tabularRouter.get(
     "/:reviewId/chats/:chatId/messages",
     requireAuth,
@@ -1211,10 +1052,10 @@ Rules:
 }
 
 // ---------------------------------------------------------------------------
-// POST /tabular-review/:reviewId/chat — agentic streaming
+// POST /projects/:projectId/tabular-reviews/:reviewId/chat — agentic streaming
 // ---------------------------------------------------------------------------
 
-// POST /tabular-review/:reviewId/chat
+// POST /projects/:projectId/tabular-reviews/:reviewId/chat
 tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;

@@ -24,7 +24,6 @@ export interface ProjectRegistryRow {
   user_id: string;
   name: string;
   cm_number?: string | null;
-  shared_with?: string[] | string | null;
   path: string;
   status?: string | null;
   last_opened_at?: string | null;
@@ -57,7 +56,9 @@ function manifestPath(projectPath: string): string {
 
 function readManifest(projectPath: string): ProjectManifest | null {
   try {
-    return JSON.parse(fs.readFileSync(manifestPath(projectPath), "utf8")) as ProjectManifest;
+    return JSON.parse(
+      fs.readFileSync(manifestPath(projectPath), "utf8"),
+    ) as ProjectManifest;
   } catch {
     return null;
   }
@@ -120,7 +121,9 @@ export function ensureProjectDatabase(projectPath: string): string {
   return dbPath;
 }
 
-export function projectContextFor(row: Pick<ProjectRegistryRow, "id" | "path">): DatabaseContext {
+export function projectContextFor(
+  row: Pick<ProjectRegistryRow, "id" | "path">,
+): DatabaseContext {
   const projectPath = resolveProjectFolder(row.path);
   return {
     kind: "project",
@@ -130,39 +133,42 @@ export function projectContextFor(row: Pick<ProjectRegistryRow, "id" | "path">):
   };
 }
 
-function parseSharedWith(raw: unknown): string[] {
-  if (Array.isArray(raw)) return raw.filter((v): v is string => typeof v === "string");
-  if (typeof raw !== "string") return [];
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter((v): v is string => typeof v === "string")
-      : [];
-  } catch {
-    return [];
-  }
-}
-
-export function getRegisteredProject(projectId: string): ProjectRegistryRow | null {
+export function getRegisteredProject(
+  projectId: string,
+): ProjectRegistryRow | null {
   const row = getAppDb()
     .prepare("SELECT * FROM projects WHERE id = ?")
     .get(projectId) as ProjectRegistryRow | undefined;
   if (!row?.path) return null;
-  return { ...row, shared_with: parseSharedWith(row.shared_with) };
+  return row;
 }
 
-export function listRegisteredProjects(userId: string, userEmail?: string | null): ProjectRegistryRow[] {
+export function getRegisteredProjectByPath(
+  folderPath: string,
+): ProjectRegistryRow | null {
+  const projectPath = resolveProjectFolder(folderPath);
+  const row = getAppDb()
+    .prepare("SELECT * FROM projects WHERE path = ?")
+    .get(projectPath) as ProjectRegistryRow | undefined;
+  if (!row?.path) return null;
+  return row;
+}
+
+export function unregisterProject(projectId: string): void {
+  getAppDb().prepare("DELETE FROM projects WHERE id = ?").run(projectId);
+}
+
+export function listRegisteredProjects(
+  userId: string,
+  userEmail?: string | null,
+): ProjectRegistryRow[] {
   const rows = getAppDb()
-    .prepare("SELECT * FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC")
+    .prepare(
+      "SELECT * FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC",
+    )
     .all() as ProjectRegistryRow[];
-  const email = (userEmail ?? "").toLowerCase();
-  return rows
-    .map((row) => ({ ...row, shared_with: parseSharedWith(row.shared_with) }))
-    .filter((row) => {
-      if (row.user_id === userId) return true;
-      const shared = Array.isArray(row.shared_with) ? row.shared_with : [];
-      return !!email && shared.some((e) => e.toLowerCase() === email);
-    });
+  void userEmail;
+  return rows.filter((row) => row.user_id === userId);
 }
 
 export function registerProjectFolder(args: {
@@ -171,7 +177,6 @@ export function registerProjectFolder(args: {
   projectId?: string;
   name?: string;
   cmNumber?: string | null;
-  sharedWith?: string[];
 }): ProjectRegistryRow {
   const projectPath = resolveProjectFolder(args.folderPath);
   fs.mkdirSync(projectDataDir(projectPath), { recursive: true });
@@ -186,7 +191,11 @@ export function registerProjectFolder(args: {
     existingManifest?.id ??
     existingByPath?.id ??
     crypto.randomUUID();
-  const name = args.name?.trim() || existingManifest?.name || path.basename(projectPath) || "Project";
+  const name =
+    args.name?.trim() ||
+    existingManifest?.name ||
+    path.basename(projectPath) ||
+    "Project";
   const manifest: ProjectManifest = {
     id,
     name,
@@ -197,7 +206,6 @@ export function registerProjectFolder(args: {
   writeManifest(projectPath, manifest);
   ensureProjectDatabase(projectPath);
 
-  const sharedWith = args.sharedWith ?? parseSharedWith(existingByPath?.shared_with);
   getAppDb()
     .prepare(
       `
@@ -221,23 +229,24 @@ export function registerProjectFolder(args: {
       args.userId,
       name,
       args.cmNumber ?? existingByPath?.cm_number ?? null,
-      JSON.stringify(sharedWith),
+      "[]",
       projectPath,
       now,
       existingByPath?.created_at ?? now,
       now,
     );
 
-  return getRegisteredProject(id) ?? {
-    id,
-    user_id: args.userId,
-    name,
-    cm_number: args.cmNumber ?? null,
-    shared_with: sharedWith,
-    path: projectPath,
-    status: "available",
-    last_opened_at: now,
-  };
+  return (
+    getRegisteredProject(id) ?? {
+      id,
+      user_id: args.userId,
+      name,
+      cm_number: args.cmNumber ?? null,
+      path: projectPath,
+      status: "available",
+      last_opened_at: now,
+    }
+  );
 }
 
 function countRows(table: string, projectId: string): number {
@@ -268,16 +277,13 @@ export function refreshProjectRegistryCounts(
       WHERE id = ?
     `,
     )
-    .run(
-      counts.document_count,
-      counts.chat_count,
-      counts.review_count,
-      row.id,
-    );
+    .run(counts.document_count, counts.chat_count, counts.review_count, row.id);
   return counts;
 }
 
-export function ensureProjectRowInProjectDb(row: ProjectRegistryRow): DatabaseContext {
+export function ensureProjectRowInProjectDb(
+  row: ProjectRegistryRow,
+): DatabaseContext {
   const ctx = projectContextFor(row);
   runWithDatabaseContext(ctx, () => {
     const db = getDbForPath(ctx.dbPath);
@@ -299,7 +305,7 @@ export function ensureProjectRowInProjectDb(row: ProjectRegistryRow): DatabaseCo
       row.user_id,
       row.name,
       row.cm_number ?? null,
-      JSON.stringify(parseSharedWith(row.shared_with)),
+      "[]",
       row.path,
       row.last_opened_at ?? new Date().toISOString(),
     );
@@ -307,12 +313,18 @@ export function ensureProjectRowInProjectDb(row: ProjectRegistryRow): DatabaseCo
   return ctx;
 }
 
-function repairLegacyChatsForProject(row: ProjectRegistryRow, ctx: DatabaseContext): boolean {
+function repairLegacyChatsForProject(
+  row: ProjectRegistryRow,
+  ctx: DatabaseContext,
+): boolean {
   if (legacyChatRepairAttempted.has(row.id)) return false;
   legacyChatRepairAttempted.add(row.id);
 
   const legacyDbPath = path.join(projectDataDir(row.path), "mike.db");
-  if (!fs.existsSync(legacyDbPath) || path.resolve(legacyDbPath) === path.resolve(ctx.dbPath)) {
+  if (
+    !fs.existsSync(legacyDbPath) ||
+    path.resolve(legacyDbPath) === path.resolve(ctx.dbPath)
+  ) {
     return false;
   }
 
@@ -348,7 +360,10 @@ function repairLegacyChatsForProject(row: ProjectRegistryRow, ctx: DatabaseConte
     const normalizedChats: Row[] = chats.map((chat) => ({
       ...chat,
       project_id: row.id,
-      user_id: typeof chat.user_id === "string" && chat.user_id ? chat.user_id : row.user_id,
+      user_id:
+        typeof chat.user_id === "string" && chat.user_id
+          ? chat.user_id
+          : row.user_id,
     }));
     const chatIds = normalizedChats
       .map((chat) => chat.id)
@@ -379,18 +394,19 @@ function repairLegacyChatsForProject(row: ProjectRegistryRow, ctx: DatabaseConte
 // project per request is slow and touches cloud-synced folders, so resolve
 // once, cache the mapping, and probe candidate DBs read-only (no realpath,
 // no migrations, no registry writes) during the scan.
-type EntityKind = "document" | "chat" | "tabular_review";
+type EntityKind = "document" | "chat";
 
 const ENTITY_TABLE: Record<EntityKind, string> = {
   document: "documents",
   chat: "chats",
-  tabular_review: "tabular_reviews",
 };
 
 const ENTITY_PROJECT_CACHE_MAX = 5000;
 const entityProjectCache = new Map<string, string>();
 
-function readableProjectDbPath(row: Pick<ProjectRegistryRow, "path">): string | null {
+function readableProjectDbPath(
+  row: Pick<ProjectRegistryRow, "path">,
+): string | null {
   if (!row.path) return null;
   const dbPath = path.join(projectDataDir(row.path), "project.db");
   return fs.existsSync(dbPath) ? dbPath : null;
@@ -482,7 +498,9 @@ export function findProjectRowForEntity(
   }
 
   const rows = getAppDb()
-    .prepare("SELECT * FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC")
+    .prepare(
+      "SELECT * FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC",
+    )
     .all() as ProjectRegistryRow[];
   for (const row of rows) {
     const dbPath = readableProjectDbPath(row);
@@ -583,68 +601,9 @@ export function chatDbRequestContext(
   next();
 }
 
-function runProjectRouteContext(
-  row: ProjectRegistryRow,
-  res: Response,
-  next: NextFunction,
-): void {
-  try {
-    assertProjectDbReadableOnce(row);
-    const ctx = ensureProjectRowInProjectDb(row);
-    if (repairLegacyChatsForProject(row, ctx)) {
-      refreshProjectRegistryCounts(row);
-    }
-    enterDatabaseContext(ctx);
-    next();
-  } catch (err) {
-    sendProjectAccessFailure(res, err);
-  }
-}
-
 function sendProjectAccessFailure(res: Response, err: unknown): void {
   const message = (err as Error).message || "Project folder is not accessible";
   res.status(503).json({
     detail: `Project folder is registered but cannot be opened: ${message}`,
   });
-}
-
-function projectIdFromTabularRequest(req: Request): string | null {
-  if (typeof req.query.project_id === "string" && req.query.project_id) {
-    return req.query.project_id;
-  }
-  const body = req.body as { project_id?: unknown } | undefined;
-  if (typeof body?.project_id === "string" && body.project_id) {
-    return body.project_id;
-  }
-  return null;
-}
-
-export function tabularReviewDbRequestContext(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): void {
-  const projectId = projectIdFromTabularRequest(req);
-  if (projectId) {
-    const row = getRegisteredProject(projectId);
-    if (!row) {
-      res.status(404).json({ detail: "Project not found" });
-      return;
-    }
-    runProjectRouteContext(row, res, next);
-    return;
-  }
-
-  const reviewId = req.params.reviewId;
-  if (!reviewId || reviewId === "prompt") {
-    next();
-    return;
-  }
-
-  const row = findProjectRowForEntity("tabular_review", reviewId);
-  if (row) {
-    runProjectRouteContext(row, res, next);
-    return;
-  }
-  next();
 }

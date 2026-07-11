@@ -6,7 +6,6 @@ import { X, Upload, Search, Loader2 } from "lucide-react";
 import {
     uploadStandaloneDocument,
     uploadProjectDocument,
-    addDocumentToProject,
     deleteDocument,
 } from "@/app/lib/docketApi";
 import type { DocketDocument } from "./types";
@@ -39,7 +38,9 @@ export function AddDocumentsModal({
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
     const [uploading, setUploading] = useState(false);
     const [search, setSearch] = useState("");
-    const [extraUploadedDocs, setExtraUploadedDocs] = useState<DocketDocument[]>([]);
+    const [extraUploadedDocs, setExtraUploadedDocs] = useState<
+        DocketDocument[]
+    >([]);
     // IDs deleted in this session — hidden locally since `useDirectoryData`'s
     // cached state won't re-fetch until the modal reopens.
     const [deletedIds, setDeletedIds] = useState<Set<string>>(new Set());
@@ -65,11 +66,13 @@ export function AddDocumentsModal({
         ...standaloneDocuments,
     ].filter((d) => !deletedIds.has(d.id));
 
-    const filteredStandalone = q
-        ? allStandalone.filter((d) => d.filename.toLowerCase().includes(q))
-        : allStandalone;
+    const filteredStandalone = projectId
+        ? []
+        : q
+          ? allStandalone.filter((d) => d.filename.toLowerCase().includes(q))
+          : allStandalone;
 
-    const filteredProjects = projects
+    const filteredProjects = (projectId ? [] : projects)
         .filter((p) => p.id !== projectId)
         .map((p) => ({
             ...p,
@@ -95,27 +98,10 @@ export function AddDocumentsModal({
         const selected = allDocs.filter((d) => selectedIds.has(d.id));
 
         if (projectId) {
-            const toAssign = selected.filter((d) => d.project_id !== projectId);
-            const alreadyHere = selected.filter(
-                (d) => d.project_id === projectId,
+            onSelect(
+                selected.filter((d) => d.project_id === projectId),
+                projectId,
             );
-            if (toAssign.length > 0) {
-                setUploading(true);
-                try {
-                    const assigned = await Promise.all(
-                        toAssign.map((d) =>
-                            addDocumentToProject(projectId, d.id),
-                        ),
-                    );
-                    onSelect([...alreadyHere, ...assigned], projectId);
-                } catch (err) {
-                    console.error("Failed to assign documents:", err);
-                } finally {
-                    setUploading(false);
-                }
-            } else {
-                onSelect(alreadyHere, projectId);
-            }
             onClose();
             return;
         }

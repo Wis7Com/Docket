@@ -381,29 +381,22 @@ export function DisplayWorkflowModal({ workflows, workflow, onClose }: Props) {
     }
 
     async function handleCreateReview() {
-        const allDocs: DocketDocument[] = [
-            ...standaloneDocuments,
-            ...projects.flatMap((p) => p.documents || []),
-        ];
-        const docIds = allDocs
+        if (!selectedProjectId) return;
+        const docIds = projectDocs
             .filter((d) => selectedDocIds.has(d.id))
             .map((d) => d.id);
-        const projectId = inProject ? selectedProjectId! : undefined;
 
         setSaving(true);
         try {
-            const review = await createTabularReview({
+            const review = await createTabularReview(selectedProjectId, {
                 title: wf.title,
                 document_ids: docIds,
                 columns_config: wf.columns_config || [],
                 workflow_id: wf.is_system ? undefined : wf.id,
-                project_id: projectId,
             });
             handleClose();
             router.push(
-                projectId
-                    ? `/projects/${projectId}/tabular-reviews/${review.id}`
-                    : `/tabular-reviews/${review.id}`,
+                `/projects/${selectedProjectId}/tabular-reviews/${review.id}`,
             );
         } finally {
             setSaving(false);
@@ -501,11 +494,18 @@ export function DisplayWorkflowModal({ workflows, workflow, onClose }: Props) {
                                             type="text"
                                             placeholder="Search…"
                                             value={listSearch}
-                                            onChange={(e) => setListSearch(e.target.value)}
+                                            onChange={(e) =>
+                                                setListSearch(e.target.value)
+                                            }
                                             className="flex-1 bg-transparent text-xs text-gray-700 placeholder:text-gray-400 outline-none"
                                         />
                                         {listSearch && (
-                                            <button onClick={() => setListSearch("")} className="text-gray-400 hover:text-gray-600">
+                                            <button
+                                                onClick={() =>
+                                                    setListSearch("")
+                                                }
+                                                className="text-gray-400 hover:text-gray-600"
+                                            >
                                                 <X className="h-3 w-3" />
                                             </button>
                                         )}
@@ -514,19 +514,39 @@ export function DisplayWorkflowModal({ workflows, workflow, onClose }: Props) {
                                 {/* List */}
                                 <div className="overflow-y-auto flex-1">
                                     {workflows
-                                        .filter((wfItem) => !listSearch || wfItem.title.toLowerCase().includes(listSearch.toLowerCase()))
+                                        .filter(
+                                            (wfItem) =>
+                                                !listSearch ||
+                                                wfItem.title
+                                                    .toLowerCase()
+                                                    .includes(
+                                                        listSearch.toLowerCase(),
+                                                    ),
+                                        )
                                         .map((wfItem) => {
-                                            const isSelected = selected?.id === wfItem.id;
-                                            const Icon = wfItem.type === "tabular" ? Table2 : MessageSquare;
+                                            const isSelected =
+                                                selected?.id === wfItem.id;
+                                            const Icon =
+                                                wfItem.type === "tabular"
+                                                    ? Table2
+                                                    : MessageSquare;
                                             return (
                                                 <button
                                                     key={wfItem.id}
-                                                    ref={isSelected ? selectedRowRef : null}
+                                                    ref={
+                                                        isSelected
+                                                            ? selectedRowRef
+                                                            : null
+                                                    }
                                                     type="button"
-                                                    onClick={() => setSelected(wfItem)}
+                                                    onClick={() =>
+                                                        setSelected(wfItem)
+                                                    }
                                                     className={`w-full flex items-center gap-3 px-4 py-3 text-xs text-left border-b border-gray-200 transition-colors ${isSelected ? "bg-gray-100" : "hover:bg-gray-50"}`}
                                                 >
-                                                    <span className={`flex-1 truncate ${isSelected ? "text-gray-900 font-medium" : "text-gray-700"}`}>
+                                                    <span
+                                                        className={`flex-1 truncate ${isSelected ? "text-gray-900 font-medium" : "text-gray-700"}`}
+                                                    >
                                                         {wfItem.title}
                                                     </span>
                                                     <Icon className="h-3.5 w-3.5 shrink-0 text-gray-400" />
@@ -707,45 +727,25 @@ export function DisplayWorkflowModal({ workflows, workflow, onClose }: Props) {
                 {screen === "configure" && wf.type === "tabular" && (
                     <>
                         <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-                            {/* Toggle stacked */}
-                            <div className="px-5 pb-3 flex flex-col gap-2 shrink-0">
-                                <span className="text-xs font-medium text-gray-700">
-                                    Create in a project
-                                </span>
-                                <Toggle
-                                    on={inProject}
-                                    onToggle={() => {
-                                        setInProject(!inProject);
-                                        setSelectedProjectId(null);
-                                        setDocSearch("");
-                                        setSelectedDocIds(new Set());
-                                    }}
-                                />
-                            </div>
-
                             {/* Project section */}
-                            {inProject && (
-                                <>
-                                    <div className="px-5 pt-1 pb-1 shrink-0">
-                                        <p className="text-xs font-medium text-gray-700">
-                                            Select Project
-                                        </p>
-                                    </div>
-                                    <div className="px-5 pb-2 shrink-0">
-                                        <SimpleProjectPicker
-                                            projects={projects}
-                                            selectedId={selectedProjectId}
-                                            onSelect={(id) => {
-                                                setSelectedProjectId(id);
-                                                if (!id)
-                                                    setSelectedDocIds(
-                                                        new Set(),
-                                                    );
-                                            }}
-                                        />
-                                    </div>
-                                </>
-                            )}
+                            <>
+                                <div className="px-5 pt-1 pb-1 shrink-0">
+                                    <p className="text-xs font-medium text-gray-700">
+                                        Select Project
+                                    </p>
+                                </div>
+                                <div className="px-5 pb-2 shrink-0">
+                                    <SimpleProjectPicker
+                                        projects={projects}
+                                        selectedId={selectedProjectId}
+                                        onSelect={(id) => {
+                                            setSelectedProjectId(id);
+                                            if (!id)
+                                                setSelectedDocIds(new Set());
+                                        }}
+                                    />
+                                </div>
+                            </>
 
                             {/* Documents section */}
                             <div className="px-5 pt-3 pb-1 shrink-0">
@@ -781,25 +781,17 @@ export function DisplayWorkflowModal({ workflows, workflow, onClose }: Props) {
                             {/* File browser */}
                             <div className="flex-1 overflow-y-auto px-4 pb-2">
                                 <FileDirectory
-                                    standaloneDocs={
-                                        inProject
-                                            ? filteredProjectDocs
-                                            : filteredStandalone
-                                    }
-                                    directoryProjects={
-                                        inProject ? [] : filteredAllProjects
-                                    }
+                                    standaloneDocs={filteredProjectDocs}
+                                    directoryProjects={[]}
                                     loading={dirLoading}
                                     selectedIds={selectedDocIds}
                                     onChange={setSelectedDocIds}
                                     allowMultiple
-                                    forceExpanded={!!q || inProject}
+                                    forceExpanded
                                     emptyMessage={
                                         q
                                             ? "No matches found"
-                                            : inProject
-                                              ? "No documents in this project"
-                                              : "No documents yet"
+                                            : "No documents in this project"
                                     }
                                 />
                             </div>
@@ -816,7 +808,7 @@ export function DisplayWorkflowModal({ workflows, workflow, onClose }: Props) {
                                 disabled={
                                     saving ||
                                     selectedDocIds.size === 0 ||
-                                    (inProject && !selectedProjectId)
+                                    !selectedProjectId
                                 }
                                 className="rounded-lg bg-gray-900 px-5 py-2 text-sm font-medium text-white hover:bg-gray-700 disabled:opacity-50"
                             >

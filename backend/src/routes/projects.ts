@@ -7,11 +7,14 @@ import {
   attachActiveVersionPaths,
   attachLatestVersionNumbers,
 } from "../lib/documentVersions";
-import { downloadFile, storageKey, uploadFile } from "../lib/storage";
+import { storageKey, uploadFile } from "../lib/storage";
 import { docxToPdf, convertedPdfKey } from "../lib/convert";
 import { checkProjectAccess } from "../lib/access";
 import { singleFileUpload } from "../lib/upload";
-import { resolveSourceFolderPath, scanSourceFolder } from "../lib/sourceFolders";
+import {
+  resolveSourceFolderPath,
+  scanSourceFolder,
+} from "../lib/sourceFolders";
 import {
   addSourceFolderToProject,
   createProjectFromFolder,
@@ -37,10 +40,9 @@ import {
   getRegisteredProject,
   listRegisteredProjects,
   projectDbRequestContext,
-  registerProjectFolder,
   refreshProjectRegistryCounts,
 } from "../lib/projectRegistry";
-import { appDataPath, getAppDb, runWithDatabaseContext } from "../db/sqlite";
+import { getAppDb, runWithDatabaseContext } from "../db/sqlite";
 import {
   IMAGE_DOCUMENT_TYPES,
   isAllowedDocumentType,
@@ -95,18 +97,20 @@ async function uploadIntoProjectSourceRoot(args: {
   userId: string;
   filename: string;
   content: Buffer;
-}): Promise<Record<string, unknown> | null> {
+}): Promise<Record<string, unknown>> {
   const { data: sourceFolders, error } = await args.db
     .from("source_folders")
     .select("*")
     .eq("project_id", args.projectId)
-    .order("created_at", { ascending: true })
+    .eq("root_path", "project:.")
     .limit(1);
   if (error) throw new Error(error.message);
   const sourceFolder = sourceFolders?.[0] as
     | { id: string; root_path: string }
     | undefined;
-  if (!sourceFolder?.id || !sourceFolder.root_path) return null;
+  if (!sourceFolder?.id || !sourceFolder.root_path) {
+    throw new Error("Project root source folder is missing");
+  }
 
   const root = resolveSourceFolderPath(
     resolveStoredSourceFolderPath(sourceFolder.root_path),
@@ -162,38 +166,6 @@ projectsRouter.get("/", requireAuth, async (req, res) => {
   res.json(result);
 });
 
-// POST /projects
-projectsRouter.post("/", requireAuth, async (req, res) => {
-  const userId = res.locals.userId as string;
-  const { name, cm_number, shared_with } = req.body as {
-    name: string;
-    path?: string;
-    cm_number?: string;
-    shared_with?: string[];
-  };
-  if (!name?.trim())
-    return void res.status(400).json({ detail: "name is required" });
-
-  const requestedPath =
-    typeof req.body?.path === "string" && req.body.path.trim()
-      ? req.body.path
-      : path.join(
-          appDataPath(),
-          "Projects",
-          name.trim().replace(/[\\/:*?"<>|]+/g, "-"),
-        );
-  fs.mkdirSync(requestedPath, { recursive: true });
-  const project = registerProjectFolder({
-    folderPath: requestedPath,
-    userId,
-    name,
-    cmNumber: cm_number ?? null,
-    sharedWith: shared_with ?? [],
-  });
-  ensureProjectRowInProjectDb(project);
-  res.status(201).json({ ...project, documents: [] });
-});
-
 // POST /projects/open-folder
 // Open a local folder as a Docket project. The folder itself is the durable
 // project boundary; project data lives in <folder>/.docket.
@@ -220,9 +192,9 @@ projectsRouter.post("/open-folder", requireAuth, async (req, res) => {
       scan,
     });
   } catch (err) {
-    return void res
-      .status(400)
-      .json({ detail: (err as Error).message || "Could not open folder" });
+    return void res.status(400).json({
+      detail: (err as Error).message || "Could not open folder",
+    });
   }
 });
 
@@ -231,22 +203,15 @@ projectsRouter.post("/open-folder", requireAuth, async (req, res) => {
 // the UI can recover when macOS folder access needs to be re-authorized.
 projectsRouter.get("/:projectId/registry", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
-  const userEmail = res.locals.userEmail as string;
   const row = getRegisteredProject(req.params.projectId);
   if (!row) return void res.status(404).json({ detail: "Project not found" });
-
-  const sharedWith = Array.isArray(row.shared_with) ? row.shared_with : [];
-  const email = (userEmail ?? "").toLowerCase();
-  const canAccess =
-    row.user_id === userId ||
-    (!!email && sharedWith.some((e) => e.toLowerCase() === email));
-  if (!canAccess)
+  if (row.user_id !== userId)
     return void res.status(404).json({ detail: "Project not found" });
 
   res.json({
     ...row,
-    shared_with: sharedWith,
-    is_owner: row.user_id === userId,
+    shared_with: undefined,
+    is_owner: true,
     document_count: row.document_count_cache ?? 0,
     chat_count: row.chat_count_cache ?? 0,
     review_count: row.review_count_cache ?? 0,
@@ -258,7 +223,6 @@ projectsRouter.use("/:projectId", requireAuth, projectDbRequestContext);
 // GET /projects/:projectId
 projectsRouter.get("/:projectId", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
-  const userEmail = res.locals.userEmail as string;
   const { projectId } = req.params;
   const db = createServerSupabase();
 
@@ -270,12 +234,7 @@ projectsRouter.get("/:projectId", requireAuth, async (req, res) => {
   if (error || !project)
     return void res.status(404).json({ detail: "Project not found" });
 
-  const canAccess =
-    project.user_id === userId ||
-    (userEmail &&
-      Array.isArray(project.shared_with) &&
-      project.shared_with.includes(userEmail));
-  if (!canAccess)
+  if (project.user_id !== userId)
     return void res.status(404).json({ detail: "Project not found" });
 
   const [{ data: docs }, { data: folderData }] = await Promise.all([
@@ -309,21 +268,25 @@ projectsRouter.get("/:projectId", requireAuth, async (req, res) => {
 });
 
 // GET /projects/:projectId/index-status
-projectsRouter.get("/:projectId/index-status", requireAuth, async (req, res) => {
-  const userId = res.locals.userId as string;
-  const userEmail = res.locals.userEmail as string | undefined;
-  const { projectId } = req.params;
-  const db = createServerSupabase();
+projectsRouter.get(
+  "/:projectId/index-status",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { projectId } = req.params;
+    const db = createServerSupabase();
 
-  const access = await checkProjectAccess(projectId, userId, userEmail, db);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Project not found" });
+    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Project not found" });
 
-  res.json({
-    ...getProjectIndexStatus(projectId),
-    semantic: getProjectSemanticIndexStatus(projectId, userId),
-  });
-});
+    res.json({
+      ...getProjectIndexStatus(projectId),
+      semantic: getProjectSemanticIndexStatus(projectId, userId),
+    });
+  },
+);
 
 // POST /projects/:projectId/index/ensure
 // Reconcile only project-DB index metadata. This never scans linked folders or
@@ -342,7 +305,10 @@ projectsRouter.post(
       return void res.status(404).json({ detail: "Project not found" });
 
     const enqueued = ensureProjectBaselineCurrent(projectId);
-    res.status(enqueued > 0 ? 202 : 200).json({ project_id: projectId, enqueued });
+    res.status(enqueued > 0 ? 202 : 200).json({
+      project_id: projectId,
+      enqueued,
+    });
   },
 );
 
@@ -360,9 +326,9 @@ projectsRouter.post(
     if (!access.ok)
       return void res.status(404).json({ detail: "Project not found" });
     if (!access.isOwner)
-      return void res
-        .status(403)
-        .json({ detail: "Only the project owner can rebuild the index" });
+      return void res.status(403).json({
+        detail: "Only the project owner can rebuild the index",
+      });
 
     const enqueued = await enqueueProjectIndexRebuild(projectId);
     res.status(202).json({ project_id: projectId, enqueued });
@@ -383,9 +349,9 @@ projectsRouter.post(
     if (!access.ok)
       return void res.status(404).json({ detail: "Project not found" });
     if (!access.isOwner)
-      return void res
-        .status(403)
-        .json({ detail: "Only the project owner can compact the database" });
+      return void res.status(403).json({
+        detail: "Only the project owner can compact the database",
+      });
 
     try {
       const compacted = compactProjectDatabase(projectId);
@@ -453,9 +419,9 @@ projectsRouter.post(
       });
     } catch (err) {
       const detail = (err as Error).message || "Embedding start failed";
-      res
-        .status(detail.includes("lexical indexing") ? 409 : 500)
-        .json({ detail });
+      res.status(detail.includes("lexical indexing") ? 409 : 500).json({
+        detail,
+      });
     }
   },
 );
@@ -607,9 +573,9 @@ projectsRouter.post(
     if (!access.ok)
       return void res.status(404).json({ detail: "Project not found" });
     if (!access.isOwner)
-      return void res
-        .status(403)
-        .json({ detail: "Only the project owner can rescan source folders" });
+      return void res.status(403).json({
+        detail: "Only the project owner can rescan source folders",
+      });
 
     const { data: sourceFolder, error } = await db
       .from("source_folders")
@@ -629,8 +595,7 @@ projectsRouter.post(
     } catch (err) {
       return void res.status(400).json({
         detail:
-          (err as Error).message ||
-          "Opened folder is no longer accessible",
+          (err as Error).message || "Opened folder is no longer accessible",
       });
     }
 
@@ -641,93 +606,19 @@ projectsRouter.post(
       userId,
       rootPath: root,
     });
-    res.json({ source_folder: serializeSourceFolder(sourceFolder), ...scan });
+    res.json({
+      source_folder: serializeSourceFolder(sourceFolder),
+      ...scan,
+    });
   },
 );
 
-// GET /projects/:projectId/people
-// Resolve the owner + every shared member to {email, display_name}. Used
-// by the People modal so the UI can show display names where available
-// and tag the current user as "You".
-projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
-  const userId = res.locals.userId as string;
-  const userEmail = res.locals.userEmail as string | undefined;
-  const { projectId } = req.params;
-  const db = createServerSupabase();
-
-  const { data: project } = await db
-    .from("projects")
-    .select("id, user_id, shared_with")
-    .eq("id", projectId)
-    .single();
-  if (!project)
-    return void res.status(404).json({ detail: "Project not found" });
-
-  const isOwner = project.user_id === userId;
-  const sharedWith = (
-    Array.isArray(project.shared_with) ? (project.shared_with as string[]) : []
-  ).map((e) => e.toLowerCase());
-  const isShared = !!userEmail && sharedWith.includes(userEmail.toLowerCase());
-  if (!isOwner && !isShared)
-    return void res.status(404).json({ detail: "Project not found" });
-
-  // Pull every auth user (matching the lookup endpoint's pattern). For
-  // larger deployments this should page or be replaced with a bulk-by-id
-  // RPC, but it keeps things simple while user counts are modest.
-  const { data: usersData } = await db.auth.admin.listUsers({ perPage: 1000 });
-  const allUsers = usersData?.users ?? [];
-  const userByEmail = new Map<string, { id: string; email: string }>();
-  const userById = new Map<string, { id: string; email: string }>();
-  for (const u of allUsers) {
-    if (!u.email) continue;
-    const lower = u.email.toLowerCase();
-    userByEmail.set(lower, { id: u.id, email: u.email });
-    userById.set(u.id, { id: u.id, email: u.email });
-  }
-
-  const memberUserIds: string[] = [];
-  for (const email of sharedWith) {
-    const u = userByEmail.get(email);
-    if (u) memberUserIds.push(u.id);
-  }
-
-  const profileIds = [project.user_id as string, ...memberUserIds].filter(
-    (x, i, arr) => arr.indexOf(x) === i,
-  );
-
-  const profileByUserId = new Map<
-    string,
-    { display_name: string | null; organisation: string | null }
-  >();
-  if (profileIds.length > 0) {
-    const { data: profiles } = await db
-      .from("user_profiles")
-      .select("user_id, display_name, organisation")
-      .in("user_id", profileIds);
-    for (const p of profiles ?? []) {
-      profileByUserId.set(p.user_id as string, {
-        display_name: (p.display_name as string | null) ?? null,
-        organisation: (p.organisation as string | null) ?? null,
-      });
-    }
-  }
-
-  const ownerInfo = userById.get(project.user_id as string);
-  const owner = {
-    user_id: project.user_id,
-    email: ownerInfo?.email ?? null,
-    display_name:
-      profileByUserId.get(project.user_id as string)?.display_name ?? null,
-  };
-  const members = sharedWith.map((email) => {
-    const u = userByEmail.get(email);
-    const display_name = u
-      ? (profileByUserId.get(u.id)?.display_name ?? null)
-      : null;
-    return { email, display_name };
+// Project sharing was removed with the local-folder project boundary.
+projectsRouter.all("/:projectId/people", requireAuth, (_req, res) => {
+  res.status(410).json({
+    detail: "Project members were removed because local projects are private",
+    code: "project_members_removed",
   });
-
-  res.json({ owner, members });
 });
 
 // PATCH /projects/:projectId
@@ -737,19 +628,6 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
   const updates: Record<string, unknown> = {};
   if (req.body.name != null) updates.name = req.body.name;
   if (req.body.cm_number != null) updates.cm_number = req.body.cm_number;
-  if (Array.isArray(req.body.shared_with)) {
-    // Normalise: lowercase + dedupe + drop empties.
-    const seen = new Set<string>();
-    const cleaned: string[] = [];
-    for (const raw of req.body.shared_with) {
-      if (typeof raw !== "string") continue;
-      const e = raw.trim().toLowerCase();
-      if (!e || seen.has(e)) continue;
-      seen.add(e);
-      cleaned.push(e);
-    }
-    updates.shared_with = cleaned;
-  }
 
   const db = createServerSupabase();
   const { data, error } = await db
@@ -765,9 +643,6 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
   const registryUpdates = {
     name: (data.name as string | undefined) ?? null,
     cm_number: (data.cm_number as string | null | undefined) ?? null,
-    shared_with: JSON.stringify(
-      Array.isArray(data.shared_with) ? data.shared_with : [],
-    ),
     updated_at: new Date().toISOString(),
   };
   getAppDb()
@@ -776,7 +651,6 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
       UPDATE projects
       SET name = COALESCE(?, name),
           cm_number = ?,
-          shared_with = ?,
           updated_at = ?
       WHERE id = ?
     `,
@@ -784,7 +658,6 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
     .run(
       registryUpdates.name,
       registryUpdates.cm_number,
-      registryUpdates.shared_with,
       registryUpdates.updated_at,
       projectId,
     );
@@ -843,138 +716,16 @@ projectsRouter.get("/:projectId/documents", requireAuth, async (req, res) => {
   res.json(docsTyped);
 });
 
-// POST /projects/:projectId/documents/:documentId — assign or copy existing doc into project
+// Documents enter a project only through its local source folders.
 projectsRouter.post(
   "/:projectId/documents/:documentId",
   requireAuth,
-  async (req, res) => {
-    const userId = res.locals.userId as string;
-    const userEmail = res.locals.userEmail as string | undefined;
-    const { projectId, documentId } = req.params;
-    const db = createServerSupabase();
-
-    const access = await checkProjectAccess(projectId, userId, userEmail, db);
-    if (!access.ok)
-      return void res.status(404).json({ detail: "Project not found" });
-
-    // Adding-by-id pulls a doc into the project — only the doc's owner
-    // is allowed to do that, so other people's standalone docs can't be
-    // siphoned into a project the requester happens to share.
-    const { data: doc } = await db
-      .from("documents")
-      .select("*")
-      .eq("id", documentId)
-      .eq("user_id", userId)
-      .single();
-    if (!doc)
-      return void res.status(404).json({ detail: "Document not found" });
-
-    // Already in this project — idempotent
-    if (doc.project_id === projectId) return void res.json(doc);
-
-    if (doc.project_id === null) {
-      // Standalone → assign project_id
-      const { data: updated, error } = await db
-        .from("documents")
-        .update({ project_id: projectId, updated_at: new Date().toISOString() })
-        .eq("id", documentId)
-        .select("*")
-        .single();
-      if (error || !updated)
-        return void res
-          .status(500)
-          .json({ detail: "Failed to update document" });
-      if (updated.current_version_id) {
-        enqueueDocumentIndex(documentId, updated.current_version_id as string);
-      }
-      return void res.json(updated);
-    } else {
-      // Belongs to another project → duplicate record AND copy the
-      // underlying storage objects so each project's copy is fully
-      // independent (edits/version bumps on one don't leak into the
-      // other).
-      const { data: copy, error } = await db
-        .from("documents")
-        .insert({
-          project_id: projectId,
-          user_id: userId,
-          filename: doc.filename,
-          file_type: doc.file_type,
-          size_bytes: doc.size_bytes,
-          page_count: doc.page_count,
-          structure_tree: doc.structure_tree,
-          status: doc.status,
-        })
-        .select("*")
-        .single();
-      if (error || !copy)
-        return void res.status(500).json({ detail: "Failed to copy document" });
-
-      let copyVersionRowId: string | null = null;
-      if (doc.current_version_id) {
-        const { data: srcV } = await db
-          .from("document_versions")
-          .select(
-            "storage_path, pdf_storage_path, version_number, display_name, source",
-          )
-          .eq("id", doc.current_version_id)
-          .single();
-        if (srcV?.storage_path) {
-          const srcBytes = await downloadFile(srcV.storage_path);
-          if (!srcBytes) {
-            return void res
-              .status(500)
-              .json({ detail: "Failed to read source document bytes" });
-          }
-          const newKey = storageKey(userId, copy.id as string, doc.filename);
-          const contentType =
-            doc.file_type === "pdf"
-              ? "application/pdf"
-              : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-          await uploadFile(newKey, srcBytes, contentType);
-
-          // PDFs share one object for source + display rendition. DOCX
-          // store the converted PDF at a separate `converted-pdfs/` key —
-          // copy that too if it exists so the copy renders without going
-          // back through libreoffice.
-          let newPdfPath: string | null = null;
-          if (srcV.pdf_storage_path) {
-            if (srcV.pdf_storage_path === srcV.storage_path) {
-              newPdfPath = newKey;
-            } else {
-              const pdfBytes = await downloadFile(srcV.pdf_storage_path);
-              if (pdfBytes) {
-                const newPdfKey = convertedPdfKey(userId, copy.id as string);
-                await uploadFile(newPdfKey, pdfBytes, "application/pdf");
-                newPdfPath = newPdfKey;
-              }
-            }
-          }
-
-          const { data: newV } = await db
-            .from("document_versions")
-            .insert({
-              document_id: copy.id,
-              storage_path: newKey,
-              pdf_storage_path: newPdfPath,
-              source: (srcV.source as string | null) ?? "upload",
-              version_number: srcV.version_number ?? 1,
-              display_name: srcV.display_name ?? doc.filename,
-            })
-            .select("id")
-            .single();
-          copyVersionRowId = (newV?.id as string | null) ?? null;
-          if (copyVersionRowId) {
-            await db
-              .from("documents")
-              .update({ current_version_id: copyVersionRowId })
-              .eq("id", copy.id);
-            enqueueDocumentIndex(copy.id as string, copyVersionRowId);
-          }
-        }
-      }
-      return void res.status(201).json(copy);
-    }
+  (_req, res) => {
+    res.status(410).json({
+      detail:
+        "Documents cannot be imported from outside a project source folder",
+      code: "cross_project_document_import_removed",
+    });
   },
 );
 
@@ -1221,7 +972,7 @@ export async function handleDocumentUpload(
         filename,
         content,
       });
-      if (sourceRootDoc) return void res.status(201).json(sourceRootDoc);
+      return void res.status(201).json(sourceRootDoc);
     } catch (err) {
       return void res.status(500).json({
         detail: `Document project-folder upload failed: ${String(err)}`,

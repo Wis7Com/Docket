@@ -7,7 +7,11 @@ import dotenv from "dotenv";
 if (!process.env.APP_DATA_PATH && !process.env.WORKSPACE_PATH) {
   dotenv.config();
 }
-import express, { type NextFunction, type Request, type Response } from "express";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
 import cors from "cors";
 import * as fs from "fs";
 import * as path from "path";
@@ -26,7 +30,6 @@ import {
   chatDbRequestContext,
   documentDbRequestContext,
   projectDbRequestContext,
-  tabularReviewDbRequestContext,
 } from "./lib/projectRegistry";
 import { createProjectFromFolder } from "./lib/projectFolders";
 import { createServerSupabase } from "./lib/supabase";
@@ -35,7 +38,7 @@ import { chatRouter } from "./routes/chat";
 import { projectsRouter } from "./routes/projects";
 import { projectChatRouter } from "./routes/projectChat";
 import { documentsRouter } from "./routes/documents";
-import { tabularRouter } from "./routes/tabular";
+import { generateTabularPromptHandler, tabularRouter } from "./routes/tabular";
 import { workflowsRouter } from "./routes/workflows";
 import { userRouter } from "./routes/user";
 import { downloadsRouter } from "./routes/downloads";
@@ -71,14 +74,24 @@ app.use((_req, _res, next) => {
 
 app.use("/chat/:chatId", chatDbRequestContext);
 app.use("/chat", chatRouter);
+app.use(
+  "/projects/:projectId/tabular-reviews",
+  requireAuth,
+  projectDbRequestContext,
+  tabularRouter,
+);
 app.use("/projects", projectsRouter);
 app.use("/projects/:projectId/chat", requireAuth, projectDbRequestContext);
 app.use("/projects/:projectId/chat", projectChatRouter);
 app.use("/single-documents/:documentId", documentDbRequestContext);
 app.use("/single-documents", documentsRouter);
-app.use("/tabular-review/:reviewId", tabularReviewDbRequestContext);
-app.use("/tabular-review", tabularReviewDbRequestContext);
-app.use("/tabular-review", tabularRouter);
+app.post("/tabular-column-prompt", requireAuth, generateTabularPromptHandler);
+app.use("/tabular-review", requireAuth, (_req, res) => {
+  res.status(410).json({
+    detail: "Global tabular reviews were removed; open a project instead",
+    code: "global_tabular_review_removed",
+  });
+});
 app.use("/workflows", workflowsRouter);
 app.use("/user", userRouter);
 app.use("/users", userRouter);

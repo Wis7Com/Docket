@@ -81,7 +81,11 @@ test("createProjectFromFolder registers an app project and stores document data 
   assert.equal(localProjects?.[0]?.path, fs.realpathSync(projectFolder));
 
   const projectId = localProjects?.[0]?.id as string;
-  const projectRow = localProjects?.[0] as { id: string; path: string; name: string };
+  const projectRow = localProjects?.[0] as {
+    id: string;
+    path: string;
+    name: string;
+  };
   await runWithDatabaseContext(projectContextFor(projectRow), async () => {
     const projectDb = createServerSupabase();
     const { data: sourceFolders } = await projectDb
@@ -133,6 +137,14 @@ test("createProjectFromFolder opens the selected folder as a self-contained proj
   assert.equal(opened.scan.imported.length, 1);
   assert.equal(opened.sourceFolder.root_path, "project:.");
 
+  const reopened = await createProjectFromFolder({
+    db,
+    userId: "folder-open-user",
+    folderPath: sourceRoot,
+  });
+  assert.equal(reopened.project.id, opened.project.id);
+  assert.equal(reopened.sourceFolder.id, opened.sourceFolder.id);
+
   await runWithDatabaseContext(
     projectContextFor(opened.project as { id: string; path: string }),
     async () => {
@@ -145,6 +157,11 @@ test("createProjectFromFolder opens the selected folder as a self-contained proj
         (docs ?? []).map((doc) => doc.filename),
         ["matter.pdf"],
       );
+      const { data: sourceFolders } = await projectDb
+        .from("source_folders")
+        .select("id")
+        .eq("project_id", opened.project.id);
+      assert.equal(sourceFolders?.length, 1);
     },
   );
 
@@ -159,10 +176,8 @@ test("createProjectFromFolder opens the selected folder as a self-contained proj
 test("global chat history includes chats stored in owned project databases", async () => {
   const { signLocalJwt } = await import("../auth/local");
   const { chatRouter } = await import("../routes/chat");
-  const {
-    ensureProjectRowInProjectDb,
-    registerProjectFolder,
-  } = await import("./projectRegistry");
+  const { ensureProjectRowInProjectDb, registerProjectFolder } =
+    await import("./projectRegistry");
   const { getAppDb, getDbForPath } = await import("../db/sqlite");
 
   const userId = "global-chat-user";
@@ -180,16 +195,11 @@ test("global chat history includes chats stored in owned project databases", asy
     userId: "other-global-chat-user",
     projectId: "shared-chat-project",
     name: "Shared Chat Project",
-    sharedWith: [userEmail],
   });
   const unavailableRoot = fs.mkdtempSync(
     path.join(testRoot, "unavailable-chat-root-"),
   );
-  const unavailableDbPath = path.join(
-    unavailableRoot,
-    ".docket",
-    "project.db",
-  );
+  const unavailableDbPath = path.join(unavailableRoot, ".docket", "project.db");
   fs.mkdirSync(unavailableDbPath, {
     recursive: true,
   });
@@ -252,7 +262,9 @@ test("global chat history includes chats stored in owned project databases", asy
     const address = server.address();
     assert.ok(address && typeof address === "object");
     const base = `http://127.0.0.1:${address.port}`;
-    const auth = { Authorization: `Bearer ${signLocalJwt(userId, userEmail)}` };
+    const auth = {
+      Authorization: `Bearer ${signLocalJwt(userId, userEmail)}`,
+    };
 
     const startedAt = Date.now();
     const chats = await requestJson<{ id: string; title: string | null }[]>(
@@ -509,10 +521,8 @@ test("project uploads copy files into the opened project folder root", async () 
   const { signLocalJwt } = await import("../auth/local");
   const { projectsRouter } = await import("../routes/projects");
   const { toStoredSourceFolderPath } = await import("./sourceFolderPaths");
-  const {
-    ensureProjectRowInProjectDb,
-    registerProjectFolder,
-  } = await import("./projectRegistry");
+  const { ensureProjectRowInProjectDb, registerProjectFolder } =
+    await import("./projectRegistry");
   const { runWithDatabaseContext } = await import("../db/sqlite");
   const userId = "project-upload-user";
   const userEmail = "project-upload@example.com";
@@ -547,7 +557,9 @@ test("project uploads copy files into the opened project folder root", async () 
     const address = server.address();
     assert.ok(address && typeof address === "object");
     const base = `http://127.0.0.1:${address.port}`;
-    const auth = { Authorization: `Bearer ${signLocalJwt(userId, userEmail)}` };
+    const auth = {
+      Authorization: `Bearer ${signLocalJwt(userId, userEmail)}`,
+    };
 
     const form = new FormData();
     form.append(
@@ -597,7 +609,10 @@ test("project uploads copy files into the opened project folder root", async () 
 
     assert.equal(duplicate.filename, "uploaded (1).pdf");
     assert.match(duplicate.storage_path, /^linked-source:/);
-    assert.equal(fs.existsSync(path.join(sourceRoot, "uploaded (1).pdf")), true);
+    assert.equal(
+      fs.existsSync(path.join(sourceRoot, "uploaded (1).pdf")),
+      true,
+    );
   } finally {
     if (server.listening) {
       await new Promise<void>((resolve, reject) => {
@@ -637,7 +652,8 @@ test("document version uploads for project documents use the project database an
   const ctx = ensureProjectRowInProjectDb(project);
   const documentId = "project-version-document";
   const versionOneId = "project-version-one";
-  const originalKey = "documents/project-version-user/project-version-document/source.pdf";
+  const originalKey =
+    "documents/project-version-user/project-version-document/source.pdf";
   await runWithDatabaseContext(ctx, async () => {
     await uploadFile(
       originalKey,
@@ -718,7 +734,11 @@ test("document version uploads for project documents use the project database an
       assert.equal(version?.pdf_storage_path, version?.storage_path);
       assert.equal(
         fs.existsSync(
-          path.join(projectDataDir(projectRoot), "files", version?.storage_path as string),
+          path.join(
+            projectDataDir(projectRoot),
+            "files",
+            version?.storage_path as string,
+          ),
         ),
         true,
       );
@@ -735,10 +755,8 @@ test("document version uploads for project documents use the project database an
 test("project download tokens restore the project database and storage context", async () => {
   const { signLocalJwt } = await import("../auth/local");
   const { downloadsRouter } = await import("../routes/downloads");
-  const {
-    ensureProjectRowInProjectDb,
-    registerProjectFolder,
-  } = await import("./projectRegistry");
+  const { ensureProjectRowInProjectDb, registerProjectFolder } =
+    await import("./projectRegistry");
   const { createServerSupabase } = await import("./supabase");
   const {
     appDataPath,
@@ -761,7 +779,8 @@ test("project download tokens restore the project database and storage context",
   const ctx = ensureProjectRowInProjectDb(project);
   const documentId = "project-download-document";
   const versionId = "project-download-version";
-  const storagePath = "documents/project-download-user/project-download-document/source.pdf";
+  const storagePath =
+    "documents/project-download-user/project-download-document/source.pdf";
   const expectedBytes = Buffer.from("project scoped download bytes", "utf8");
   const token = await runWithDatabaseContext(ctx, async () => {
     await uploadFile(
@@ -833,16 +852,11 @@ test("project download tokens restore the project database and storage context",
 });
 
 test("user settings helpers read app profiles while running in a project context", async () => {
-  const {
-    ensureProjectRowInProjectDb,
-    registerProjectFolder,
-  } = await import("./projectRegistry");
+  const { ensureProjectRowInProjectDb, registerProjectFolder } =
+    await import("./projectRegistry");
   const { getAppDb, runWithDatabaseContext } = await import("../db/sqlite");
-  const {
-    getUserApiKeys,
-    getUserModelSettings,
-    getUserRetrievalSettings,
-  } = await import("./userSettings");
+  const { getUserApiKeys, getUserModelSettings, getUserRetrievalSettings } =
+    await import("./userSettings");
   const { readUserEmbeddingSettings } = await import("./indexing/embeddings");
 
   const userId = "settings-project-user";
@@ -923,9 +937,10 @@ test("tabular review routes keep project reviews in the project database", async
   const { signLocalJwt } = await import("../auth/local");
   const { tabularRouter } = await import("../routes/tabular");
   const {
+    ensureProjectRowInProjectDb,
     projectContextFor,
+    projectDbRequestContext,
     registerProjectFolder,
-    tabularReviewDbRequestContext,
   } = await import("./projectRegistry");
   const { getAppDb, runWithDatabaseContext } = await import("../db/sqlite");
 
@@ -935,33 +950,47 @@ test("tabular review routes keep project reviews in the project database", async
   const project = registerProjectFolder({
     folderPath: projectRoot,
     userId,
-    projectId: "tabular-project-root",
     name: "Tabular Root",
   });
-  const unavailableRoot = fs.mkdtempSync(
-    path.join(testRoot, "unavailable-tabular-root-"),
-  );
-  fs.mkdirSync(path.join(unavailableRoot, ".docket", "project.db"), {
-    recursive: true,
+  ensureProjectRowInProjectDb(project);
+  const sourceDocumentId = "tabular-source-document";
+  await runWithDatabaseContext(projectContextFor(project), async () => {
+    const projectDb = createServerSupabase();
+    await projectDb.from("source_folders").insert({
+      id: "tabular-root-source-folder",
+      project_id: project.id,
+      user_id: userId,
+      root_path: "project:.",
+      display_name: "Tabular Root",
+    });
+    await projectDb.from("documents").insert({
+      id: sourceDocumentId,
+      project_id: project.id,
+      user_id: userId,
+      filename: "review-source.pdf",
+      file_type: "pdf",
+      status: "ready",
+    });
+    await projectDb.from("linked_source_files").insert({
+      id: "tabular-source-link",
+      source_folder_id: "tabular-root-source-folder",
+      document_id: sourceDocumentId,
+      relative_path: "review-source.pdf",
+      size_bytes: 1,
+      mtime_ms: 1,
+    });
   });
-  getAppDb()
-    .prepare(
-      `INSERT INTO projects (
-        id, user_id, name, path, status, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'available', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-    )
-    .run(
-      "unavailable-tabular-project",
-      userId,
-      "Unavailable Tabular Project",
-      unavailableRoot,
-    );
 
   const app = express();
   app.use(express.json());
-  app.use("/tabular-review/:reviewId", tabularReviewDbRequestContext);
-  app.use("/tabular-review", tabularReviewDbRequestContext);
-  app.use("/tabular-review", tabularRouter);
+  app.use(
+    "/projects/:projectId/tabular-reviews",
+    projectDbRequestContext,
+    tabularRouter,
+  );
+  app.use("/tabular-review", (_req, res) => {
+    res.status(410).json({ code: "global_tabular_review_removed" });
+  });
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>((resolve) => server.once("listening", resolve));
   try {
@@ -973,17 +1002,32 @@ test("tabular review routes keep project reviews in the project database", async
       "Content-Type": "application/json",
     };
 
+    const invalidDocumentResponse = await fetch(
+      `${base}/projects/${project.id}/tabular-reviews`,
+      {
+        method: "POST",
+        headers: auth,
+        body: JSON.stringify({
+          title: "Invalid Table",
+          document_ids: ["not-source-backed"],
+          columns_config: [
+            { index: 0, name: "Issue", prompt: "Extract issue" },
+          ],
+        }),
+      },
+    );
+    assert.equal(invalidDocumentResponse.status, 400);
+
     const created = await requestJson<{
       id: string;
       project_id: string;
       title: string;
-    }>(`${base}/tabular-review`, {
+    }>(`${base}/projects/${project.id}/tabular-reviews`, {
       method: "POST",
       headers: auth,
       body: JSON.stringify({
         title: "Project Table",
-        project_id: project.id,
-        document_ids: [],
+        document_ids: [sourceDocumentId],
         columns_config: [{ index: 0, name: "Issue", prompt: "Extract issue" }],
       }),
     });
@@ -1006,10 +1050,15 @@ test("tabular review routes keep project reviews in the project database", async
         .select("id, title")
         .eq("id", created.id);
       assert.deepEqual(reviews, [{ id: created.id, title: "Project Table" }]);
+      const { data: attachments } = await projectDb
+        .from("tabular_review_documents")
+        .select("document_id")
+        .eq("review_id", created.id);
+      assert.deepEqual(attachments, [{ document_id: sourceDocumentId }]);
     });
 
     const projectList = await requestJson<{ id: string }[]>(
-      `${base}/tabular-review?project_id=${encodeURIComponent(project.id)}`,
+      `${base}/projects/${project.id}/tabular-reviews`,
       { headers: { Authorization: auth.Authorization } },
     );
     assert.deepEqual(
@@ -1017,26 +1066,16 @@ test("tabular review routes keep project reviews in the project database", async
       [created.id],
     );
 
-    const globalListStartedAt = Date.now();
-    const globalList = await requestJson<{ id: string }[]>(
-      `${base}/tabular-review`,
-      { headers: { Authorization: auth.Authorization } },
-    );
-    assert.ok(
-      Date.now() - globalListStartedAt < 1_000,
-      "global tabular startup should skip an unavailable project DB without retrying",
-    );
-    assert.equal(
-      globalList.some((review) => review.id === created.id),
-      true,
-    );
+    const globalResponse = await fetch(`${base}/tabular-review`, {
+      headers: { Authorization: auth.Authorization },
+    });
+    assert.equal(globalResponse.status, 410);
 
     const detail = await requestJson<{
       review: { id: string; project_id: string };
-    }>(
-      `${base}/tabular-review/${created.id}`,
-      { headers: { Authorization: auth.Authorization } },
-    );
+    }>(`${base}/projects/${project.id}/tabular-reviews/${created.id}`, {
+      headers: { Authorization: auth.Authorization },
+    });
     assert.equal(detail.review.id, created.id);
     assert.equal(detail.review.project_id, project.id);
   } finally {
@@ -1317,7 +1356,8 @@ test("PDF annotation routes keep metadata separate until explicit export", async
       "source PDFs should still import embedded PDF annotations as separate metadata",
     );
     const importedEmbedded = versionOneRows.find(
-      (row) => row.source === "user" && row.quote === "embedded source highlight",
+      (row) =>
+        row.source === "user" && row.quote === "embedded source highlight",
     );
     assert.ok(importedEmbedded);
     const deleteImported = await fetch(
@@ -1378,18 +1418,23 @@ test("PDF annotation routes keep metadata separate until explicit export", async
     );
     assert.equal(versionTwoRows.length, 0);
 
-    const collaboratorRows = await requestJson<unknown[]>(
+    const collaboratorListResponse = await fetch(
       `${base}/single-documents/${documentId}/annotations?version_id=${versionOneId}`,
       { headers: collaboratorAuth },
     );
-    assert.equal(collaboratorRows.length, 0);
+    assert.equal(collaboratorListResponse.status, 404);
 
     const patchResponse = await fetch(
       `${base}/single-documents/${documentId}/annotations/${created.id}`,
       {
         method: "PATCH",
-        headers: { ...collaboratorAuth, "Content-Type": "application/json" },
-        body: JSON.stringify({ comment: "should not update owner row" }),
+        headers: {
+          ...collaboratorAuth,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          comment: "should not update owner row",
+        }),
       },
     );
     assert.equal(patchResponse.status, 404);
@@ -1421,9 +1466,13 @@ test("PDF annotation routes keep metadata separate until explicit export", async
       .eq("document_id", documentId)
       .eq("user_id", ownerId);
     const rowsById = new Map(
-      (metadataRows as { id: string; version_id: string; deleted_at: string | null }[]).map(
-        (row) => [row.id, row],
-      ),
+      (
+        metadataRows as {
+          id: string;
+          version_id: string;
+          deleted_at: string | null;
+        }[]
+      ).map((row) => [row.id, row]),
     );
     assert.equal(rowsById.get(created.id)?.version_id, versionOneId);
     assert.equal(rowsById.get(comment.id)?.version_id, versionOneId);
@@ -1537,7 +1586,10 @@ test("PDF annotation routes keep metadata separate until explicit export", async
 async function samplePdfBytes(
   text: string,
   options?: {
-    highlight?: { contents: string; rect: [number, number, number, number] };
+    highlight?: {
+      contents: string;
+      rect: [number, number, number, number];
+    };
   },
 ): Promise<ArrayBuffer> {
   const pdf = await PDFDocument.create();

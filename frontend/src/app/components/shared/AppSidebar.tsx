@@ -5,7 +5,6 @@ import {
   PanelLeft,
   MessageSquare,
   FolderOpen,
-  Table2,
   Library,
   Settings,
   ChevronDown,
@@ -21,7 +20,6 @@ import { listProjects } from "@/app/lib/docketApi";
 const NAV_ITEMS = [
   { href: "/assistant", label: "Assistant", icon: MessageSquare },
   { href: "/projects", label: "Projects", icon: FolderOpen },
-  { href: "/tabular-reviews", label: "Tabular Review", icon: Table2 },
   { href: "/workflows", label: "Workflows", icon: Library },
   { href: "/account", label: "Settings", icon: Settings },
 ];
@@ -220,7 +218,6 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
           </div>
         </div>
       )}
-
     </div>
   );
 }

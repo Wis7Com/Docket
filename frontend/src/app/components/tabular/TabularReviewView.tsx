@@ -28,7 +28,6 @@ import type {
   TabularReview,
 } from "../shared/types";
 import { AddColumnModal } from "./AddColumnModal";
-import { AddDocumentsModal } from "../shared/AddDocumentsModal";
 import { AddProjectDocsModal } from "../shared/AddProjectDocsModal";
 import { OwnerOnlyModal } from "../shared/OwnerOnlyModal";
 import { ApiKeyMissingModal } from "../shared/ApiKeyMissingModal";
@@ -48,7 +47,7 @@ import { useSidebar } from "@/app/contexts/SidebarContext";
 
 interface Props {
   reviewId: string;
-  projectId?: string;
+  projectId: string;
 }
 
 export function TRView({ reviewId, projectId }: Props) {
@@ -125,20 +124,20 @@ export function TRView({ reviewId, projectId }: Props) {
 
   useEffect(() => {
     const fetches: Promise<unknown>[] = [
-      getTabularReview(reviewId).then(({ review, cells, documents }) => {
-        setReview(review);
-        setCells(cells);
-        setDocuments(documents);
-        setColumns(review.columns_config || []);
-      }),
+      getTabularReview(projectId, reviewId).then(
+        ({ review, cells, documents }) => {
+          setReview(review);
+          setCells(cells);
+          setDocuments(documents);
+          setColumns(review.columns_config || []);
+        },
+      ),
     ];
-    if (projectId) {
-      fetches.push(
-        getProject(projectId)
-          .then(setProject)
-          .catch(() => {}),
-      );
-    }
+    fetches.push(
+      getProject(projectId)
+        .then(setProject)
+        .catch(() => {}),
+    );
     Promise.all(fetches).finally(() => setLoading(false));
   }, [reviewId, projectId]);
 
@@ -149,7 +148,7 @@ export function TRView({ reviewId, projectId }: Props) {
   async function saveColumnsConfig(nextColumns: ColumnConfig[]) {
     setSavingColumnsConfig(true);
     try {
-      const updated = await updateTabularReview(reviewId, {
+      const updated = await updateTabularReview(projectId, reviewId, {
         columns_config: nextColumns,
         document_ids: documents.map((document) => document.id),
       });
@@ -167,7 +166,7 @@ export function TRView({ reviewId, projectId }: Props) {
     if (!toAdd.length) return;
     const allIds = [...documents.map((d) => d.id), ...toAdd.map((d) => d.id)];
 
-    await updateTabularReview(reviewId, {
+    await updateTabularReview(projectId, reviewId, {
       document_ids: allIds,
       columns_config: columns,
     });
@@ -202,7 +201,12 @@ export function TRView({ reviewId, projectId }: Props) {
       prev ? { ...prev, status: "generating" as const, content: null } : null,
     );
     try {
-      const result = await regenerateTabularCell(reviewId, docId, colIndex);
+      const result = await regenerateTabularCell(
+        projectId,
+        reviewId,
+        docId,
+        colIndex,
+      );
       setCells((prev) =>
         prev.map((c) =>
           c.document_id === docId && c.column_index === colIndex
@@ -271,7 +275,7 @@ export function TRView({ reviewId, projectId }: Props) {
     );
 
     try {
-      const response = await streamTabularGeneration(reviewId);
+      const response = await streamTabularGeneration(projectId, reviewId);
       if (!response.body) throw new Error("No body");
 
       const reader = response.body.getReader();
@@ -421,7 +425,7 @@ export function TRView({ reviewId, projectId }: Props) {
     );
     setSelectedDocIds([]);
     setActionsOpen(false);
-    await updateTabularReview(reviewId, {
+    await updateTabularReview(projectId, reviewId, {
       document_ids: remaining.map((d) => d.id),
       columns_config: columns,
     });
@@ -439,13 +443,13 @@ export function TRView({ reviewId, projectId }: Props) {
     );
     setSelectedDocIds([]);
     setActionsOpen(false);
-    await clearTabularCells(reviewId, docIds);
+    await clearTabularCells(projectId, reviewId, docIds);
   }
 
   async function handleTitleCommit(newTitle: string) {
     if (!newTitle || newTitle === review?.title) return;
     setReview((prev) => (prev ? { ...prev, title: newTitle } : prev));
-    await updateTabularReview(reviewId, { title: newTitle });
+    await updateTabularReview(projectId, reviewId, { title: newTitle });
   }
 
   const q = search.toLowerCase();
@@ -459,51 +463,41 @@ export function TRView({ reviewId, projectId }: Props) {
         {/* Header */}
         <div className="bg-white px-8 py-4 flex items-start justify-between shrink-0 gap-4">
           <div className="flex items-center gap-1.5 text-2xl font-medium font-serif">
-            {projectId && (
-              <>
-                <button
-                  onClick={() => router.push("/projects")}
-                  className="text-gray-500 hover:text-gray-700 transition-colors"
-                >
-                  Projects
-                </button>
-                <span className="text-gray-300">›</span>
-                <button
-                  onClick={() => router.push(`/projects/${projectId}`)}
-                  className="text-gray-500 hover:text-gray-700 transition-colors"
-                >
-                  {loading ? (
-                    <div className="h-6 w-32 rounded bg-gray-100 animate-pulse" />
-                  ) : (
-                    <>
-                      {project?.name ?? ""}
-                      {project?.cm_number && (
-                        <span className="ml-1 text-gray-400">
-                          (#{project.cm_number})
-                        </span>
-                      )}
-                    </>
-                  )}
-                </button>
-                <span className="text-gray-300">›</span>
-                <button
-                  onClick={() =>
-                    router.push(`/projects/${projectId}?tab=reviews`)
-                  }
-                  className="text-gray-500 hover:text-gray-700 transition-colors"
-                >
-                  Tabular Reviews
-                </button>
-              </>
-            )}
-            {!projectId && (
+            <>
               <button
-                onClick={() => router.push("/tabular-reviews")}
+                onClick={() => router.push("/projects")}
+                className="text-gray-500 hover:text-gray-700 transition-colors"
+              >
+                Projects
+              </button>
+              <span className="text-gray-300">›</span>
+              <button
+                onClick={() => router.push(`/projects/${projectId}`)}
+                className="text-gray-500 hover:text-gray-700 transition-colors"
+              >
+                {loading ? (
+                  <div className="h-6 w-32 rounded bg-gray-100 animate-pulse" />
+                ) : (
+                  <>
+                    {project?.name ?? ""}
+                    {project?.cm_number && (
+                      <span className="ml-1 text-gray-400">
+                        (#{project.cm_number})
+                      </span>
+                    )}
+                  </>
+                )}
+              </button>
+              <span className="text-gray-300">›</span>
+              <button
+                onClick={() =>
+                  router.push(`/projects/${projectId}?tab=reviews`)
+                }
                 className="text-gray-500 hover:text-gray-700 transition-colors"
               >
                 Tabular Reviews
               </button>
-            )}
+            </>
             <span className="text-gray-300">›</span>
             {loading ? (
               <div className="h-6 w-40 rounded bg-gray-100 animate-pulse" />
@@ -646,6 +640,7 @@ export function TRView({ reviewId, projectId }: Props) {
         <div className="flex flex-1 overflow-hidden">
           {chatOpen && (
             <TRChatPanel
+              projectId={projectId}
               reviewId={reviewId}
               reviewTitle={review?.title ?? null}
               projectName={project?.name ?? null}
@@ -738,34 +733,21 @@ export function TRView({ reviewId, projectId }: Props) {
         onAdd={handleAddColumn}
       />
 
-      {project ? (
-        <AddProjectDocsModal
-          open={addDocsOpen}
-          onClose={() => setAddDocsOpen(false)}
-          onSelect={(docs: DocketDocument[]) => handleAddDocuments(docs)}
-          breadcrumb={[
-            "Projects",
-            project.name +
-              (project.cm_number ? ` (#${project.cm_number})` : ""),
-            "Tabular Reviews",
-            ...(review ? [review.title || "Untitled Review"] : []),
-            "Add Documents",
-          ]}
-          projectId={project.id}
-          excludeDocIds={new Set(documents.map((d) => d.id))}
-        />
-      ) : (
-        <AddDocumentsModal
-          open={addDocsOpen}
-          onClose={() => setAddDocsOpen(false)}
-          onSelect={(docs: DocketDocument[]) => handleAddDocuments(docs)}
-          breadcrumb={[
-            "Tabular Reviews",
-            ...(review ? [review.title || "Untitled Review"] : []),
-            "Add Documents",
-          ]}
-        />
-      )}
+      <AddProjectDocsModal
+        open={addDocsOpen}
+        onClose={() => setAddDocsOpen(false)}
+        onSelect={(docs: DocketDocument[]) => handleAddDocuments(docs)}
+        breadcrumb={[
+          "Projects",
+          (project?.name ?? "Project") +
+            (project?.cm_number ? ` (#${project.cm_number})` : ""),
+          "Tabular Reviews",
+          ...(review ? [review.title || "Untitled Review"] : []),
+          "Add Documents",
+        ]}
+        projectId={projectId}
+        excludeDocIds={new Set(documents.map((d) => d.id))}
+      />
 
       <OwnerOnlyModal
         open={!!ownerOnlyAction}

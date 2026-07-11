@@ -57,8 +57,7 @@ export class DocketApiError extends Error {
 export async function getApiBase(): Promise<string> {
   if (typeof window !== "undefined") {
     const bridge = window.docket as
-      | { getApiPort?: () => Promise<number> }
-      | undefined;
+      { getApiPort?: () => Promise<number> } | undefined;
     if (bridge?.getApiPort) {
       try {
         const port = await bridge.getApiPort();
@@ -146,18 +145,6 @@ export async function listProjects(): Promise<DocketProject[]> {
   return apiRequest<DocketProject[]>("/projects");
 }
 
-export async function createProject(
-  name: string,
-  cm_number?: string,
-  shared_with?: string[],
-): Promise<DocketProject> {
-  return apiRequest<DocketProject>("/projects", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, cm_number, shared_with }),
-  });
-}
-
 export async function openProjectFolder(path: string): Promise<DocketProject> {
   return apiRequest<DocketProject>("/projects/open-folder", {
     method: "POST",
@@ -185,7 +172,6 @@ export async function updateProject(
   payload: {
     name?: string;
     cm_number?: string;
-    shared_with?: string[];
   },
 ): Promise<DocketProject> {
   return apiRequest<DocketProject>(`/projects/${projectId}`, {
@@ -197,21 +183,6 @@ export async function updateProject(
 
 export async function deleteProject(projectId: string): Promise<void> {
   await apiRequest(`/projects/${projectId}`, { method: "DELETE" });
-}
-
-export interface ProjectPeople {
-  owner: {
-    user_id: string;
-    email: string | null;
-    display_name: string | null;
-  };
-  members: { email: string; display_name: string | null }[];
-}
-
-export async function getProjectPeople(
-  projectId: string,
-): Promise<ProjectPeople> {
-  return apiRequest<ProjectPeople>(`/projects/${projectId}/people`);
 }
 
 export interface ProjectIndexStatus {
@@ -256,12 +227,7 @@ export interface ProjectSearchResult {
   lexical_score?: number | null;
   semantic_score?: number | null;
   match_reasons?: (
-    | "exact"
-    | "keyword"
-    | "substring"
-    | "semantic"
-    | "filename"
-    | "basic"
+    "exact" | "keyword" | "substring" | "semantic" | "filename" | "basic"
   )[];
   grouped_chunk_count?: number;
   basic_match: boolean;
@@ -423,16 +389,6 @@ export async function moveDocumentToFolder(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ folder_id: folderId }),
     },
-  );
-}
-
-export async function addDocumentToProject(
-  projectId: string,
-  documentId: string,
-): Promise<DocketDocument> {
-  return apiRequest<DocketDocument>(
-    `/projects/${projectId}/documents/${documentId}`,
-    { method: "POST" },
   );
 }
 
@@ -902,20 +858,21 @@ export async function streamProjectChat(payload: {
 // ---------------------------------------------------------------------------
 
 export async function listTabularReviews(
-  projectId?: string,
+  projectId: string,
 ): Promise<TabularReview[]> {
-  const qs = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
-  return apiRequest<TabularReview[]>(`/tabular-review${qs}`);
+  return apiRequest<TabularReview[]>(`/projects/${projectId}/tabular-reviews`);
 }
 
-export async function createTabularReview(payload: {
-  title?: string;
-  document_ids: string[];
-  columns_config: { index: number; name: string; prompt: string }[];
-  workflow_id?: string;
-  project_id?: string;
-}): Promise<TabularReview> {
-  return apiRequest<TabularReview>("/tabular-review", {
+export async function createTabularReview(
+  projectId: string,
+  payload: {
+    title?: string;
+    document_ids: string[];
+    columns_config: { index: number; name: string; prompt: string }[];
+    workflow_id?: string;
+  },
+): Promise<TabularReview> {
+  return apiRequest<TabularReview>(`/projects/${projectId}/tabular-reviews`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -923,32 +880,31 @@ export async function createTabularReview(payload: {
 }
 
 export async function getTabularReview(
+  projectId: string,
   reviewId: string,
 ): Promise<TabularReviewDetailOut> {
-  return apiRequest<TabularReviewDetailOut>(`/tabular-review/${reviewId}`);
+  return apiRequest<TabularReviewDetailOut>(
+    `/projects/${projectId}/tabular-reviews/${reviewId}`,
+  );
 }
 
 export async function updateTabularReview(
+  projectId: string,
   reviewId: string,
   payload: {
     title?: string;
     columns_config?: { index: number; name: string; prompt: string }[];
     document_ids?: string[];
-    project_id?: string | null;
-    shared_with?: string[];
   },
 ): Promise<TabularReview> {
-  return apiRequest<TabularReview>(`/tabular-review/${reviewId}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function getTabularReviewPeople(
-  reviewId: string,
-): Promise<ProjectPeople> {
-  return apiRequest<ProjectPeople>(`/tabular-review/${reviewId}/people`);
+  return apiRequest<TabularReview>(
+    `/projects/${projectId}/tabular-reviews/${reviewId}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export async function generateTabularColumnPrompt(
@@ -958,7 +914,7 @@ export async function generateTabularColumnPrompt(
   return apiRequest<{
     prompt: string;
     source: "preset" | "llm" | "fallback";
-  }>("/tabular-review/prompt", {
+  }>("/tabular-column-prompt", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -971,19 +927,17 @@ export async function generateTabularColumnPrompt(
 }
 
 export async function uploadReviewDocument(
+  projectId: string,
   reviewId: string,
   file: File,
   options?: {
-    projectId?: string;
     documentIds?: string[];
     columnsConfig?: { index: number; name: string; prompt: string }[];
   },
 ): Promise<DocketDocument> {
-  const uploaded = options?.projectId
-    ? await uploadProjectDocument(options.projectId, file)
-    : await uploadStandaloneDocument(file);
+  const uploaded = await uploadProjectDocument(projectId, file);
 
-  await updateTabularReview(reviewId, {
+  await updateTabularReview(projectId, reviewId, {
     columns_config: options?.columnsConfig,
     document_ids: [...(options?.documentIds ?? []), uploaded.id],
   });
@@ -991,21 +945,31 @@ export async function uploadReviewDocument(
   return uploaded;
 }
 
-export async function deleteTabularReview(reviewId: string): Promise<void> {
-  await apiRequest(`/tabular-review/${reviewId}`, { method: "DELETE" });
-}
-
-export async function streamTabularGeneration(
+export async function deleteTabularReview(
+  projectId: string,
   reviewId: string,
-): Promise<Response> {
-  const authHeaders = await getAuthHeader();
-  return fetch(`${await getApiBase()}/tabular-review/${reviewId}/generate`, {
-    method: "POST",
-    headers: { ...authHeaders },
+): Promise<void> {
+  await apiRequest(`/projects/${projectId}/tabular-reviews/${reviewId}`, {
+    method: "DELETE",
   });
 }
 
+export async function streamTabularGeneration(
+  projectId: string,
+  reviewId: string,
+): Promise<Response> {
+  const authHeaders = await getAuthHeader();
+  return fetch(
+    `${await getApiBase()}/projects/${projectId}/tabular-reviews/${reviewId}/generate`,
+    {
+      method: "POST",
+      headers: { ...authHeaders },
+    },
+  );
+}
+
 export async function streamTabularChat(
+  projectId: string,
   reviewId: string,
   messages: { role: string; content: string }[],
   chat_id?: string | null,
@@ -1013,17 +977,20 @@ export async function streamTabularChat(
   context?: { reviewTitle?: string | null; projectName?: string | null },
 ): Promise<Response> {
   const authHeaders = await getAuthHeader();
-  return fetch(`${await getApiBase()}/tabular-review/${reviewId}/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...authHeaders },
-    body: JSON.stringify({
-      messages,
-      chat_id: chat_id ?? undefined,
-      review_title: context?.reviewTitle ?? undefined,
-      project_name: context?.projectName ?? undefined,
-    }),
-    signal: signal ?? undefined,
-  });
+  return fetch(
+    `${await getApiBase()}/projects/${projectId}/tabular-reviews/${reviewId}/chat`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        messages,
+        chat_id: chat_id ?? undefined,
+        review_title: context?.reviewTitle ?? undefined,
+        project_name: context?.projectName ?? undefined,
+      }),
+      signal: signal ?? undefined,
+    },
+  );
 }
 
 export interface TRCitationAnnotation {
@@ -1084,29 +1051,40 @@ export function mapTRMessages(raw: RawTRMessage[]): TRDisplayMessage[] {
   });
 }
 
-export async function getTabularChats(reviewId: string): Promise<TRChat[]> {
-  return apiRequest<TRChat[]>(`/tabular-review/${reviewId}/chats`);
+export async function getTabularChats(
+  projectId: string,
+  reviewId: string,
+): Promise<TRChat[]> {
+  return apiRequest<TRChat[]>(
+    `/projects/${projectId}/tabular-reviews/${reviewId}/chats`,
+  );
 }
 
 export async function getTabularChatMessages(
+  projectId: string,
   reviewId: string,
   chatId: string,
 ): Promise<RawTRMessage[]> {
   return apiRequest<RawTRMessage[]>(
-    `/tabular-review/${reviewId}/chats/${chatId}/messages`,
+    `/projects/${projectId}/tabular-reviews/${reviewId}/chats/${chatId}/messages`,
   );
 }
 
 export async function deleteTabularChat(
+  projectId: string,
   reviewId: string,
   chatId: string,
 ): Promise<void> {
-  await apiRequest(`/tabular-review/${reviewId}/chats/${chatId}`, {
-    method: "DELETE",
-  });
+  await apiRequest(
+    `/projects/${projectId}/tabular-reviews/${reviewId}/chats/${chatId}`,
+    {
+      method: "DELETE",
+    },
+  );
 }
 
 export async function regenerateTabularCell(
+  projectId: string,
   reviewId: string,
   documentId: string,
   columnIndex: number,
@@ -1115,25 +1093,32 @@ export async function regenerateTabularCell(
   flag: "green" | "grey" | "yellow" | "red";
   reasoning: string;
 }> {
-  return apiRequest(`/tabular-review/${reviewId}/regenerate-cell`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      document_id: documentId,
-      column_index: columnIndex,
-    }),
-  });
+  return apiRequest(
+    `/projects/${projectId}/tabular-reviews/${reviewId}/regenerate-cell`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        document_id: documentId,
+        column_index: columnIndex,
+      }),
+    },
+  );
 }
 
 export async function clearTabularCells(
+  projectId: string,
   reviewId: string,
   documentIds: string[],
 ): Promise<void> {
-  await apiRequest(`/tabular-review/${reviewId}/clear-cells`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ document_ids: documentIds }),
-  });
+  await apiRequest(
+    `/projects/${projectId}/tabular-reviews/${reviewId}/clear-cells`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ document_ids: documentIds }),
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -52,6 +52,7 @@ interface TRMessage {
 }
 
 interface Props {
+  projectId: string;
   reviewId: string;
   reviewTitle?: string | null;
   projectName?: string | null;
@@ -559,6 +560,7 @@ function findLastContentIndex(events: AssistantEvent[]): number {
 // ---------------------------------------------------------------------------
 
 export function TRChatPanel({
+  projectId,
   reviewId,
   reviewTitle,
   projectName,
@@ -633,20 +635,20 @@ export function TRChatPanel({
 
   // Load existing chats from DB on mount
   useEffect(() => {
-    getTabularChats(reviewId)
+    getTabularChats(projectId, reviewId)
       .then(setChats)
       .catch(() => {});
-  }, [reviewId]);
+  }, [projectId, reviewId]);
 
   // Load messages for an initial chat id (e.g. from URL)
   useEffect(() => {
     if (!initialChatId) return;
     setIsLoadingMessages(true);
-    getTabularChatMessages(reviewId, initialChatId)
+    getTabularChatMessages(projectId, reviewId, initialChatId)
       .then((raw) => setMessages(mapTRMessages(raw) as TRMessage[]))
       .catch(() => {})
       .finally(() => setIsLoadingMessages(false));
-  }, [reviewId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [projectId, reviewId]);
 
   // Fill in title once chats list arrives
   useEffect(() => {
@@ -892,7 +894,7 @@ export function TRChatPanel({
     setCurrentChatTitle(null);
     setMessages([]);
     try {
-      await deleteTabularChat(reviewId, chatIdToDelete);
+      await deleteTabularChat(projectId, reviewId, chatIdToDelete);
     } catch {
       /* ignore */
     }
@@ -906,7 +908,7 @@ export function TRChatPanel({
     setHistoryOpen(false);
     setIsLoadingMessages(true);
     try {
-      const raw = await getTabularChatMessages(reviewId, chatId);
+      const raw = await getTabularChatMessages(projectId, reviewId, chatId);
       setMessages(mapTRMessages(raw) as TRMessage[]);
     } catch {
       /* ignore */
@@ -965,6 +967,7 @@ export function TRChatPanel({
 
     try {
       const response = await streamTabularChat(
+        projectId,
         reviewId,
         allMessages,
         currentChatId,

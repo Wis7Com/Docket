@@ -16,5 +16,5 @@ test("tabular reviews do not expose multi-user sharing UI", () => {
 test("removing sharing UI keeps adjacent tabular review actions", () => {
   assert.match(source, /<HeaderSearchBtn/);
   assert.match(source, /exportTabularReviewToExcel/);
-  assert.match(source, /<AddDocumentsModal/);
+  assert.match(source, /<AddProjectDocsModal/);
 });
