@@ -8,7 +8,9 @@ import {
     extractAnnotations,
     filterDocContext,
     filterToolsByDisabled,
+    extractAnnotationContext,
     fetchUserPdfAnnotations,
+    readAnnotationContexts,
     resolveSearchDocumentIds,
     sanitizeAssistantVisibleText,
     validateCitationContract,
@@ -93,7 +95,7 @@ test("project chat exposes a dedicated annotation retrieval tool", () => {
 });
 
 test("filterToolsByDisabled is deny-only and ignores unknown tool names", () => {
-    const tools = PROJECT_EXTRA_TOOLS.slice(0, 3);
+    const tools = PROJECT_EXTRA_TOOLS.slice(0, 4);
     const filtered = filterToolsByDisabled(tools, [
         "get_user_pdf_annotations",
         "not_a_server_tool",
@@ -103,9 +105,46 @@ test("filterToolsByDisabled is deny-only and ignores unknown tool names", () => 
             (tool) =>
                 (tool as { function: { name: string } }).function.name,
         ),
-        ["list_documents", "search_project_documents"],
+        ["read_annotation_context", "list_documents", "search_project_documents"],
     );
 });
+
+type AnnotationTestRow = Record<string, unknown>;
+
+class AnnotationQuery {
+  private filters: Array<(row: AnnotationTestRow) => boolean> = [];
+  constructor(private readonly rows: AnnotationTestRow[]) {}
+  select() { return this; }
+  eq(column: string, value: unknown) {
+    this.filters.push((row) => row[column] === value); return this;
+  }
+  neq(column: string, value: unknown) {
+    this.filters.push((row) => row[column] !== value); return this;
+  }
+  in(column: string, values: unknown[]) {
+    this.filters.push((row) => values.includes(row[column])); return this;
+  }
+  is(column: string, value: unknown) {
+    this.filters.push((row) => row[column] === value); return this;
+  }
+  not(column: string, op: string, value: unknown) {
+    assert.equal(op, "is");
+    this.filters.push((row) => row[column] !== value); return this;
+  }
+  then<TResult1 = { data: AnnotationTestRow[]; error: null }, TResult2 = never>(
+    onfulfilled?: ((value: { data: AnnotationTestRow[]; error: null }) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ) {
+    return Promise.resolve({
+      data: this.rows.filter((row) => this.filters.every((filter) => filter(row))),
+      error: null,
+    }).then(onfulfilled, onrejected);
+  }
+}
+
+function annotationDb(rows: AnnotationTestRow[]) {
+  return { from: () => new AnnotationQuery(rows) } as never;
+}
 
 test("fetchUserPdfAnnotations scopes rows to matched docs, user query, and current version", async () => {
     const rows = [
@@ -149,16 +188,9 @@ test("fetchUserPdfAnnotations scopes rows to matched docs, user query, and curre
             deleted_at: null,
         },
     ];
-    const chain = {
-        select() { return this; },
-        eq() { return this; },
-        in() { return this; },
-        order() { return this; },
-        async limit() { return { data: rows, error: null }; },
-    };
     const result = await fetchUserPdfAnnotations({
         userId: "user-a",
-        db: { from: () => chain } as never,
+        db: annotationDb(rows.map((row) => ({ ...row, user_id: "user-a" }))),
         docIndex,
         documentQuery: "credit agreement",
     });
@@ -175,12 +207,112 @@ test("fetchUserPdfAnnotations scopes rows to matched docs, user query, and curre
             page: 12,
             type: "highlight",
             color: "#ffff00",
+            color_family: "yellow",
             quote: "The DAO may appoint a manager.",
             comment: null,
             source: "user",
             created_at: "2026-07-10T12:00:00Z",
         },
     ]);
+    assert.equal((result.summary as { project_total: number }).project_total, 2);
+});
+
+test("fetchUserPdfAnnotations applies filters and filtered summaries", async () => {
+  const rows = [
+    { id: "red", user_id: "user-a", document_id: "document-a", version_id: "version-a", page_number: 3, annotation_type: "highlight", color: "#ff8787", quote: "red", comment: "note", source: "user", created_at: "2026-01-01T00:00:00Z", deleted_at: null },
+    { id: "blue", user_id: "user-a", document_id: "document-a", version_id: "version-a", page_number: 4, annotation_type: "highlight", color: "#74c0fc", quote: "blue", comment: null, source: "citation_promotion", created_at: "2026-01-02T00:00:00Z", deleted_at: null },
+    { id: "gray", user_id: "user-a", document_id: "document-b", version_id: null, page_number: 1, annotation_type: "comment", color: "#dfdfdf", quote: null, comment: "", source: "user", created_at: "2026-01-03T00:00:00Z", deleted_at: null },
+  ];
+  const red = await fetchUserPdfAnnotations({
+    userId: "user-a", db: annotationDb(rows), docIndex,
+    colorFamily: ["red"], source: "user", hasComment: true,
+  });
+  assert.deepEqual((red.annotations as Array<{ id: string }>).map((row) => row.id), ["red"]);
+  assert.deepEqual(red.summary, {
+    total: 1,
+    project_total: 3,
+    by_color: [{ color: "#ff8787", color_family: "red", count: 1 }],
+    by_document: [{ doc_id: "document-a", filename: "credit-agreement.pdf", count: 1 }],
+    by_type: { highlight: 1 },
+    by_source: { user: 1 },
+    with_comment: 1,
+  });
+  const exact = await fetchUserPdfAnnotations({
+    userId: "user-a", db: annotationDb(rows), docIndex,
+    colors: ["#74C0FC"], source: "citation_promotion", hasComment: false,
+  });
+  assert.deepEqual((exact.annotations as Array<{ id: string }>).map((row) => row.id), ["blue"]);
+  const recent = await fetchUserPdfAnnotations({
+    userId: "user-a", db: annotationDb(rows), docIndex, hasComment: false, order: "recent",
+  });
+  assert.deepEqual((recent.annotations as Array<{ id: string }>).map((row) => row.id), ["gray", "blue"]);
+});
+
+test("fetchUserPdfAnnotations paginates 900 rows without duplicates or the old cap", async () => {
+  const rows = Array.from({ length: 900 }, (_, index) => ({
+    id: `annotation-${index.toString().padStart(4, "0")}`,
+    user_id: "user-a",
+    document_id: index % 2 ? "document-b" : "document-a",
+    version_id: index % 2 ? null : "version-a",
+    page_number: Math.floor(index / 2) + 1,
+    annotation_type: "highlight",
+    color: index % 2 ? "#74c0fc" : "#feffa0",
+    quote: `quote ${index}`,
+    comment: null,
+    source: "user",
+    created_at: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+    deleted_at: null,
+  }));
+  const first = await fetchUserPdfAnnotations({ userId: "user-a", db: annotationDb(rows), docIndex, limit: 100 });
+  const second = await fetchUserPdfAnnotations({ userId: "user-a", db: annotationDb(rows), docIndex, limit: 100, offset: 100 });
+  const firstIds = (first.annotations as Array<{ id: string }>).map((row) => row.id);
+  const secondIds = (second.annotations as Array<{ id: string }>).map((row) => row.id);
+  assert.equal(first.total, 900);
+  assert.equal(first.next_offset, 100);
+  assert.equal(new Set([...firstIds, ...secondIds]).size, 200);
+  assert.equal((first.summary as { project_total: number }).project_total, 900);
+});
+
+test("annotation context locates same-page and cross-chunk quotes", () => {
+  assert.deepEqual(extractAnnotationContext({
+    quote: "target phrase", page: 1, radius: 7,
+    chunks: [{ chunk_index: 0, page_number: 1, content: "prefix target phrase suffix", start_char: 0, end_char: 27 }],
+  }), { before: "prefix ", after: " suffix", located: true });
+  const spanning = extractAnnotationContext({
+    quote: "boundary phrase", page: 2, radius: 20,
+    chunks: [
+      { chunk_index: 0, page_number: 2, content: "before boundary ", start_char: 0, end_char: 16 },
+      { chunk_index: 1, page_number: 3, content: "phrase after", start_char: 16, end_char: 28 },
+    ],
+  });
+  assert.equal(spanning.located, true);
+  assert.match(spanning.before, /before/);
+  assert.match(spanning.after, /after/);
+});
+
+test("annotation context returns bounded page text when a quote is absent", () => {
+  assert.deepEqual(extractAnnotationContext({
+    quote: "missing", page: 5, radius: 5,
+    chunks: [{ chunk_index: 2, page_number: 5, content: "abcdefghijklmno", start_char: 0, end_char: 15 }],
+  }), { before: "", after: "", located: false, page_text: "abcdefghij" });
+});
+
+test("readAnnotationContexts caps ids and radius and prevents cross-document access", async () => {
+  const rows = Array.from({ length: 25 }, (_, index) => ({
+    id: `id-${index}`, user_id: "user-a", document_id: "document-a", version_id: "version-a",
+    page_number: 1, annotation_type: "highlight", color: "#feffa0", quote: `quote ${index}`,
+    comment: null, source: "user", created_at: "2026-01-01T00:00:00Z", deleted_at: null,
+  }));
+  rows.push({ ...rows[0], id: "outside", document_id: "outside-document", version_id: "outside-version" });
+  const result = await readAnnotationContexts({
+    userId: "user-a", db: annotationDb(rows), docIndex,
+    annotationIds: [...rows.map((row) => row.id), "outside"], radius: 9999,
+    loadChunks: () => [{ chunk_index: 0, page_number: 1, content: rows.map((row) => row.quote).join(" -- "), start_char: 0, end_char: 500 }],
+  });
+  assert.equal(result.requested, 20);
+  assert.equal(result.returned, 20);
+  assert.equal(result.radius, 2000);
+  assert.equal((result.contexts as Array<{ annotation_id: string }>).some((row) => row.annotation_id === "outside"), false);
 });
 
 test("filterDocContext preserves original slugs while filtering every context map", () => {

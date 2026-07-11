@@ -22,6 +22,14 @@ test("annotation prompt requires the dedicated tool instead of document search",
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /hilighted/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /하이라이트/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /Never substitute search_project_documents/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /first call.*without color or document filters/s);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /next_offset/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /summary is computed over the complete filtered result set/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /do not accumulate every raw annotation/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /read_annotation_context/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /user's current message/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /colors exact-hex filter/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /user notes.*not document facts/);
 });
 
 test("selected document scope ignores injected ids and fails open only for empty intersections", () => {
@@ -64,15 +72,31 @@ test("requestsAnnotationContext recognizes user-defined color emphasis prompts",
         true,
     );
     assert.equal(requestsAnnotationContext("Find the red flags in this agreement"), false);
+    assert.equal(
+        requestsAnnotationContext(
+            "빨간 색은 원고 주장, 파란 색은 피고 주장이니까 annotation을 대비한 표를 만들어",
+        ),
+        true,
+    );
+    assert.equal(requestsAnnotationContext("내가 comment 남긴 항목들을 정리해"), true);
+    assert.equal(
+        requestsAnnotationContext("회색은 다툼 없는 사실이니 표로 만들어"),
+        true,
+    );
 });
 
 test("describeAnnotationColor adds readable labels for filterable colors", () => {
-    assert.equal(describeAnnotationColor("#f783ac"), "pink/red");
+    assert.equal(describeAnnotationColor("#f783ac"), "pink");
     assert.equal(describeAnnotationColor("#74c0fc"), "blue");
+    assert.equal(describeAnnotationColor("#feffa0"), "yellow");
+    assert.equal(describeAnnotationColor("#ceffff"), "blue");
+    assert.equal(describeAnnotationColor("#fed4ff"), "pink");
+    assert.equal(describeAnnotationColor("#d1ffc3"), "green");
     assert.equal(describeAnnotationColor("not-a-color"), null);
-    assert.deepEqual([...requestedAnnotationColorFamilies("빨간색은 caveat")], [
-        "red",
-    ]);
+    assert.deepEqual(
+        [...requestedAnnotationColorFamilies("빨간 색, 회색, 보라색, grey")],
+        ["red", "purple", "gray"],
+    );
 });
 
 test("buildRequestedAnnotationContext includes and filters annotation color metadata", async () => {
@@ -97,7 +121,7 @@ test("buildRequestedAnnotationContext includes and filters annotation color meta
             version_id: "version-a",
             page_number: 31,
             annotation_type: "highlight" as const,
-            color: "#f783ac",
+            color: "#ff8787",
             quote: "This obligation is subject to caveats.",
             comment: null,
             source: "user" as const,
@@ -110,7 +134,7 @@ test("buildRequestedAnnotationContext includes and filters annotation color meta
             version_id: "version-outside",
             page_number: 99,
             annotation_type: "highlight" as const,
-            color: "#f783ac",
+            color: "#ff8787",
             quote: "This outside-scope annotation must never be included.",
             comment: null,
             source: "user" as const,
@@ -160,7 +184,7 @@ test("buildRequestedAnnotationContext includes and filters annotation color meta
     });
 
     assert.match(selectedFields[0], /\bcolor\b/);
-    assert.match(context ?? "", /color=#f783ac \(pink\/red\)/);
+    assert.match(context ?? "", /color=#ff8787 \(red\)/);
     assert.match(
         context ?? "",
         /quote="This obligation is subject to caveats\."/,

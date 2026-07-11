@@ -40,7 +40,11 @@ export const CHAT_TOOL_CATALOG: ChatToolCatalogItem[] = [
     name: "get_user_pdf_annotations",
     label: "Read my annotations",
     description: "Retrieve your PDF highlights, comments, and notes.",
-    projectOnly: true,
+  },
+  {
+    name: "read_annotation_context",
+    label: "Read annotation context",
+    description: "Read document text surrounding selected annotations.",
   },
   {
     name: "list_documents",

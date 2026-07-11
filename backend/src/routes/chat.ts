@@ -12,6 +12,7 @@ import {
     buildWorkflowStore,
     extractAnnotations,
     runLLMStream,
+    PROJECT_EXTRA_TOOLS,
     type ChatMessage,
 } from "../lib/chatTools";
 import { completeText } from "../lib/llm";
@@ -21,6 +22,28 @@ import { listRegisteredProjects } from "../lib/projectRegistry";
 import { presentChatStreamError } from "../lib/chatStreamErrors";
 
 export const chatRouter = Router();
+
+export const DOCUMENT_ANNOTATION_TOOL_PROMPT = `USER PDF ANNOTATIONS (ATTACHED DOCUMENTS ONLY):
+The annotation tools are restricted to the documents attached to this chat. Call get_user_pdf_annotations whenever the user assigns meaning to annotation colors, refers to their highlights, comments, notes, flags, or markings (including implicit phrases such as "based on what I marked"), or asks for an answer that reflects those markings. Do not substitute find_in_document or ordinary document search: those read document text, not the user's saved annotations.
+
+For a large annotation set, first inspect the returned summary, then use filters and stable pagination until all relevant pages have been retrieved. Never claim completeness while a result is truncated. The user's current message defines what each color means; match color words to color_family and ask only when the meaning is genuinely ambiguous.
+
+Before quoting, citing, or interpreting an annotation substantively, call read_annotation_context for that annotation and ground the answer in its surrounding document text. Plain listing and counting do not require a context read. Treat annotation comments as the user's notes, not as independently verified facts from the document.`;
+
+const DOCUMENT_ANNOTATION_TOOL_NAMES = new Set([
+    "get_user_pdf_annotations",
+    "read_annotation_context",
+]);
+
+export function documentAnnotationTools(): unknown[] {
+    return PROJECT_EXTRA_TOOLS.filter((tool) => {
+        if (typeof tool !== "object" || tool === null || !("function" in tool)) {
+            return false;
+        }
+        const name = (tool as { function?: { name?: string } }).function?.name;
+        return typeof name === "string" && DOCUMENT_ANNOTATION_TOOL_NAMES.has(name);
+    });
+}
 
 type ChatRow = {
     id: string;
@@ -510,7 +533,12 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         db,
         docIndex,
     );
-    const apiMessages = buildMessages(enrichedMessages, docAvailability);
+    const apiMessages = buildMessages(
+        enrichedMessages,
+        docAvailability,
+        DOCUMENT_ANNOTATION_TOOL_PROMPT,
+        docIndex,
+    );
 
     const workflowStore = await buildWorkflowStore(userId, userEmail, db);
 
@@ -540,6 +568,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             userId,
             db,
             write,
+            extraTools: documentAnnotationTools(),
             workflowStore,
             model,
             apiKeys,

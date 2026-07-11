@@ -37,6 +37,10 @@ import {
     FULL_READ_MAX_TEXT_BYTES,
     RETRIEVAL_TOP_K,
 } from "./indexing/types";
+import {
+    classifyAnnotationColor,
+    type AnnotationColorFamily,
+} from "./annotationColors";
 
 const STANDARD_FONT_DATA_URL = (() => {
     try {
@@ -202,13 +206,71 @@ export const PROJECT_EXTRA_TOOLS = [
                         enum: ["highlight", "comment"],
                         description: "Optional annotation type filter.",
                     },
+                    color_family: {
+                        type: "array",
+                        items: {
+                            type: "string",
+                            enum: ["red", "yellow", "green", "blue", "orange", "pink", "purple", "gray"],
+                        },
+                        description: "Optional computed color-family filters. Multiple values are ORed.",
+                    },
+                    colors: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "Optional exact hex colors such as ['#feffa0'].",
+                    },
+                    source: {
+                        type: "string",
+                        enum: ["user", "citation_promotion"],
+                        description: "Optional annotation source filter.",
+                    },
+                    has_comment: {
+                        type: "boolean",
+                        description: "Whether the annotation has a non-empty user comment.",
+                    },
+                    offset: {
+                        type: "integer",
+                        minimum: 0,
+                        description: "Zero-based pagination offset. Defaults to 0.",
+                    },
+                    order: {
+                        type: "string",
+                        enum: ["position", "recent"],
+                        description: "Stable document position order (default) or newest first.",
+                    },
                     limit: {
                         type: "integer",
                         minimum: 1,
-                        maximum: 50,
+                        maximum: 100,
                         description: "Maximum annotations to return. Defaults to 30.",
                     },
                 },
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "read_annotation_context",
+            description:
+                "Read surrounding indexed document text for saved annotations before quoting, citing, or interpreting them. Plain listing and counting do not require this tool.",
+            parameters: {
+                type: "object",
+                properties: {
+                    annotation_ids: {
+                        type: "array",
+                        items: { type: "string" },
+                        maxItems: 20,
+                        description: "Annotation IDs returned by get_user_pdf_annotations.",
+                    },
+                    radius: {
+                        type: "integer",
+                        minimum: 1,
+                        maximum: 2000,
+                        description: "Characters to return on each side. Defaults to 600.",
+                    },
+                },
+                required: ["annotation_ids"],
             },
         },
     },
@@ -1847,6 +1909,100 @@ type PdfAnnotationToolRow = {
     deleted_at?: string | null;
 };
 
+type AnnotationSource = "user" | "citation_promotion";
+type AnnotationOrder = "position" | "recent";
+
+function normalizeAnnotationHex(value: string | null | undefined): string | null {
+    const normalized = (value ?? "").trim().toLowerCase();
+    return /^#[0-9a-f]{6}$/.test(normalized) ? normalized : null;
+}
+
+function annotationIsCurrent(
+    row: PdfAnnotationToolRow,
+    infoByDocumentId: Map<string, DocIndex[string]>,
+): boolean {
+    const info = infoByDocumentId.get(row.document_id);
+    return !!info && !row.deleted_at && (!info.version_id || row.version_id === info.version_id);
+}
+
+function summarizeAnnotationRows(
+    rows: PdfAnnotationToolRow[],
+    infoByDocumentId: Map<string, DocIndex[string]>,
+    projectTotal: number,
+) {
+    const colors = new Map<string, { color_family: AnnotationColorFamily | null; count: number }>();
+    const documents = new Map<string, { filename: string; count: number }>();
+    const byType: Record<string, number> = {};
+    const bySource: Record<string, number> = {};
+    let withComment = 0;
+    for (const row of rows) {
+        const color = normalizeAnnotationHex(row.color) ?? row.color ?? "unknown";
+        const colorCount = colors.get(color) ?? {
+            color_family: classifyAnnotationColor(row.color)?.family ?? null,
+            count: 0,
+        };
+        colorCount.count += 1;
+        colors.set(color, colorCount);
+        const info = infoByDocumentId.get(row.document_id);
+        const documentCount = documents.get(row.document_id) ?? {
+            filename: info?.filename ?? "Unknown document",
+            count: 0,
+        };
+        documentCount.count += 1;
+        documents.set(row.document_id, documentCount);
+        byType[row.annotation_type] = (byType[row.annotation_type] ?? 0) + 1;
+        const source = row.source ?? "user";
+        bySource[source] = (bySource[source] ?? 0) + 1;
+        if (row.comment?.trim()) withComment += 1;
+    }
+    return {
+        total: rows.length,
+        project_total: projectTotal,
+        by_color: [...colors.entries()]
+            .map(([color, value]) => ({ color, ...value }))
+            .sort((a, b) => a.color.localeCompare(b.color)),
+        by_document: [...documents.entries()]
+            .map(([doc_id, value]) => ({ doc_id, ...value }))
+            .sort((a, b) => a.filename.localeCompare(b.filename)),
+        by_type: byType,
+        by_source: bySource,
+        with_comment: withComment,
+    };
+}
+
+async function queryAnnotationRows(args: {
+    db: ReturnType<typeof createServerSupabase>;
+    userId: string;
+    documentIds: string[];
+    versionByDocumentId?: Map<string, string | null | undefined>;
+    annotationType?: "highlight" | "comment";
+    source?: AnnotationSource;
+    hasComment?: boolean;
+}): Promise<{ data: PdfAnnotationToolRow[]; error: unknown }> {
+    const groups = new Map<string | null, string[]>();
+    for (const documentId of args.documentIds) {
+        const version = args.versionByDocumentId?.get(documentId) ?? null;
+        groups.set(version, [...(groups.get(version) ?? []), documentId]);
+    }
+    const results = await Promise.all([...groups].map(async ([versionId, documentIds]) => {
+        let query = args.db
+            .from("pdf_annotations")
+            .select("id, document_id, version_id, page_number, annotation_type, color, quote, comment, source, created_at, deleted_at")
+            .eq("user_id", args.userId)
+            .in("document_id", documentIds)
+            .is("deleted_at", null);
+        if (versionId) query = query.eq("version_id", versionId);
+        if (args.annotationType) query = query.eq("annotation_type", args.annotationType);
+        if (args.source) query = query.eq("source", args.source);
+        if (args.hasComment === true) query = query.not("comment", "is", null).neq("comment", "");
+        return await query;
+    }));
+    return {
+        data: results.flatMap((result) => (result.data ?? []) as PdfAnnotationToolRow[]),
+        error: results.find((result) => result.error)?.error ?? null,
+    };
+}
+
 export async function fetchUserPdfAnnotations(args: {
     userId: string;
     db: ReturnType<typeof createServerSupabase>;
@@ -1854,6 +2010,12 @@ export async function fetchUserPdfAnnotations(args: {
     documentQuery?: string;
     docIds?: string[];
     annotationType?: "highlight" | "comment";
+    colorFamily?: AnnotationColorFamily[];
+    colors?: string[];
+    source?: AnnotationSource;
+    hasComment?: boolean;
+    offset?: number;
+    order?: AnnotationOrder;
     limit?: number;
 }): Promise<Record<string, unknown>> {
     const requestedSlugs = new Set(args.docIds ?? []);
@@ -1863,7 +2025,8 @@ export async function fetchUserPdfAnnotations(args: {
     const documentQueryTokens = normalizedDocumentQuery
         ? lookupTokens(normalizedDocumentQuery)
         : [];
-    const candidates = Object.entries(args.docIndex).filter(
+    const allCandidates = Object.entries(args.docIndex);
+    const candidates = allCandidates.filter(
         ([slug, info]) =>
             (requestedSlugs.size === 0 || requestedSlugs.has(slug)) &&
             (documentQueryTokens.length === 0 ||
@@ -1871,16 +2034,31 @@ export async function fetchUserPdfAnnotations(args: {
                     lookupTokens(info.filename).includes(token),
                 )),
     );
-    if (candidates.length === 0) {
+    if (allCandidates.length === 0) {
         return {
             annotations: [],
             total: 0,
             returned: 0,
             truncated: false,
-            message:
-                normalizedDocumentQuery || requestedSlugs.size > 0
-                    ? "No in-scope project document matched the requested document filter."
-                    : "No project documents are available in this chat.",
+            next_offset: null,
+            summary: summarizeAnnotationRows([], new Map(), 0),
+            message: "No project documents are available in this chat.",
+        };
+    }
+
+    const allInfoByDocumentId = new Map(allCandidates.map(([, info]) => [info.document_id, info]));
+    const projectQuery = await queryAnnotationRows({
+        db: args.db,
+        userId: args.userId,
+        documentIds: [...allInfoByDocumentId.keys()],
+        versionByDocumentId: new Map([...allInfoByDocumentId].map(([id, info]) => [id, info.version_id])),
+    });
+    const projectRows = projectQuery.data.filter((row) => annotationIsCurrent(row, allInfoByDocumentId));
+    if (candidates.length === 0) {
+        return {
+            annotations: [], total: 0, returned: 0, truncated: false, next_offset: null,
+            summary: summarizeAnnotationRows([], allInfoByDocumentId, projectRows.length),
+            message: "No in-scope project document matched the requested document filter.",
         };
     }
 
@@ -1891,16 +2069,20 @@ export async function fetchUserPdfAnnotations(args: {
         candidates.map(([, info]) => [info.document_id, info]),
     );
     const documentIds = [...labelByDocumentId.keys()];
-    const boundedLimit = Math.max(1, Math.min(50, Math.floor(args.limit ?? 30)));
-    const { data, error } = await args.db
-        .from("pdf_annotations")
-        .select(
-            "id, document_id, version_id, page_number, annotation_type, color, quote, comment, source, created_at, deleted_at",
-        )
-        .eq("user_id", args.userId)
-        .in("document_id", documentIds)
-        .order("created_at", { ascending: false })
-        .limit(240);
+    const boundedLimit = Math.max(1, Math.min(100, Math.floor(args.limit ?? 30)));
+    const boundedOffset = Math.max(0, Math.floor(args.offset ?? 0));
+    const normalizedColors = (args.colors ?? [])
+        .map(normalizeAnnotationHex)
+        .filter((value): value is string => value !== null);
+    const { data, error } = await queryAnnotationRows({
+        db: args.db,
+        userId: args.userId,
+        documentIds,
+        versionByDocumentId: new Map([...infoByDocumentId].map(([id, info]) => [id, info.version_id])),
+        annotationType: args.annotationType,
+        source: args.source,
+        hasComment: args.hasComment,
+    });
 
     if (error) {
         return {
@@ -1908,23 +2090,32 @@ export async function fetchUserPdfAnnotations(args: {
             total: 0,
             returned: 0,
             truncated: false,
+            next_offset: null,
+            summary: summarizeAnnotationRows([], infoByDocumentId, projectRows.length),
             error: "Failed to retrieve saved PDF annotations.",
         };
     }
 
-    const rows = ((data ?? []) as PdfAnnotationToolRow[]).filter((row) => {
-        if (!infoByDocumentId.has(row.document_id)) return false;
-        if (row.deleted_at) return false;
-        if (
-            args.annotationType &&
-            row.annotation_type !== args.annotationType
-        ) {
-            return false;
-        }
-        const currentVersionId = infoByDocumentId.get(row.document_id)?.version_id;
-        return !currentVersionId || row.version_id === currentVersionId;
-    });
-    const annotations = rows.slice(0, boundedLimit).map((row) => {
+    const requestedFamilies = new Set(args.colorFamily ?? []);
+    const rows = data
+        .filter((row) => annotationIsCurrent(row, infoByDocumentId))
+        .filter((row) => {
+            if (normalizedColors.length && !normalizedColors.includes(normalizeAnnotationHex(row.color) ?? "")) return false;
+            if (args.hasComment !== undefined && Boolean(row.comment?.trim()) !== args.hasComment) return false;
+            if (!requestedFamilies.size) return true;
+            const family = classifyAnnotationColor(row.color)?.family;
+            return !!family && requestedFamilies.has(family);
+        })
+        .sort((a, b) => {
+            if (args.order === "recent") {
+                return b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id);
+            }
+            const aName = infoByDocumentId.get(a.document_id)?.filename ?? "";
+            const bName = infoByDocumentId.get(b.document_id)?.filename ?? "";
+            return aName.localeCompare(bName) || a.page_number - b.page_number ||
+                a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id);
+        });
+    const annotations = rows.slice(boundedOffset, boundedOffset + boundedLimit).map((row) => {
         const info = infoByDocumentId.get(row.document_id);
         return {
             id: row.id,
@@ -1935,6 +2126,7 @@ export async function fetchUserPdfAnnotations(args: {
             page: row.page_number,
             type: row.annotation_type,
             color: row.color,
+            color_family: classifyAnnotationColor(row.color)?.family ?? null,
             quote: row.quote,
             comment: row.comment,
             source: row.source,
@@ -1946,8 +2138,196 @@ export async function fetchUserPdfAnnotations(args: {
         annotations,
         total: rows.length,
         returned: annotations.length,
-        truncated: rows.length > annotations.length,
+        truncated: boundedOffset + annotations.length < rows.length,
+        next_offset: boundedOffset + annotations.length < rows.length
+            ? boundedOffset + annotations.length
+            : null,
+        summary: summarizeAnnotationRows(rows, infoByDocumentId, projectRows.length),
     };
+}
+
+export type AnnotationContextChunk = {
+    chunk_index: number;
+    page_number: number | null;
+    content: string;
+    start_char: number;
+    end_char: number;
+};
+
+type AnnotationContextLoader = (
+    documentId: string,
+    versionId: string | null,
+) => AnnotationContextChunk[] | Promise<AnnotationContextChunk[]>;
+
+function defaultAnnotationContextLoader(
+    documentId: string,
+    versionId: string | null,
+): AnnotationContextChunk[] {
+    try {
+        return getDb()
+            .prepare(
+                `SELECT chunk_index, page_number, content, start_char, end_char
+                 FROM document_index_chunks
+                 WHERE document_id = ? AND (? IS NULL OR version_id = ?)
+                 ORDER BY chunk_index ASC`,
+            )
+            .all(documentId, versionId, versionId) as AnnotationContextChunk[];
+    } catch {
+        return [];
+    }
+}
+
+function mergeAnnotationChunks(chunks: AnnotationContextChunk[]): string {
+    let text = "";
+    let lastEnd: number | null = null;
+    for (const chunk of [...chunks].sort((a, b) => a.chunk_index - b.chunk_index)) {
+        const overlap = lastEnd === null ? 0 : Math.max(0, lastEnd - chunk.start_char);
+        const suffix = chunk.content.slice(Math.min(overlap, chunk.content.length));
+        if (text && suffix && lastEnd !== null && chunk.start_char > lastEnd) text += "\n";
+        text += suffix;
+        lastEnd = Math.max(lastEnd ?? chunk.end_char, chunk.end_char);
+    }
+    return text.trim();
+}
+
+function normalizedTextWithOffsets(value: string): { text: string; offsets: number[] } {
+    let text = "";
+    const offsets: number[] = [];
+    let previousWhitespace = false;
+    for (let index = 0; index < value.length; index += 1) {
+        for (const char of value[index].normalize("NFKC").toLocaleLowerCase()) {
+            const whitespace = /\s/u.test(char);
+            if (whitespace) {
+                if (!previousWhitespace && text.length) {
+                    text += " ";
+                    offsets.push(index);
+                }
+            } else {
+                text += char;
+                offsets.push(index);
+            }
+            previousWhitespace = whitespace;
+        }
+    }
+    return { text: text.trim(), offsets };
+}
+
+export function extractAnnotationContext(args: {
+    quote: string | null;
+    page: number;
+    chunks: AnnotationContextChunk[];
+    radius: number;
+}): { before: string; after: string; located: boolean; page_text?: string } {
+    const pageChunks = args.chunks.filter((chunk) => chunk.page_number === args.page);
+    const pageIndexes = new Set(pageChunks.map((chunk) => chunk.chunk_index));
+    const expandedChunks = args.chunks.filter((chunk) =>
+        pageIndexes.has(chunk.chunk_index) ||
+        pageIndexes.has(chunk.chunk_index - 1) ||
+        pageIndexes.has(chunk.chunk_index + 1),
+    );
+    const pageText = mergeAnnotationChunks(pageChunks);
+    const expandedText = mergeAnnotationChunks(expandedChunks.length ? expandedChunks : pageChunks);
+    const quote = normalizedTextWithOffsets(args.quote ?? "").text;
+    const locate = (candidate: string) => {
+        const normalized = normalizedTextWithOffsets(candidate);
+        if (!quote || !normalized.text) return null;
+        let matchIndex = normalized.text.indexOf(quote);
+        let matchLength = quote.length;
+        if (matchIndex < 0) {
+            const fuzzyNeedle = quote.slice(0, 60).trim();
+            if (fuzzyNeedle.length >= 12) {
+                matchIndex = normalized.text.indexOf(fuzzyNeedle);
+                matchLength = fuzzyNeedle.length;
+            }
+        }
+        if (matchIndex < 0) return null;
+        const originalStart = normalized.offsets[matchIndex] ?? 0;
+        const originalEnd = (normalized.offsets[Math.min(
+            normalized.offsets.length - 1,
+            matchIndex + matchLength - 1,
+        )] ?? originalStart) + 1;
+        return {
+            before: candidate.slice(Math.max(0, originalStart - args.radius), originalStart),
+            after: candidate.slice(originalEnd, originalEnd + args.radius),
+            located: true as const,
+        };
+    };
+    const match = locate(pageText) ?? locate(expandedText);
+    if (match) return match;
+    return {
+        before: "",
+        after: "",
+        located: false,
+        page_text: pageText.slice(0, args.radius * 2),
+    };
+}
+
+export async function readAnnotationContexts(args: {
+    userId: string;
+    db: ReturnType<typeof createServerSupabase>;
+    docIndex: DocIndex;
+    annotationIds: string[];
+    radius?: number;
+    loadChunks?: AnnotationContextLoader;
+}): Promise<Record<string, unknown>> {
+    const annotationIds = [...new Set(args.annotationIds.filter(Boolean))].slice(0, 20);
+    const radius = Math.max(1, Math.min(2000, Math.floor(args.radius ?? 600)));
+    if (!annotationIds.length) return { contexts: [], requested: 0, returned: 0 };
+    const infoByDocumentId = new Map(
+        Object.values(args.docIndex).map((info) => [info.document_id, info]),
+    );
+    const labelByDocumentId = new Map(
+        Object.entries(args.docIndex).map(([label, info]) => [info.document_id, label]),
+    );
+    if (!infoByDocumentId.size) {
+        return { contexts: [], requested: annotationIds.length, returned: 0 };
+    }
+    const { data, error } = await args.db
+        .from("pdf_annotations")
+        .select("id, document_id, version_id, page_number, annotation_type, color, quote, comment, source, created_at, deleted_at")
+        .eq("user_id", args.userId)
+        .in("document_id", [...infoByDocumentId.keys()])
+        .in("id", annotationIds)
+        .is("deleted_at", null);
+    if (error) {
+        return {
+            contexts: [], requested: annotationIds.length, returned: 0,
+            error: "Failed to retrieve annotation context.",
+        };
+    }
+    const byId = new Map(
+        ((data ?? []) as PdfAnnotationToolRow[])
+            .filter((row) => annotationIsCurrent(row, infoByDocumentId))
+            .map((row) => [row.id, row]),
+    );
+    const loadChunks = args.loadChunks ?? defaultAnnotationContextLoader;
+    const chunkCache = new Map<string, Promise<AnnotationContextChunk[]>>();
+    const contexts = [];
+    for (const annotationId of annotationIds) {
+        const row = byId.get(annotationId);
+        if (!row) continue;
+        const info = infoByDocumentId.get(row.document_id);
+        const cacheKey = `${row.document_id}:${row.version_id ?? ""}`;
+        let chunksPromise = chunkCache.get(cacheKey);
+        if (!chunksPromise) {
+            chunksPromise = Promise.resolve(loadChunks(row.document_id, row.version_id));
+            chunkCache.set(cacheKey, chunksPromise);
+        }
+        contexts.push({
+            annotation_id: row.id,
+            doc_id: labelByDocumentId.get(row.document_id),
+            filename: info?.filename,
+            page: row.page_number,
+            quote: row.quote,
+            ...extractAnnotationContext({
+                quote: row.quote,
+                page: row.page_number,
+                chunks: await chunksPromise,
+                radius,
+            }),
+        });
+    }
+    return { contexts, requested: annotationIds.length, returned: contexts.length, radius };
 }
 
 export async function runToolCalls(
@@ -1993,6 +2373,9 @@ export async function runToolCalls(
         }
 
         if (tc.function.name === "get_user_pdf_annotations") {
+            const validColorFamilies = new Set<AnnotationColorFamily>([
+                "red", "yellow", "green", "blue", "orange", "pink", "purple", "gray",
+            ]);
             const content = await fetchUserPdfAnnotations({
                 userId,
                 db,
@@ -2011,7 +2394,47 @@ export async function runToolCalls(
                     args.annotation_type === "comment"
                         ? args.annotation_type
                         : undefined,
+                colorFamily: Array.isArray(args.color_family)
+                    ? args.color_family.filter(
+                          (value): value is AnnotationColorFamily =>
+                              typeof value === "string" &&
+                              validColorFamilies.has(value as AnnotationColorFamily),
+                      )
+                    : undefined,
+                colors: Array.isArray(args.colors)
+                    ? args.colors.filter(
+                          (value): value is string => typeof value === "string",
+                      )
+                    : undefined,
+                source:
+                    args.source === "user" || args.source === "citation_promotion"
+                        ? args.source
+                        : undefined,
+                hasComment: typeof args.has_comment === "boolean" ? args.has_comment : undefined,
+                offset: typeof args.offset === "number" ? args.offset : undefined,
+                order:
+                    args.order === "position" || args.order === "recent"
+                        ? args.order
+                        : undefined,
                 limit: typeof args.limit === "number" ? args.limit : undefined,
+            });
+            toolResults.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: JSON.stringify(content),
+            });
+
+        } else if (tc.function.name === "read_annotation_context") {
+            const content = await readAnnotationContexts({
+                userId,
+                db,
+                docIndex: docIndex ?? {},
+                annotationIds: Array.isArray(args.annotation_ids)
+                    ? args.annotation_ids.filter(
+                          (value): value is string => typeof value === "string",
+                      )
+                    : [],
+                radius: typeof args.radius === "number" ? args.radius : undefined,
             });
             toolResults.push({
                 role: "tool",

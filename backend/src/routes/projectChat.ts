@@ -18,6 +18,10 @@ import { getUserApiKeys, getUserRetrievalSettings } from "../lib/userSettings";
 import { checkProjectAccess } from "../lib/access";
 import { getProjectIndexCorpusStats } from "../lib/indexing/search";
 import { presentChatStreamError } from "../lib/chatStreamErrors";
+import {
+    classifyAnnotationColor,
+    type AnnotationColorFamily,
+} from "../lib/annotationColors";
 
 export const PROJECT_SYSTEM_PROMPT_EXTRA = `PROJECT CONTEXT:
 You are operating within a project folder that contains a collection of legal documents the user has organised for a single matter. The user's questions will usually refer to one or more documents in this project — your job is to find the relevant files to work on. For broad or unnamed-source project questions, call search_project_documents with group_by_document=true first so distinct candidate documents are represented; then run doc_ids-scoped chunk searches and use read_index_chunk for evidence and surrounding context. Escalate to read_document / fetch_documents only for selected documents that fit the full-read budget.
@@ -31,7 +35,13 @@ REPLICATING A DOCUMENT:
 When the user wants to use an existing project document as a starting point for a new file (e.g. "use this NDA as a template", "make me a copy of the SOW so I can edit it", "duplicate this and adapt it for company X"), call the replicate_document tool with the source doc_id. This creates a byte-for-byte copy as a new project document, returns a fresh doc_id slug, and shows a download/open card in the UI. Then call edit_document on the returned slug to make the user's requested changes — do NOT call generate_docx for cases where the user clearly wants the existing document's structure and formatting preserved.`;
 
 export const PROJECT_ANNOTATION_TOOL_PROMPT = `USER PDF ANNOTATIONS:
-When the user asks what they annotated, highlighted, hilighted, marked, commented on, or noted — including 하이라이트, 형광펜, 주석, 메모, 표시한 내용 — you MUST call get_user_pdf_annotations before answering. Use its document_query for a named document. Never substitute search_project_documents, find_in_document, or regex matching because those retrieve document text, not the user's saved annotations. Summarize the returned annotations directly unless the user separately asks you to verify them against the source document.`;
+You MUST call get_user_pdf_annotations before answering whenever the user asks what they annotated, highlighted, hilighted, marked, commented on, or noted; assigns meaning to annotation colors; implicitly references their highlights, comments, flags, or markings; or asks for an answer based on or reflecting those markings. This includes 하이라이트, 형광펜, 주석, 메모, 코멘트, 표시한 내용, and 색상별 지시. Use document_query for a named document. Never substitute search_project_documents, find_in_document, or regex matching because those retrieve document text, not the user's saved annotations.
+
+For a potentially large annotation set, first call get_user_pdf_annotations without color or document filters to inspect its summary. Then make filtered calls by color_family or document as needed. The returned summary is computed over the complete filtered result set even when the annotations page is truncated, so use summary.total, summary.by_document, and summary.by_color for complete counts and document-level distribution. For summaries, themes, and other synthesis requests, inspect a bounded representative page and do not accumulate every raw annotation merely to reproduce counts already present in summary. Follow next_offset through every page only when the user asks for an exhaustive item-by-item list, export, or audit, or when the specific annotations needed for the answer have not yet been retrieved; never claim an exhaustive item list before paging through the relevant result set.
+
+Color meanings come from the user's current message and are not permanent settings. Match unqualified color words to the returned color_family (red, orange, yellow, green, blue, purple, pink, or gray). When the user qualifies a color as light, pale, dark, or a particular shade, inspect summary.by_color and use the colors exact-hex filter for the best matching bucket instead of silently broadening to the whole family. A clearly dominant exact bucket matching that shade may be selected without asking; state the chosen hex and count. Ask for clarification only when multiple plausible buckets would materially change the answer.
+
+For every annotation that the answer substantively quotes, cites, or interprets, call read_annotation_context with its annotation id before relying on it, and ground the answer in the returned surrounding document text. Plain listing and counting do not require context reads. Annotation comments are user notes and reading priorities, not document facts; verify factual, legal, or citation-bearing claims against the surrounding document text.`;
 
 export const projectChatRouter = Router({ mergeParams: true });
 
@@ -48,15 +58,6 @@ type ProjectAnnotationContextRow = {
     created_at: string;
     deleted_at?: string | null;
 };
-
-type AnnotationColorFamily =
-    | "red"
-    | "yellow"
-    | "green"
-    | "blue"
-    | "orange"
-    | "pink"
-    | "gray";
 
 function projectToolsForCorpus(smallIndexedCorpus: boolean): unknown[] {
     if (!smallIndexedCorpus) return PROJECT_EXTRA_TOOLS;
@@ -75,21 +76,29 @@ function latestUserText(messages: ChatMessage[]): string {
 
 export function requestsAnnotationContext(text: string): boolean {
     const lower = text.toLowerCase();
+    if (
+        /\bred flags?\b/i.test(lower) &&
+        !/(annotation|annotat|highlight|comment|mark|색상|색깔)/i.test(lower)
+    ) {
+        return false;
+    }
+    const colorTerm =
+        /(색상|색깔|빨간\s*색|붉은\s*색|노란\s*색|초록\s*색|파란\s*색|주황\s*색|분홍\s*색|보라\s*색|회색|그레이|\b(?:red|yellow|green|blue|orange|pink|purple|gr[ae]y)\b)/i;
     const annotationTerm =
-        /(annotation|annotat|annotition|highlight|하이라이트|형광펜|주석|메모|표시한|강조한|밑줄|마크|색상|색깔|빨간색|붉은색|노란색|초록색|파란색|주황색|분홍색|red|yellow|green|blue|orange|pink)/i;
+        /(annotation|annotat|annotition|highlight|comment|하이라이트|형광펜|주석|메모|코멘트|표시한|강조한|밑줄|마크|flag|색상|색깔|빨간\s*색|붉은\s*색|노란\s*색|초록\s*색|파란\s*색|주황\s*색|분홍\s*색|보라\s*색|회색|그레이|red|yellow|green|blue|orange|pink|purple|gr[ae]y)/i;
     const explicitAnnotationTerm =
-        /(annotation|annotat|annotition|highlight|하이라이트|형광펜|주석|메모|표시한|강조한|밑줄|마크)/i;
+        /(annotation|annotat|annotition|highlight|comment|하이라이트|형광펜|주석|메모|코멘트|표시한|강조한|밑줄|마크|flag)/i;
     const instructionTerm =
         /(근거|기반|고려|반영|참조|중심|중점|초점|위주|강조|강조점|토대|바탕|주의|유의|caveat|based on|basis|consider|reflect|refer|according to|take into account|focus|emphasis|prioritize|priority)/i;
     const annotationActionTerm =
-        /(가져|찾아|보여|목록|요약|fetch|find|list|retrieve|show|summari[sz]e)/i;
+        /(가져|찾아|보여|목록|요약|만들|정리|비교|대비|표|fetch|find|list|retrieve|show|summari[sz]e|make|organize|compare|table)/i;
     const firstPersonTerm =
         /(내|내가|사용자|user|\bmy\b|\bmine\b|\bi\s+(?:made|added|created|highlighted|annotated)\b)/i;
     return (
         annotationTerm.test(lower) &&
         (instructionTerm.test(lower) ||
             firstPersonTerm.test(lower) ||
-            (explicitAnnotationTerm.test(lower) &&
+            ((explicitAnnotationTerm.test(lower) || colorTerm.test(lower)) &&
                 annotationActionTerm.test(lower)))
     );
 }
@@ -101,40 +110,20 @@ function clipAnnotationText(value: string | null | undefined, max = 360): string
 }
 
 export function describeAnnotationColor(color: string | null | undefined): string | null {
-    const normalized = (color ?? "").trim().toLowerCase();
-    if (!/^#[0-9a-f]{6}$/.test(normalized)) return null;
-
-    const r = Number.parseInt(normalized.slice(1, 3), 16);
-    const g = Number.parseInt(normalized.slice(3, 5), 16);
-    const b = Number.parseInt(normalized.slice(5, 7), 16);
-    const max = Math.max(r, g, b);
-    const min = Math.min(r, g, b);
-
-    if (max - min < 24) return "gray";
-    if (r >= 210 && g >= 150 && b < 120) return "yellow/orange";
-    if (r >= 200 && b >= 130 && g < 170) return "pink/red";
-    if (r >= 180 && g < 130 && b < 130) return "red";
-    if (g >= 150 && r < 180 && b < 170) return "green";
-    if (b >= 150 && r < 170) return "blue";
-    if (r >= 180 && g >= 120 && b < 120) return "orange";
-    return null;
-}
-
-function annotationColorFamilies(color: string | null | undefined): Set<AnnotationColorFamily> {
-    const label = describeAnnotationColor(color);
-    if (!label) return new Set();
-    return new Set(label.split("/") as AnnotationColorFamily[]);
+    return classifyAnnotationColor(color)?.label ?? null;
 }
 
 export function requestedAnnotationColorFamilies(text: string): Set<AnnotationColorFamily> {
     const lower = text.toLowerCase();
     const families = new Set<AnnotationColorFamily>();
-    if (/(빨간|붉은|red)/i.test(lower)) families.add("red");
-    if (/(노란|노랑|yellow)/i.test(lower)) families.add("yellow");
-    if (/(초록|녹색|green)/i.test(lower)) families.add("green");
-    if (/(파란|파랑|청색|blue)/i.test(lower)) families.add("blue");
-    if (/(주황|orange)/i.test(lower)) families.add("orange");
-    if (/(분홍|핑크|pink)/i.test(lower)) families.add("pink");
+    if (/(빨간\s*색?|붉은\s*색?|red)/i.test(lower)) families.add("red");
+    if (/(노란\s*색?|노랑|yellow)/i.test(lower)) families.add("yellow");
+    if (/(초록\s*색?|녹색|green)/i.test(lower)) families.add("green");
+    if (/(파란\s*색?|파랑|청색|blue)/i.test(lower)) families.add("blue");
+    if (/(주황\s*색?|orange)/i.test(lower)) families.add("orange");
+    if (/(분홍\s*색?|핑크|pink)/i.test(lower)) families.add("pink");
+    if (/(보라\s*색?|자주\s*색?|purple)/i.test(lower)) families.add("purple");
+    if (/(회색|그레이|gr[ae]y)/i.test(lower)) families.add("gray");
     return families;
 }
 
@@ -263,8 +252,8 @@ export async function buildRequestedAnnotationContext(args: {
     const colorFilteredRows =
         requestedColors.size > 0
             ? sortedRows.filter((row) => {
-                  const rowColors = annotationColorFamilies(row.color);
-                  return [...requestedColors].some((color) => rowColors.has(color));
+                  const rowColor = classifyAnnotationColor(row.color)?.family;
+                  return rowColor ? requestedColors.has(rowColor) : false;
               })
             : sortedRows;
     const rows = (colorFilteredRows.length > 0 ? colorFilteredRows : sortedRows).slice(0, 30);
