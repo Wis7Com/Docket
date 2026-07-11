@@ -14,6 +14,7 @@ export type DocResult =
     | { type: "docx" }
     | { type: "markdown"; text: string }
     | { type: "text"; text: string }
+    | { type: "image"; buffer: ArrayBuffer; contentType: string }
     | null;
 
 // The `%PDF-` header must appear within the first 1024 bytes (the spec
@@ -89,6 +90,10 @@ export function useFetchSingleDoc(
                         return;
                     }
                     setResult({ type: "pdf", buffer });
+                } else if (contentType.startsWith("image/")) {
+                    const buffer = await response.arrayBuffer();
+                    if (!cancelled)
+                        setResult({ type: "image", buffer, contentType });
                 } else if (contentType.includes("text/markdown")) {
                     const text = await response.text();
                     if (!cancelled) setResult({ type: "markdown", text });

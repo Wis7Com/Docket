@@ -2,6 +2,10 @@ import { Buffer } from "buffer";
 import { downloadFile } from "../storage";
 import { extractDocxBodyText } from "../docxTrackedChanges";
 import type { createServerSupabase } from "../supabase";
+import { createLocalOcrEngine } from "../ocr";
+import type { OcrEngine } from "../ocr/types";
+import { getUserOcrSettings } from "../userSettings";
+import { isImageDocumentType } from "../documentTypes";
 import {
   buildChunkSearchText,
   buildPlainTextLines,
@@ -22,6 +26,7 @@ type DocumentRow = {
   filename: string;
   file_type: string | null;
   current_version_id: string | null;
+  user_id: string;
 };
 
 type VersionRow = {
@@ -126,8 +131,53 @@ export async function extractTextFromBytes(
 export async function extractStructuredTextFromBytes(
   raw: ArrayBuffer,
   fileType: string,
+  options: { ocrEngine?: OcrEngine; ocrMaxPages?: number } = {},
 ): Promise<StructuredIndexText> {
-  if (fileType === "pdf") return extractStructuredPdfText(raw);
+  if (fileType === "pdf") {
+    return extractStructuredPdfText(raw, {
+      ocr: options.ocrEngine
+        ? { engine: options.ocrEngine, maxPages: options.ocrMaxPages ?? 50 }
+        : undefined,
+    });
+  }
+  if (isImageDocumentType(fileType)) {
+    if (!options.ocrEngine) {
+      return {
+        text: "",
+        lines: [],
+        sections: [],
+        ocr_pages: 0,
+        ocr_engine: null,
+        ocr_regions: [],
+      };
+    }
+    const { createCanvas, loadImage } = await import("@napi-rs/canvas");
+    const image = await loadImage(Buffer.from(raw));
+    const canvas = createCanvas(image.width, image.height);
+    canvas.getContext("2d").drawImage(image, 0, 0);
+    const result = await options.ocrEngine.recognize({
+      data: canvas.toBuffer("image/png"),
+      width: image.width,
+      height: image.height,
+      format: "png",
+    });
+    const body = normalizeIndexText(
+      result.text || result.regions.map((region) => region.text).join("\n"),
+    );
+    const text = body ? `[Page 1]\n${body}` : "";
+    const lines = buildPlainTextLines(text);
+    return {
+      text,
+      lines,
+      sections: detectDocumentSections(text, lines),
+      ocr_pages: 1,
+      ocr_engine: options.ocrEngine.name,
+      ocr_regions: result.regions.map((region) => ({
+        ...region,
+        page_number: 1,
+      })),
+    };
+  }
   let text = "";
   if (fileType === "txt" || fileType === "md") {
     text = normalizeIndexText(Buffer.from(raw).toString("utf8"));
@@ -153,10 +203,11 @@ export async function extractDocumentForIndex(args: {
   db: ReturnType<typeof createServerSupabase>;
   documentId: string;
   versionId?: string | null;
+  ocrEngine?: OcrEngine;
 }): Promise<ExtractedDocument> {
   const { data: docData } = await args.db
     .from("documents")
-    .select("id, filename, file_type, current_version_id")
+    .select("id, filename, file_type, current_version_id, user_id")
     .eq("id", args.documentId)
     .single();
   const doc = docData as DocumentRow | null;
@@ -179,7 +230,23 @@ export async function extractDocumentForIndex(args: {
   if (!raw) throw new Error("Document bytes not available");
 
   const fileType = (doc.file_type ?? "").toLowerCase();
-  const extracted = await extractStructuredTextFromBytes(raw, fileType);
+  const ocrSettings = await getUserOcrSettings(doc.user_id);
+  let ocrEngine = args.ocrEngine;
+  if (
+    !ocrEngine &&
+    (fileType === "pdf" || isImageDocumentType(fileType)) &&
+    ocrSettings.enabled
+  ) {
+    try {
+      ocrEngine = createLocalOcrEngine(ocrSettings);
+    } catch (err) {
+      console.warn("[ocr] local OCR engine is unavailable", err);
+    }
+  }
+  const extracted = await extractStructuredTextFromBytes(raw, fileType, {
+    ocrEngine,
+    ocrMaxPages: ocrSettings.maxPagesPerDocument,
+  });
   const chunks = chunkTextForIndex(extracted.text, extracted.sections);
 
   return {
@@ -189,5 +256,8 @@ export async function extractDocumentForIndex(args: {
     file_type: fileType,
     text: extracted.text,
     chunks,
+    ocr_pages: extracted.ocr_pages ?? 0,
+    ocr_engine: extracted.ocr_engine ?? null,
+    ocr_regions: extracted.ocr_regions ?? [],
   };
 }

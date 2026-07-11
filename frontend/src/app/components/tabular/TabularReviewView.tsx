@@ -9,7 +9,6 @@ import {
   ChevronDown,
   MessageSquare,
   Download,
-  Users,
 } from "lucide-react";
 import { HeaderSearchBtn } from "../shared/HeaderSearchBtn";
 
@@ -17,7 +16,6 @@ import {
   clearTabularCells,
   getTabularReview,
   getProject,
-  getTabularReviewPeople,
   regenerateTabularCell,
   streamTabularGeneration,
   updateTabularReview,
@@ -32,11 +30,9 @@ import type {
 import { AddColumnModal } from "./AddColumnModal";
 import { AddDocumentsModal } from "../shared/AddDocumentsModal";
 import { AddProjectDocsModal } from "../shared/AddProjectDocsModal";
-import { PeopleModal } from "../shared/PeopleModal";
 import { OwnerOnlyModal } from "../shared/OwnerOnlyModal";
 import { ApiKeyMissingModal } from "../shared/ApiKeyMissingModal";
 import { RenameableTitle } from "../shared/RenameableTitle";
-import { useAuth } from "@/contexts/AuthContext";
 import { useUserProfile } from "@/contexts/UserProfileContext";
 import {
   getModelProvider,
@@ -68,9 +64,7 @@ export function TRView({ reviewId, projectId }: Props) {
   const [savingColumnsConfig, setSavingColumnsConfig] = useState(false);
   const [addColOpen, setAddColOpen] = useState(false);
   const [addDocsOpen, setAddDocsOpen] = useState(false);
-  const [peopleModalOpen, setPeopleModalOpen] = useState(false);
   const [ownerOnlyAction, setOwnerOnlyAction] = useState<string | null>(null);
-  const { user } = useAuth();
   const [expandedCell, setExpandedCell] = useState<TabularCell | null>(null);
   const [expandedCellCitation, setExpandedCellCitation] = useState<
     { quote: string; page: number } | undefined
@@ -527,21 +521,6 @@ export function TRView({ reviewId, projectId }: Props) {
                 onChange={setSearch}
                 placeholder="Search documents…"
               />
-              {!projectId && (
-                <button
-                  onClick={() => setPeopleModalOpen(true)}
-                  disabled={loading}
-                  className={`flex h-8 w-8 items-center justify-center text-sm transition-colors ${
-                    loading
-                      ? "text-gray-300 cursor-default"
-                      : "text-gray-500 hover:text-gray-900 cursor-pointer"
-                  }`}
-                  title="People with access"
-                  aria-label="People with access"
-                >
-                  <Users className="h-4 w-4" />
-                </button>
-              )}
               <button
                 onClick={() =>
                   exportTabularReviewToExcel({
@@ -787,38 +766,6 @@ export function TRView({ reviewId, projectId }: Props) {
           ]}
         />
       )}
-
-      <PeopleModal
-        open={peopleModalOpen}
-        onClose={() => setPeopleModalOpen(false)}
-        resource={review}
-        fetchPeople={getTabularReviewPeople}
-        currentUserEmail={user?.email ?? null}
-        breadcrumb={[
-          "Tabular Reviews",
-          review?.title || "Untitled Review",
-          "People",
-        ]}
-        // Only the review owner may modify the member list. PeopleModal
-        // hides the add/remove controls when this prop is undefined.
-        onSharedWithChange={
-          review?.is_owner === false
-            ? undefined
-            : async (next) => {
-                const updated = await updateTabularReview(reviewId, {
-                  shared_with: next,
-                });
-                setReview((prev) =>
-                  prev
-                    ? {
-                        ...prev,
-                        shared_with: updated.shared_with,
-                      }
-                    : prev,
-                );
-              }
-        }
-      />
 
       <OwnerOnlyModal
         open={!!ownerOnlyAction}

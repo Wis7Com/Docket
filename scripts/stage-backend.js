@@ -119,7 +119,7 @@ function main() {
   // -w accepts a comma-separated module list (NOT repeated flags — the CLI
   // calls argv.w.split(',') and crashes on an array).
   execSync(
-    `"${rebuildBin}" -m "${STAGE}" -w better-sqlite3,@napi-rs/canvas --force`,
+    `"${rebuildBin}" -m "${STAGE}" -w better-sqlite3,@napi-rs/canvas,onnxruntime-node --force`,
     {
       cwd: ROOT,
       stdio: "inherit",

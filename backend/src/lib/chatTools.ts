@@ -905,6 +905,67 @@ export async function extractPdfText(buf: ArrayBuffer): Promise<string> {
     }
 }
 
+export function meaningfulPdfTextLength(text: string): number {
+    return text
+        .replace(/^\s*\[Page\s+\d+\]\s*$/gim, "")
+        .replace(/\s+/g, "")
+        .length;
+}
+
+export function reassembleIndexedDocumentText(
+    documentId: string,
+    versionId?: string | null,
+): string {
+    const db = getDb();
+    const resolvedVersionId =
+        versionId ??
+        (db
+            .prepare("SELECT current_version_id FROM documents WHERE id = ?")
+            .get(documentId) as { current_version_id?: string | null } | undefined)
+            ?.current_version_id;
+    if (!resolvedVersionId) return "";
+
+    const ocr = db
+        .prepare(
+            `SELECT ocr_pages FROM document_index_files
+             WHERE document_id = ? AND version_id = ? AND status = 'ready'`,
+        )
+        .get(documentId, resolvedVersionId) as { ocr_pages: number } | undefined;
+    if (!ocr || ocr.ocr_pages <= 0) return "";
+
+    const chunks = db
+        .prepare(
+            `
+            SELECT page_number, content, start_char, end_char
+            FROM document_index_chunks
+            WHERE document_id = ? AND version_id = ?
+            ORDER BY chunk_index ASC
+        `,
+        )
+        .all(documentId, resolvedVersionId) as {
+        page_number: number | null;
+        content: string;
+        start_char: number;
+        end_char: number;
+    }[];
+
+    const pages = new Map<number | null, { text: string; end: number }>();
+    for (const chunk of chunks) {
+        const page = pages.get(chunk.page_number) ?? { text: "", end: -1 };
+        const overlap = Math.max(0, page.end - chunk.start_char);
+        const suffix = chunk.content.slice(Math.min(overlap, chunk.content.length));
+        page.text += `${page.text && suffix ? " " : ""}${suffix}`;
+        page.end = Math.max(page.end, chunk.end_char);
+        pages.set(chunk.page_number, page);
+    }
+    return [...pages.entries()]
+        .map(([pageNumber, page]) =>
+            pageNumber === null ? page.text.trim() : `[Page ${pageNumber}]\n${page.text.trim()}`,
+        )
+        .filter(Boolean)
+        .join("\n\n");
+}
+
 export async function generateDocx(
     title: string,
     sections: unknown[],
@@ -1470,6 +1531,13 @@ async function readDocumentContent(
         let text: string;
         if (docInfo.file_type === "pdf") {
             text = await extractPdfText(raw);
+            if (meaningfulPdfTextLength(text) < 10 && documentId) {
+                const indexed = reassembleIndexedDocumentText(
+                    documentId,
+                    docIndex?.[docLabel]?.version_id,
+                );
+                if (indexed) text = indexed;
+            }
             console.log(
                 `[read_document] pdf extracted length=${text.length} for filename="${docInfo.filename}"`,
             );

@@ -9,11 +9,11 @@ import {
   refreshProjectRegistryCounts,
 } from "./projectRegistry";
 import { getCurrentDatabaseContext, runWithDatabaseContext } from "../db/sqlite";
+import { isAllowedDocumentType } from "./documentTypes";
 
 type Supa = ReturnType<typeof createServerSupabase>;
 
 const IMPORT_SKIP = new Set([".git", ".docket", "node_modules"]);
-const IMPORT_ALLOWED_TYPES = new Set(["pdf", "docx", "doc", "txt", "md"]);
 
 function isInsideRoot(root: string, candidate: string): boolean {
   const rel = path.relative(root, candidate);
@@ -46,7 +46,7 @@ function copySupportedFilesIntoProject(args: {
         visit(src);
       } else if (entry.isFile() || entry.isSymbolicLink()) {
         const ext = path.extname(entry.name).slice(1).toLowerCase();
-        if (!IMPORT_ALLOWED_TYPES.has(ext)) continue;
+        if (!isAllowedDocumentType(ext)) continue;
         const realSrc = fs.realpathSync(src);
         if (!isInsideRoot(args.sourceRoot, realSrc)) continue;
         fs.mkdirSync(path.dirname(dest), { recursive: true });

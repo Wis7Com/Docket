@@ -1,10 +1,10 @@
 # Docket
 
-Docket is a local desktop AI legal platform. Everything runs on your
-computer: documents, database, settings, model API calls. No Supabase,
-no cloud storage, no external login. The only network calls the app
-makes are to whichever model providers' API keys you configure
-(Anthropic and/or Gemini).
+Docket is a local desktop AI legal platform. Documents, database,
+settings, indexing, search, and OCR stay on your computer. No Supabase,
+no cloud storage, no external login. Network calls are limited to model
+providers you explicitly configure for chat or embeddings; local Ollama
+and MLX/OpenAI-compatible servers can keep those workflows offline too.
 
 Docket builds on
 [mikelocal](https://github.com/rafal-fryc/mikelocal), the Electron
@@ -16,7 +16,8 @@ licensing details.
 Docket extends that desktop base with self-contained local project
 folders (app-level state under Electron `userData`, project data under
 each project's `.docket/` directory), hybrid document indexing and
-search with optional embeddings, a full PDF annotation workflow
+search with optional embeddings, local OCR for scanned PDFs and images,
+a full PDF annotation workflow
 (highlights, comments, citation promotion, PDF export), annotation- and
 document-scoped chat, and a bundled-LibreOffice installer — see
 the feature overview below.
@@ -96,6 +97,21 @@ Search results show *why* each document matched — keyword, substring,
 exact, or semantic — with highlighted snippets:
 
 ![Search results with keyword, substring, and exact match badges and highlighted snippets](docs/media/document-search.png)
+
+### Local OCR for scanned PDFs and images
+
+Scanned PDFs and image documents (`PNG`, `JPG`/`JPEG`, `TIFF`, `BMP`,
+and `WebP`) are recognized locally during indexing. On macOS Docket uses
+Apple Vision first; a bundled local PP-OCR/ONNX pipeline is available as
+the cross-platform fallback. OCR failures stop locally and are never
+rerouted to a cloud model or external OCR API.
+
+Recognized text participates in the same keyword, substring, and
+semantic search paths as ordinary document text. Docket also stores the
+normalized bounding box for each recognized region. When a scanned-PDF
+citation has no PDF text layer to match, clicking the citation retrieves
+those local regions and paints the cited passage in the existing PDF
+highlight overlay.
 
 ### PDF annotation workflow: highlights, comments, citations, export
 
@@ -243,7 +259,8 @@ registry/profile/session state, delete Electron's `userData` directory.
   (Ollama or any OpenAI-compatible server such as LM Studio) or with
   cloud Anthropic Claude / Google Gemini models — with conversation
   history, tool use, and reasoning streams either way.
-- **Document workflows**: upload PDF, DOCX, DOC, TXT files; the
+- **Document workflows**: upload PDF, DOCX, DOC, TXT, PNG, JPG/JPEG,
+  TIFF, BMP, and WebP files; the
   assistant can read, edit, and produce annotated revisions of them
   with track-changes-style UI.
 - **Project organisation**: group documents into projects with
@@ -270,7 +287,8 @@ required: local models also run on CPU, a GPU just makes them faster
 | Feature | CPU only | Local LLM or API needed |
 |---|:---:|---|
 | Projects, folders, per-project organisation | ✅ | — |
-| Document upload & viewing (PDF, DOCX, DOC, TXT) | ✅ | — |
+| Document upload & viewing (PDF, DOCX, DOC, TXT, PNG/JPEG, TIFF, BMP, WebP) | ✅ | — |
+| Local OCR for scanned PDFs and images | ✅ | — |
 | DOCX/DOC → PDF conversion (bundled LibreOffice) | ✅ | — |
 | Highlights, comments, annotations | ✅ | — |
 | Keyword / full-text search (SQLite FTS5 + trigram, BM25) | ✅ | — |
@@ -317,7 +335,8 @@ Notes:
 │  ─ supabase shim    │  │  ─ JWT auth middleware (HS256)       │
 │  ─ getApiPort,      │◀─┤  ─ better-sqlite3 + migration runner │
 │    getToken via IPC │  │  ─ Local-FS storage (path guarded)   │
-└─────────────────────┘  │  ─ LLM clients (Claude, Gemini)      │
+└─────────────────────┘  │  ─ Local OCR (Vision / PP-OCR ONNX)  │
+                         │  ─ LLM clients (local or configured) │
                          │  ─ LibreOffice convert (timeout-bound) │
                          └──────────────────────────────────────┘
 ```
@@ -598,11 +617,13 @@ share a built `.dmg`/`.zip` with.
 > `vendor/libreoffice/program/soffice.exe` exists. This step is a no-op
 > on macOS/Linux (LibreOffice bundling is Windows-only).
 
-> **Native modules** — `better-sqlite3` and `@napi-rs/canvas` ship
-> native binaries that must be built against Electron's Node ABI, not
-> the system Node. `electron-builder install-app-deps` handles this
-> during `npm run dist`. If you see "wrong NODE_MODULE_VERSION" at
-> runtime, run `npm run rebuild-native`.
+> **Native modules** — `better-sqlite3`, `@napi-rs/canvas`, and
+> `onnxruntime-node` ship native binaries that must match the active Node
+> or Electron ABI. Development startup verifies them through
+> `scripts/ensure-dev-native-modules.js`; `electron-builder
+> install-app-deps` handles packaging during `npm run dist`. The macOS
+> Apple Vision helper is compiled separately by
+> `scripts/build-vision-ocr.js` and is not tracked in Git.
 
 > **EPERM during build** — if `npm run dist` fails with
 > `EPERM: operation not permitted, unlink … better_sqlite3.node`, you
@@ -658,6 +679,8 @@ docket-desktop/
 │   │   │   ├── downloadTokens.ts HMAC-signed download URLs
 │   │   │   ├── safeSpawn.ts     env-scrubbed child spawn helper
 │   │   │   ├── libreofficeStatus.ts  bundled-soffice probe
+│   │   │   ├── ocr/             local OCR engines, model management,
+│   │   │   │                    preprocessing, and region matching
 │   │   │   ├── llm/             Claude + Gemini clients, tool dispatch
 │   │   │   └── ...
 │   │   └── routes/              chat, projects, documents, tabular,
@@ -694,6 +717,7 @@ docket-desktop/
 | Database     | SQLite via `better-sqlite3` (synchronous, WAL mode)           |
 | Auth         | Node `crypto` HS256 HMAC session JWT — no third-party deps     |
 | File storage | Plain filesystem under app data and `<project>/.docket/files/` |
+| OCR          | Apple Vision (macOS) + local PP-OCR models through ONNX Runtime |
 | LLM          | `@anthropic-ai/sdk`, `@google/generative-ai`                  |
 | DOCX→PDF     | LibreOffice 25.8.6 bundled via `libreoffice-convert`          |
 | Packaging    | electron-builder + NSIS (Windows) / DMG + ZIP (macOS)         |
@@ -727,6 +751,10 @@ Current highlights:
   the same electron-builder default but hasn't been separately verified.
   Linux is not yet configured (no `linux` target beyond the icon
   reference in `package.json`).
+- **OCR accuracy**: recognition quality depends on scan resolution,
+  skew, language mix, and source contrast. Search remains available
+  when individual regions are imperfect, but important quoted text
+  should still be checked against the displayed scan.
 - **Next.js 16.0.3 has a security advisory (CVE-2025-66478)**. Bumping
   to the latest 16.x patch is on the to-do list. Lower urgency for
   this loopback-only deployment but worth tracking.
@@ -748,8 +776,9 @@ the same terms.
 - Desktop port portions (Electron shell, SQLite/filesystem/auth
   rewiring, Windows packaging) © the mikelocal contributors.
 - Docket modifications (project folders, document indexing and hybrid
-  search, PDF annotation workflow, annotation- and document-scoped
-  chat, local providers, rebrand) © 2026 the Docket contributors.
+  search, local OCR, PDF annotation workflow, annotation- and
+  document-scoped chat, local providers, rebrand) © 2026 the Docket
+  contributors.
 - Parts of the product design were inspired by
   [Docufinder](https://github.com/chrisryugj/Docufinder); Docket contains
   no Docufinder code.

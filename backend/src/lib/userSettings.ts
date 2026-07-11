@@ -6,6 +6,12 @@ import {
   DEFAULT_TABULAR_MODEL,
   type UserApiKeys,
 } from "./llm";
+import type {
+  OcrEnginePreference,
+  OcrLanguages,
+  OcrMode,
+  OcrSettings,
+} from "./ocr/types";
 
 export type UserModelSettings = {
   title_model: string;
@@ -33,6 +39,13 @@ type UserProfileSettingsRow = {
   chat_full_read_max_text_bytes?: number | null;
   chat_fetch_max_docs?: number | null;
   chat_fetch_max_text_bytes?: number | null;
+  ocr_enabled?: number | boolean | null;
+  ocr_mode?: string | null;
+  ocr_engine?: string | null;
+  ocr_languages?: string | null;
+  ocr_max_pages_per_doc?: number | null;
+  ocr_gpu_endpoint?: string | null;
+  ocr_external_provider?: string | null;
 };
 
 // Title generation is a lightweight task. Prefer Gemini's free-tier friendly
@@ -74,7 +87,9 @@ function readAppProfile(userId: string): UserProfileSettingsRow | null {
                openrouter_api_key, nvidia_api_key, openai_compatible_api_key,
                openai_compatible_base_url, chat_full_read_max_docs,
                chat_full_read_max_text_bytes, chat_fetch_max_docs,
-               chat_fetch_max_text_bytes
+               chat_fetch_max_text_bytes, ocr_enabled, ocr_mode, ocr_engine,
+               ocr_languages, ocr_max_pages_per_doc, ocr_gpu_endpoint,
+               ocr_external_provider
         FROM user_profiles
         WHERE user_id = ?
       `,
@@ -137,6 +152,44 @@ export async function getUserApiKeys(
 function positiveInt(value: unknown, fallback: number): number {
   const n = typeof value === "number" ? value : Number(value);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+function oneOf<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  return typeof value === "string" && allowed.includes(value as T)
+    ? (value as T)
+    : fallback;
+}
+
+export async function getUserOcrSettings(userId: string): Promise<OcrSettings> {
+  const data = readAppProfile(userId);
+  return {
+    enabled:
+      data?.ocr_enabled === undefined || data?.ocr_enabled === null
+        ? true
+        : Boolean(data.ocr_enabled),
+    mode: oneOf<OcrMode>(
+      data?.ocr_mode,
+      ["local_cpu", "local_gpu", "external_api"],
+      "local_cpu",
+    ),
+    engine: oneOf<OcrEnginePreference>(
+      data?.ocr_engine,
+      ["auto", "vision", "paddle"],
+      "auto",
+    ),
+    languages: oneOf<OcrLanguages>(
+      data?.ocr_languages,
+      ["auto", "korean+english", "english"],
+      "auto",
+    ),
+    maxPagesPerDocument: positiveInt(data?.ocr_max_pages_per_doc, 50),
+    gpuEndpoint: data?.ocr_gpu_endpoint?.trim() || null,
+    externalProvider: data?.ocr_external_provider?.trim() || null,
+  };
 }
 
 export async function getUserRetrievalSettings(

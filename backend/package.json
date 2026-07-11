@@ -12,8 +12,10 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
     "@google/genai": "^1.50.1",
+    "@napi-rs/canvas": "^0.1.100",
     "better-sqlite3": "^12.9.0",
     "cors": "^2.8.5",
+    "docket-desktop": "file:..",
     "docx": "^9.5.0",
     "dotenv": "^17.4.1",
     "express": "^4.21.2",
@@ -22,8 +24,8 @@
     "jszip": "^3.10.1",
     "libreoffice-convert": "^1.6.0",
     "mammoth": "^1.9.0",
-    "docket-desktop": "file:..",
     "multer": "^1.4.5-lts.2",
+    "onnxruntime-node": "^1.27.0",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.10.38",
     "resend": "^4.5.1"

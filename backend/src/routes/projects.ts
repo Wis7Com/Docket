@@ -41,9 +41,22 @@ import {
   refreshProjectRegistryCounts,
 } from "../lib/projectRegistry";
 import { appDataPath, getAppDb, runWithDatabaseContext } from "../db/sqlite";
+import {
+  IMAGE_DOCUMENT_TYPES,
+  isAllowedDocumentType,
+  isImageDocumentType,
+  mimeTypeForDocumentType,
+} from "../lib/documentTypes";
 
 export const projectsRouter = Router();
-const ALLOWED_TYPES = new Set(["pdf", "docx", "doc", "txt", "md"]);
+const ALLOWED_TYPES = new Set([
+  "pdf",
+  "docx",
+  "doc",
+  "txt",
+  "md",
+  ...IMAGE_DOCUMENT_TYPES,
+]);
 
 function serializeSourceFolder<T extends Record<string, unknown>>(row: T): T {
   const rootPath = typeof row.root_path === "string" ? row.root_path : "";
@@ -1193,9 +1206,9 @@ export async function handleDocumentUpload(
   const suffix = filename.includes(".")
     ? filename.split(".").pop()!.toLowerCase()
     : "";
-  if (!ALLOWED_TYPES.has(suffix))
+  if (!isAllowedDocumentType(suffix) || !ALLOWED_TYPES.has(suffix))
     return void res.status(400).json({
-      detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc, txt, md`,
+      detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc, txt, md, ${IMAGE_DOCUMENT_TYPES.join(", ")}`,
     });
 
   const content = file.buffer;
@@ -1237,12 +1250,7 @@ export async function handleDocumentUpload(
   try {
     const docId = doc.id as string;
     const key = storageKey(userId, docId, filename);
-    const contentType =
-      suffix === "pdf"
-        ? "application/pdf"
-        : suffix === "txt" || suffix === "md"
-          ? "text/plain; charset=utf-8"
-          : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    const contentType = mimeTypeForDocumentType(suffix);
     await uploadFile(
       key,
       content.buffer.slice(
@@ -1257,7 +1265,12 @@ export async function handleDocumentUpload(
       content.byteOffset + content.byteLength,
     ) as ArrayBuffer;
     const tree = await extractStructureTree(rawBuf, suffix, filename);
-    const pageCount = suffix === "pdf" ? await countPdfPages(rawBuf) : null;
+    const pageCount =
+      suffix === "pdf"
+        ? await countPdfPages(rawBuf)
+        : isImageDocumentType(suffix)
+          ? 1
+          : null;
 
     // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;

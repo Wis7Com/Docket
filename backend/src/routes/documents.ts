@@ -54,9 +54,23 @@ import { extractStructuredTextFromBytes } from "../lib/indexing/extractors";
 import { generateDocumentOutlineFallback } from "../lib/documentOutline";
 import { getUserModelSettings } from "../lib/userSettings";
 import { resolveModel } from "../lib/llm";
+import {
+  IMAGE_DOCUMENT_TYPES,
+  isAllowedDocumentType,
+  isImageDocumentType,
+  mimeTypeForDocumentType,
+} from "../lib/documentTypes";
+import { findMatchingOcrRegions } from "../lib/ocr/ocrRegions";
 
 export const documentsRouter = Router();
-const ALLOWED_TYPES = new Set(["pdf", "docx", "doc", "txt", "md"]);
+const ALLOWED_TYPES = new Set([
+  "pdf",
+  "docx",
+  "doc",
+  "txt",
+  "md",
+  ...IMAGE_DOCUMENT_TYPES,
+]);
 
 type PdfAnnotationRect = {
   page: number;
@@ -252,6 +266,13 @@ documentsRouter.get("/:documentId/display", requireAuth, async (req, res) => {
       buildContentDisposition("inline", doc.filename as string),
     );
     res.send(Buffer.from(raw));
+  } else if (isImageDocumentType(fileType)) {
+    res.setHeader("Content-Type", mimeTypeForDocumentType(fileType));
+    res.setHeader(
+      "Content-Disposition",
+      buildContentDisposition("inline", doc.filename as string),
+    );
+    res.send(Buffer.from(raw));
   } else {
     // Fallback: serve raw DOCX (mammoth will handle it client-side)
     res.setHeader(
@@ -265,6 +286,59 @@ documentsRouter.get("/:documentId/display", requireAuth, async (req, res) => {
     res.send(Buffer.from(raw));
   }
 });
+
+documentsRouter.get(
+  "/:documentId/ocr-regions",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { documentId } = req.params;
+    const pageNumber = Number(req.query.page);
+    const quote =
+      typeof req.query.quote === "string" ? req.query.quote.trim() : "";
+    const versionId =
+      typeof req.query.version_id === "string" ? req.query.version_id : null;
+    if (!Number.isInteger(pageNumber) || pageNumber < 1 || !quote) {
+      return void res
+        .status(400)
+        .json({ detail: "page and quote are required" });
+    }
+    const db = createServerSupabase();
+    const doc = await loadAccessibleDocument(documentId, userId, userEmail, db);
+    if (!doc)
+      return void res.status(404).json({ detail: "Document not found" });
+    const active = await loadActiveVersion(documentId, db, versionId);
+    if (!active)
+      return void res
+        .status(404)
+        .json({ detail: "Document version not found" });
+    const { data, error } = await db
+      .from("document_ocr_regions")
+      .select("region_index, text, bbox_x, bbox_y, bbox_width, bbox_height")
+      .eq("document_id", documentId)
+      .eq("version_id", active.id)
+      .eq("page_number", pageNumber)
+      .order("region_index", { ascending: true });
+    if (error) return void res.status(500).json({ detail: error.message });
+    const matched = findMatchingOcrRegions(
+      (data ?? []) as Parameters<typeof findMatchingOcrRegions>[0],
+      quote,
+    );
+    res.json({
+      page_number: pageNumber,
+      regions: matched.map((region) => ({
+        text: region.text,
+        bbox: {
+          x: region.bbox_x,
+          y: region.bbox_y,
+          width: region.bbox_width,
+          height: region.bbox_height,
+        },
+      })),
+    });
+  },
+);
 
 // POST /single-documents/:documentId/outline
 // Final server-side fallback for documents whose viewer-side heading and TOC
@@ -1737,10 +1811,7 @@ documentsRouter.post(
         versionSlug,
         file.originalname,
       );
-      const contentType =
-        suffix === "pdf"
-          ? "application/pdf"
-          : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      const contentType = mimeTypeForDocumentType(suffix);
       try {
         await uploadFile(
           key,
@@ -2191,9 +2262,9 @@ async function handleDocumentUpload(
   const suffix = filename.includes(".")
     ? filename.split(".").pop()!.toLowerCase()
     : "";
-  if (!ALLOWED_TYPES.has(suffix))
+  if (!isAllowedDocumentType(suffix) || !ALLOWED_TYPES.has(suffix))
     return void res.status(400).json({
-      detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc, txt, md`,
+      detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc, txt, md, ${IMAGE_DOCUMENT_TYPES.join(", ")}`,
     });
 
   const content = file.buffer;
@@ -2217,12 +2288,7 @@ async function handleDocumentUpload(
   try {
     const docId = doc.id as string;
     const key = storageKey(userId, docId, filename);
-    const contentType =
-      suffix === "pdf"
-        ? "application/pdf"
-        : suffix === "txt" || suffix === "md"
-          ? "text/plain; charset=utf-8"
-          : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    const contentType = mimeTypeForDocumentType(suffix);
     await uploadFile(
       key,
       content.buffer.slice(
@@ -2237,7 +2303,12 @@ async function handleDocumentUpload(
       content.byteOffset + content.byteLength,
     ) as ArrayBuffer;
     const tree = await extractStructureTree(rawBuf, suffix, filename);
-    const pageCount = suffix === "pdf" ? await countPdfPages(rawBuf) : null;
+    const pageCount =
+      suffix === "pdf"
+        ? await countPdfPages(rawBuf)
+        : isImageDocumentType(suffix)
+          ? 1
+          : null;
 
     // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;

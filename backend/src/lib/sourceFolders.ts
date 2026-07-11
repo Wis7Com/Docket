@@ -5,10 +5,10 @@ import type { createServerSupabase } from "./supabase";
 import { docxToPdf } from "./convert";
 import { enqueueDocumentIndex } from "./indexing/indexer";
 import { linkedSourceKey, uploadFile } from "./storage";
+import { isAllowedDocumentType } from "./documentTypes";
 
 type Supa = ReturnType<typeof createServerSupabase>;
 
-const ALLOWED_TYPES = new Set(["pdf", "docx", "doc", "txt", "md"]);
 const MAX_LINKED_SOURCE_FILES = 5000;
 
 export type LinkedSourceDocument = Record<string, unknown>;
@@ -38,7 +38,7 @@ export function isInsideRoot(root: string, candidate: string): boolean {
 
 export function sourceFileType(filePath: string): string | null {
   const ext = path.extname(filePath).slice(1).toLowerCase();
-  return ALLOWED_TYPES.has(ext) ? ext : null;
+  return isAllowedDocumentType(ext) ? ext : null;
 }
 
 export function resolveSourceFolderPath(folderPath: string): string {

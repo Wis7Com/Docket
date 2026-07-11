@@ -1,6 +1,12 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
+import { enqueueEmptyPdfIndexes } from "../lib/indexing/indexer";
+import {
+  listRegisteredProjects,
+  projectContextFor,
+} from "../lib/projectRegistry";
+import { runWithDatabaseContext } from "../db/sqlite";
 
 export const userRouter = Router();
 
@@ -64,6 +70,13 @@ const ALLOWED_FIELDS = new Set([
   "chat_full_read_max_text_bytes",
   "chat_fetch_max_docs",
   "chat_fetch_max_text_bytes",
+  "ocr_enabled",
+  "ocr_mode",
+  "ocr_engine",
+  "ocr_languages",
+  "ocr_max_pages_per_doc",
+  "ocr_gpu_endpoint",
+  "ocr_external_provider",
   "message_credits_used",
 ]);
 
@@ -80,6 +93,11 @@ userRouter.patch("/profile", requireAuth, async (req, res) => {
   update.updated_at = new Date().toISOString();
 
   const db = createServerSupabase();
+  const { data: before } = await db
+    .from("user_profiles")
+    .select("ocr_enabled, ocr_engine")
+    .eq("user_id", userId)
+    .single();
   const { error } = await db
     .from("user_profiles")
     .update(update)
@@ -91,6 +109,34 @@ userRouter.patch("/profile", requireAuth, async (req, res) => {
     .select("*")
     .eq("user_id", userId)
     .single();
+
+  const previous = before as
+    | { ocr_enabled?: number | boolean | null; ocr_engine?: string | null }
+    | null;
+  const current = data as
+    | { ocr_enabled?: number | boolean | null; ocr_engine?: string | null }
+    | null;
+  const ocrBecameEnabled =
+    Object.hasOwn(update, "ocr_enabled") &&
+    !Boolean(previous?.ocr_enabled) &&
+    Boolean(current?.ocr_enabled);
+  const ocrEngineChanged =
+    Object.hasOwn(update, "ocr_engine") &&
+    previous?.ocr_engine !== current?.ocr_engine;
+  if (Boolean(current?.ocr_enabled) && (ocrBecameEnabled || ocrEngineChanged)) {
+    for (const project of listRegisteredProjects(userId)) {
+      try {
+        await runWithDatabaseContext(projectContextFor(project), async () => {
+          enqueueEmptyPdfIndexes(project.id);
+        });
+      } catch (err) {
+        console.warn(
+          `[ocr] unable to enqueue empty PDFs for project ${project.id}`,
+          err,
+        );
+      }
+    }
+  }
   res.json(data);
 });
 

@@ -28,3 +28,6 @@ backend/.dist-bundle/
 
 # Machine-local Docket runtime state (SQLite database and WAL files)
 /backend/.docket-app/
+
+# Native OCR helper compiled locally by scripts/build-vision-ocr.js
+/native/macos-vision-ocr/docket-vision-ocr

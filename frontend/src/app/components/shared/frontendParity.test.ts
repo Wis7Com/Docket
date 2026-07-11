@@ -837,6 +837,36 @@ test("project index status shows circular indexing and embedding progress", () =
   );
   assert.match(
     source,
+    /function IndexActionTooltip/,
+    "index action buttons should share a visible tooltip treatment",
+  );
+  assert.match(
+    source,
+    /Generate semantic embeddings for documents that have not been embedded yet\./,
+    "start embedding should explain its action on hover",
+  );
+  assert.match(
+    source,
+    /Pause semantic embedding after the current item\. Completed embeddings stay saved; use Start Embedding to resume\./,
+    "pause embedding should explain that completed work is kept and resumable",
+  );
+  assert.match(
+    source,
+    /Cancel document text indexing\. Semantic embedding continues; use Pause Embedding to stop it\./,
+    "cancel indexing should distinguish text indexing from semantic embedding",
+  );
+  assert.match(
+    source,
+    /role="tooltip"/,
+    "index action explanations should expose tooltip semantics",
+  );
+  assert.match(
+    source,
+    /group-focus-within:opacity-100/,
+    "index action tooltips should also appear for keyboard focus",
+  );
+  assert.match(
+    source,
     /indexStatus\.semantic\?\.paused/,
     "semantic status should visibly reflect paused embedding",
   );

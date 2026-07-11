@@ -1,4 +1,5 @@
 import path from "path";
+import type { OcrEngine } from "../ocr/types";
 import type {
   DocumentSectionAnchor,
   StructuredIndexText,
@@ -421,6 +422,7 @@ export function buildChunkSearchText(
 
 export async function extractStructuredPdfText(
   raw: ArrayBuffer,
+  options: { ocr?: { engine: OcrEngine; maxPages: number } } = {},
 ): Promise<StructuredIndexText> {
   try {
     const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs" as string);
@@ -439,6 +441,14 @@ export async function extractStructuredPdfText(
             numPages: number;
             getPage: (pageNumber: number) => Promise<{
               getTextContent: () => Promise<PdfTextContentLike>;
+              getViewport: (options: { scale: number }) => {
+                width: number;
+                height: number;
+              };
+              render: (options: {
+                canvasContext: unknown;
+                viewport: unknown;
+              }) => { promise: Promise<void> };
             }>;
             destroy?: () => Promise<void>;
           }>;
@@ -452,11 +462,74 @@ export async function extractStructuredPdfText(
     const textParts: string[] = [];
     const lines: StructuredTextLine[] = [];
     let globalOffset = 0;
+    let ocrAttempts = 0;
+    let ocrPages = 0;
+    const ocrRegions: NonNullable<StructuredIndexText["ocr_regions"]> = [];
     try {
       for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
         const page = await pdf.getPage(pageNumber);
         const content = await page.getTextContent();
-        const reconstructed = reconstructPdfPageText(content);
+        let reconstructed = reconstructPdfPageText(content);
+        if (
+          reconstructed.text.trim().length < 10 &&
+          options.ocr &&
+          ocrAttempts < Math.max(0, options.ocr.maxPages)
+        ) {
+          ocrAttempts += 1;
+          try {
+            const baseViewport = page.getViewport({ scale: 1 });
+            const dpiScale = 200 / 72;
+            const scale = Math.min(
+              dpiScale,
+              2000 / Math.max(1, baseViewport.width),
+            );
+            const viewport = page.getViewport({ scale });
+            const { createCanvas } = await import("@napi-rs/canvas");
+            const canvas = createCanvas(
+              Math.max(1, Math.ceil(viewport.width)),
+              Math.max(1, Math.ceil(viewport.height)),
+            );
+            const canvasContext = canvas.getContext("2d");
+            await page.render({ canvasContext, viewport }).promise;
+            const result = await options.ocr.engine.recognize({
+              data: canvas.toBuffer("image/png"),
+              width: canvas.width,
+              height: canvas.height,
+              format: "png",
+            });
+            ocrPages += 1;
+            const text = result.text.normalize("NFC").trim();
+            for (const region of result.regions) {
+              ocrRegions.push({ ...region, page_number: pageNumber });
+            }
+            const ocrLines = (
+              result.regions.length > 0
+                ? result.regions.map((region) => region.text)
+                : text.split(/\r?\n/)
+            )
+              .map(normalizeInlineText)
+              .filter(Boolean);
+            let offset = 0;
+            reconstructed = {
+              text,
+              lines: ocrLines.map((line, lineIndex) => {
+                const start = text.indexOf(line, offset);
+                const startChar = start >= 0 ? start : offset;
+                offset = startChar + line.length;
+                return {
+                  line_index: lineIndex,
+                  text: line,
+                  start_char: startChar,
+                  end_char: offset,
+                  font_size: null,
+                  bold: false,
+                };
+              }),
+            };
+          } catch (err) {
+            console.warn(`[ocr] page ${pageNumber} failed`, err);
+          }
+        }
         const pageText = `[Page ${pageNumber}]\n${reconstructed.text}`;
         if (textParts.length > 0) globalOffset += 2;
         const contentOffset = globalOffset + `[Page ${pageNumber}]\n`.length;
@@ -476,8 +549,22 @@ export async function extractStructuredPdfText(
     }
 
     const text = textParts.join("\n\n").trim();
-    return { text, lines, sections: detectDocumentSections(text, lines) };
+    return {
+      text,
+      lines,
+      sections: detectDocumentSections(text, lines),
+      ocr_pages: ocrPages,
+      ocr_engine: ocrPages > 0 ? (options.ocr?.engine.name ?? null) : null,
+      ocr_regions: ocrRegions,
+    };
   } catch {
-    return { text: "", lines: [], sections: [] };
+    return {
+      text: "",
+      lines: [],
+      sections: [],
+      ocr_pages: 0,
+      ocr_engine: null,
+      ocr_regions: [],
+    };
   }
 }

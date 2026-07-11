@@ -460,6 +460,30 @@ function CircularProgressPill({
   );
 }
 
+function IndexActionTooltip({
+  id,
+  text,
+  children,
+}: {
+  id: string;
+  text: string;
+  children: ReactNode;
+}) {
+  return (
+    <span className="group relative inline-flex">
+      {children}
+      <span
+        id={id}
+        role="tooltip"
+        className="pointer-events-none invisible absolute right-0 top-full z-50 mt-2 w-max max-w-64 rounded-md bg-gray-900 px-2.5 py-1.5 text-left text-[11px] font-normal leading-4 text-white opacity-0 shadow-lg transition-opacity group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100 motion-reduce:transition-none"
+      >
+        <span className="absolute -top-1 right-4 h-2 w-2 rotate-45 bg-gray-900" />
+        {text}
+      </span>
+    </span>
+  );
+}
+
 function SourceFolderModal({
   open,
   busy,
@@ -3010,6 +3034,11 @@ export function ProjectPage({ projectId }: Props) {
                   <span className="rounded bg-gray-100 px-2 py-0.5 text-gray-500">
                     {formatBytes(indexStatus.text_bytes)}
                   </span>
+                  {indexStatus.ocr_pages > 0 ? (
+                    <span className="rounded bg-violet-50 px-2 py-0.5 text-violet-700">
+                      OCR processed · {indexStatus.ocr_pages} pages
+                    </span>
+                  ) : null}
                   {indexStatus.status_counts.ready ? (
                     <span className="rounded bg-emerald-50 px-2 py-0.5 text-emerald-700">
                       {indexStatus.status_counts.ready} ready
@@ -3078,93 +3107,115 @@ export function ProjectPage({ projectId }: Props) {
               )}
             </div>
             <div className="ml-auto flex items-center gap-2">
-              <button
-                type="button"
-                disabled={
-                  embeddingBusy ||
-                  compactBusy ||
-                  currentIndexProgress?.active ||
-                  !semanticEmbeddingAvailable ||
-                  (semanticEmbeddingActive && !semanticEmbeddingPaused)
-                }
-                onClick={() => void handleStartEmbedding()}
-                title={
-                  currentIndexProgress?.active
-                    ? "Wait for lexical indexing to finish"
-                    : indexStatus?.semantic?.enabled === false
-                      ? "Semantic search is disabled in model settings"
-                      : undefined
-                }
-                className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+              <IndexActionTooltip
+                id="start-embedding-tooltip"
+                text="Generate semantic embeddings for documents that have not been embedded yet."
               >
-                {embeddingBusy && semanticEmbeddingPaused ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Play className="h-3 w-3" />
-                )}
-                Start Embedding
-              </button>
-              <button
-                type="button"
-                disabled={
-                  embeddingBusy ||
-                  compactBusy ||
-                  !semanticEmbeddingAvailable ||
-                  semanticEmbeddingPaused ||
-                  !semanticEmbeddingActive
-                }
-                onClick={() => void handlePauseEmbedding()}
-                className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                <button
+                  type="button"
+                  aria-describedby="start-embedding-tooltip"
+                  disabled={
+                    embeddingBusy ||
+                    compactBusy ||
+                    currentIndexProgress?.active ||
+                    !semanticEmbeddingAvailable ||
+                    (semanticEmbeddingActive && !semanticEmbeddingPaused)
+                  }
+                  onClick={() => void handleStartEmbedding()}
+                  className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                >
+                  {embeddingBusy && semanticEmbeddingPaused ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Play className="h-3 w-3" />
+                  )}
+                  Start Embedding
+                </button>
+              </IndexActionTooltip>
+              <IndexActionTooltip
+                id="pause-embedding-tooltip"
+                text="Pause semantic embedding after the current item. Completed embeddings stay saved; use Start Embedding to resume."
               >
-                {embeddingBusy && !semanticEmbeddingPaused ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Pause className="h-3 w-3" />
-                )}
-                Pause Embedding
-              </button>
-              <button
-                type="button"
-                disabled={indexBusy || compactBusy}
-                onClick={() => void handleRebuildIndex()}
-                className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                <button
+                  type="button"
+                  aria-describedby="pause-embedding-tooltip"
+                  disabled={
+                    embeddingBusy ||
+                    compactBusy ||
+                    !semanticEmbeddingAvailable ||
+                    semanticEmbeddingPaused ||
+                    !semanticEmbeddingActive
+                  }
+                  onClick={() => void handlePauseEmbedding()}
+                  className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                >
+                  {embeddingBusy && !semanticEmbeddingPaused ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Pause className="h-3 w-3" />
+                  )}
+                  Pause Embedding
+                </button>
+              </IndexActionTooltip>
+              <IndexActionTooltip
+                id="rebuild-index-tooltip"
+                text="Rebuild the search index and remove all existing project embeddings."
               >
-                {indexBusy ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <RefreshCw className="h-3 w-3" />
-                )}
-                Rebuild
-              </button>
-              <button
-                type="button"
-                disabled={
-                  compactBusy ||
-                  indexBusy ||
-                  embeddingBusy ||
-                  currentIndexProgress?.active ||
-                  currentSemanticProgress?.active
-                }
-                onClick={() => void handleCompactDatabase()}
-                title="Return unused project database space to disk"
-                className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                <button
+                  type="button"
+                  aria-describedby="rebuild-index-tooltip"
+                  disabled={indexBusy || compactBusy}
+                  onClick={() => void handleRebuildIndex()}
+                  className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                >
+                  {indexBusy ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <RefreshCw className="h-3 w-3" />
+                  )}
+                  Rebuild
+                </button>
+              </IndexActionTooltip>
+              <IndexActionTooltip
+                id="compact-database-tooltip"
+                text="Return unused project database space to disk."
               >
-                {compactBusy ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Database className="h-3 w-3" />
-                )}
-                Compact Database
-              </button>
-              <button
-                type="button"
-                disabled={indexBusy || compactBusy}
-                onClick={() => void handleCancelIndexing()}
-                className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                <button
+                  type="button"
+                  aria-describedby="compact-database-tooltip"
+                  disabled={
+                    compactBusy ||
+                    indexBusy ||
+                    embeddingBusy ||
+                    currentIndexProgress?.active ||
+                    currentSemanticProgress?.active
+                  }
+                  onClick={() => void handleCompactDatabase()}
+                  className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                >
+                  {compactBusy ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Database className="h-3 w-3" />
+                  )}
+                  Compact Database
+                </button>
+              </IndexActionTooltip>
+              <IndexActionTooltip
+                id="cancel-indexing-tooltip"
+                text="Cancel document text indexing. Semantic embedding continues; use Pause Embedding to stop it."
               >
-                <X className="h-3 w-3" />
-                Cancel
-              </button>
+                <button
+                  type="button"
+                  aria-describedby="cancel-indexing-tooltip"
+                  disabled={indexBusy || compactBusy}
+                  onClick={() => void handleCancelIndexing()}
+                  className="flex h-7 items-center gap-1 rounded border border-gray-200 px-2 text-xs font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:text-gray-300"
+                >
+                  <X className="h-3 w-3" />
+                  Cancel
+                </button>
+              </IndexActionTooltip>
             </div>
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">

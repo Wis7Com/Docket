@@ -57,7 +57,8 @@ export class DocketApiError extends Error {
 export async function getApiBase(): Promise<string> {
   if (typeof window !== "undefined") {
     const bridge = window.docket as
-      { getApiPort?: () => Promise<number> } | undefined;
+      | { getApiPort?: () => Promise<number> }
+      | undefined;
     if (bridge?.getApiPort) {
       try {
         const port = await bridge.getApiPort();
@@ -220,6 +221,7 @@ export interface ProjectIndexStatus {
   status_counts: Record<string, number>;
   text_bytes: number;
   chunk_count: number;
+  ocr_pages: number;
   last_indexed_at: string | null;
   semantic?: {
     enabled: boolean;
@@ -254,7 +256,12 @@ export interface ProjectSearchResult {
   lexical_score?: number | null;
   semantic_score?: number | null;
   match_reasons?: (
-    "exact" | "keyword" | "substring" | "semantic" | "filename" | "basic"
+    | "exact"
+    | "keyword"
+    | "substring"
+    | "semantic"
+    | "filename"
+    | "basic"
   )[];
   grouped_chunk_count?: number;
   basic_match: boolean;
@@ -578,6 +585,27 @@ export async function getDocumentUrl(
 ): Promise<{ url: string; filename: string; version_id: string | null }> {
   const qs = versionId ? `?version_id=${encodeURIComponent(versionId)}` : "";
   return apiRequest(`/single-documents/${documentId}/url${qs}`);
+}
+
+export type OcrRegionMatch = {
+  page_number: number;
+  regions: {
+    text: string;
+    bbox: { x: number; y: number; width: number; height: number };
+  }[];
+};
+
+export async function getDocumentOcrRegions(
+  documentId: string,
+  versionId: string | null | undefined,
+  page: number,
+  quote: string,
+): Promise<OcrRegionMatch> {
+  const qs = new URLSearchParams({ page: String(page), quote });
+  if (versionId) qs.set("version_id", versionId);
+  return apiRequest(
+    `/single-documents/${documentId}/ocr-regions?${qs.toString()}`,
+  );
 }
 
 export interface GeneratedDocumentOutlineItem {

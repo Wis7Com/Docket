@@ -8,6 +8,7 @@ import {
 } from "../../db/sqlite";
 import { createServerSupabase } from "../supabase";
 import { extractDocumentForIndex } from "./extractors";
+import type { OcrEngine } from "../ocr/types";
 import {
   contentHash,
   embedDocumentText,
@@ -109,6 +110,8 @@ function markIndexStatus(args: {
   textBytes?: number;
   indexedContentRevision?: number;
   indexSchemaVersion?: number;
+  ocrPages?: number;
+  ocrEngine?: string | null;
 }): void {
   getDb()
     .prepare(
@@ -120,6 +123,8 @@ function markIndexStatus(args: {
           text_bytes = COALESCE(?, text_bytes),
           indexed_content_revision = COALESCE(?, indexed_content_revision),
           index_schema_version = COALESCE(?, index_schema_version),
+          ocr_pages = COALESCE(?, ocr_pages),
+          ocr_engine = CASE WHEN ? = 'ready' THEN ? ELSE ocr_engine END,
           indexed_at = CASE WHEN ? = 'ready' THEN CURRENT_TIMESTAMP ELSE indexed_at END,
           updated_at = CURRENT_TIMESTAMP
       WHERE document_id = ? AND version_id = ?
@@ -132,6 +137,9 @@ function markIndexStatus(args: {
       args.textBytes ?? null,
       args.indexedContentRevision ?? null,
       args.indexSchemaVersion ?? null,
+      args.ocrPages ?? null,
+      args.status,
+      args.ocrEngine ?? null,
       args.status,
       args.documentId,
       args.versionId,
@@ -205,6 +213,7 @@ function documentVersionExists(documentId: string, versionId: string): boolean {
 export async function indexDocumentVersion(args: {
   documentId: string;
   versionId?: string | null;
+  ocrEngine?: OcrEngine;
 }): Promise<void> {
   const dbShim = createServerSupabase();
   const requestedRevision = args.versionId
@@ -214,6 +223,7 @@ export async function indexDocumentVersion(args: {
     db: dbShim,
     documentId: args.documentId,
     versionId: args.versionId,
+    ocrEngine: args.ocrEngine,
   });
   const extractedRevision =
     requestedRevision ??
@@ -249,6 +259,9 @@ export async function indexDocumentVersion(args: {
     db.prepare(
       "DELETE FROM document_index_chunks WHERE document_id = ? AND version_id = ?",
     ).run(extracted.document_id, extracted.version_id);
+    db.prepare(
+      "DELETE FROM document_ocr_regions WHERE document_id = ? AND version_id = ?",
+    ).run(extracted.document_id, extracted.version_id);
 
     const insertChunk = db.prepare(
       `
@@ -275,6 +288,29 @@ export async function indexDocumentVersion(args: {
       VALUES (?, ?, ?, ?)
     `,
     );
+    const insertOcrRegion = db.prepare(`
+      INSERT INTO document_ocr_regions (
+        document_id, version_id, page_number, region_index, text, confidence,
+        bbox_x, bbox_y, bbox_width, bbox_height
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const regionIndexes = new Map<number, number>();
+    for (const region of extracted.ocr_regions) {
+      const index = regionIndexes.get(region.page_number) ?? 0;
+      regionIndexes.set(region.page_number, index + 1);
+      insertOcrRegion.run(
+        extracted.document_id,
+        extracted.version_id,
+        region.page_number,
+        index,
+        region.text,
+        region.confidence,
+        region.bbox.x,
+        region.bbox.y,
+        region.bbox.width,
+        region.bbox.height,
+      );
+    }
 
     insertedChunkIds = [];
     for (const chunk of extracted.chunks) {
@@ -322,6 +358,8 @@ export async function indexDocumentVersion(args: {
       textBytes: Buffer.byteLength(extracted.text, "utf8"),
       indexedContentRevision: extractedRevision,
       indexSchemaVersion: BASELINE_INDEX_SCHEMA_VERSION,
+      ocrPages: extracted.ocr_pages,
+      ocrEngine: extracted.ocr_engine,
     });
   });
   replaceChunks();
@@ -522,6 +560,31 @@ export async function enqueueProjectIndexRebuild(
   return count;
 }
 
+/** Re-index only empty ready PDFs after OCR is enabled or its engine changes. */
+export function enqueueEmptyPdfIndexes(projectId: string): number {
+  const rows = getDb()
+    .prepare(
+      `
+      SELECT d.id AS document_id, d.current_version_id AS version_id
+      FROM documents d
+      LEFT JOIN document_index_files f
+        ON f.document_id = d.id AND f.version_id = d.current_version_id
+      WHERE d.project_id = ?
+        AND d.status = 'ready'
+        AND lower(COALESCE(d.file_type, '')) = 'pdf'
+        AND d.current_version_id IS NOT NULL
+        AND COALESCE(f.chunk_count, 0) = 0
+    `,
+    )
+    .all(projectId) as { document_id: string; version_id: string }[];
+  let count = 0;
+  for (const row of rows) {
+    ensureIndexFileRow(row.document_id, row.version_id);
+    if (enqueueDocumentIndex(row.document_id, row.version_id)) count += 1;
+  }
+  return count;
+}
+
 export function clearProjectEmbeddings(projectId: string): {
   deleted_embeddings: number;
   cancelled_jobs: number;
@@ -682,6 +745,7 @@ export function getProjectIndexStatus(projectId: string): {
   status_counts: Record<string, number>;
   text_bytes: number;
   chunk_count: number;
+  ocr_pages: number;
   last_indexed_at: string | null;
 } {
   const db = getDb();
@@ -692,7 +756,8 @@ export function getProjectIndexStatus(projectId: string): {
     .prepare(
       `
       SELECT f.status, COUNT(*) AS count, SUM(f.text_bytes) AS text_bytes,
-             SUM(f.chunk_count) AS chunk_count, MAX(f.indexed_at) AS last_indexed_at
+             SUM(f.chunk_count) AS chunk_count, SUM(f.ocr_pages) AS ocr_pages,
+             MAX(f.indexed_at) AS last_indexed_at
       FROM document_index_files f
       JOIN documents d ON d.id = f.document_id
       WHERE d.project_id = ?
@@ -705,17 +770,20 @@ export function getProjectIndexStatus(projectId: string): {
     count: number;
     text_bytes: number | null;
     chunk_count: number | null;
+    ocr_pages: number | null;
     last_indexed_at: string | null;
   }[];
 
   const statusCounts: Record<string, number> = {};
   let textBytes = 0;
   let chunkCount = 0;
+  let ocrPages = 0;
   let lastIndexedAt: string | null = null;
   for (const row of rows) {
     statusCounts[row.status] = row.count;
     textBytes += row.text_bytes ?? 0;
     chunkCount += row.chunk_count ?? 0;
+    ocrPages += row.ocr_pages ?? 0;
     if (
       row.last_indexed_at &&
       (!lastIndexedAt || row.last_indexed_at > lastIndexedAt)
@@ -734,6 +802,7 @@ export function getProjectIndexStatus(projectId: string): {
     status_counts: statusCounts,
     text_bytes: textBytes,
     chunk_count: chunkCount,
+    ocr_pages: ocrPages,
     last_indexed_at: lastIndexedAt,
   };
 }

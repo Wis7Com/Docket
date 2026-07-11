@@ -56,6 +56,16 @@ export type StructuredIndexText = {
   text: string;
   lines: StructuredTextLine[];
   sections: DocumentSectionAnchor[];
+  ocr_pages?: number;
+  ocr_engine?: string | null;
+  ocr_regions?: IndexedOcrRegion[];
+};
+
+export type IndexedOcrRegion = {
+  page_number: number;
+  text: string;
+  confidence: number;
+  bbox: { x: number; y: number; width: number; height: number };
 };
 
 export type ExtractedDocument = {
@@ -65,6 +75,9 @@ export type ExtractedDocument = {
   file_type: string;
   text: string;
   chunks: ExtractedChunk[];
+  ocr_pages: number;
+  ocr_engine: string | null;
+  ocr_regions: IndexedOcrRegion[];
 };
 
 export type SearchResult = {

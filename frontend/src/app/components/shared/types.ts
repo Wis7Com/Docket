@@ -33,7 +33,7 @@ export interface DocketDocument {
     project_id: string | null;
     folder_id?: string | null;
     filename: string;
-    file_type: string | null; // pdf | docx | doc
+    file_type: string | null; // pdf | docx | doc | txt | md | image formats
     storage_path: string | null;
     pdf_storage_path: string | null;
     size_bytes: number | null;

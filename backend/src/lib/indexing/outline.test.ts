@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { PDFDocument, StandardFonts } from "pdf-lib";
+import { createCanvas } from "@napi-rs/canvas";
 import { chunkTextForIndex } from "./extractors";
 import {
   buildChunkSearchText,
@@ -10,6 +11,7 @@ import {
   reconstructPdfPageText,
 } from "./outline";
 import type { StructuredTextLine } from "./types";
+import type { OcrEngine, OcrResult } from "../ocr/types";
 
 function item(
   str: string,
@@ -78,6 +80,134 @@ test("pdfjs extraction supplies page-backed section offsets", async () => {
   const chunks = chunkTextForIndex(extracted.text, extracted.sections);
   assert.equal(chunks[0].content.includes("p. 1 ·"), false);
   assert.equal(chunks[0].section_path, "p. 1 · PDF Heading");
+});
+
+async function scannedPdfFixture(pageCount: number): Promise<ArrayBuffer> {
+  const pdf = await PDFDocument.create();
+  for (let index = 0; index < pageCount; index += 1) {
+    const canvas = createCanvas(300, 400);
+    const context = canvas.getContext("2d");
+    context.fillStyle = "white";
+    context.fillRect(0, 0, 300, 400);
+    context.fillStyle = "black";
+    context.font = "24px sans-serif";
+    context.fillText(`scan ${index + 1}`, 25, 60);
+    const png = await pdf.embedPng(canvas.toBuffer("image/png"));
+    const page = pdf.addPage([216, 288]);
+    page.drawImage(png, { x: 0, y: 0, width: 216, height: 288 });
+  }
+  const bytes = await pdf.save();
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+}
+
+class QueuedOcrEngine implements OcrEngine {
+  readonly name = "test-ocr";
+  readonly calls: { width: number; height: number }[] = [];
+
+  constructor(private readonly results: (OcrResult | Error)[]) {}
+
+  async recognize(image: {
+    data: Uint8Array;
+    width: number;
+    height: number;
+  }): Promise<OcrResult> {
+    this.calls.push({ width: image.width, height: image.height });
+    const result = this.results.shift();
+    if (result instanceof Error) throw result;
+    return result ?? { text: "", regions: [], confidence: 0 };
+  }
+}
+
+function ocrResult(text: string): OcrResult {
+  return {
+    text,
+    confidence: 0.95,
+    regions: [
+      {
+        text,
+        confidence: 0.95,
+        bbox: { x: 0.1, y: 0.1, width: 0.8, height: 0.1 },
+      },
+    ],
+  };
+}
+
+test("scanned PDF pages are rendered, OCRed, and chunked with page numbers", async () => {
+  const raw = await scannedPdfFixture(3);
+  const engine = new QueuedOcrEngine([
+    ocrResult("한국어 계약 조항"),
+    ocrResult("English indemnity clause"),
+    ocrResult("혼용 mixed clause"),
+  ]);
+
+  const extracted = await extractStructuredPdfText(raw, {
+    ocr: { engine, maxPages: 50 },
+  });
+
+  assert.equal(
+    extracted.text,
+    [
+      "[Page 1]\n한국어 계약 조항",
+      "[Page 2]\nEnglish indemnity clause",
+      "[Page 3]\n혼용 mixed clause",
+    ].join("\n\n"),
+  );
+  assert.equal(extracted.ocr_pages, 3);
+  assert.equal(extracted.ocr_engine, "test-ocr");
+  assert.deepEqual(
+    extracted.lines.map((line) => line.page_number),
+    [1, 2, 3],
+  );
+  assert.deepEqual(
+    chunkTextForIndex(extracted.text, extracted.sections).map(
+      (chunk) => chunk.page_number,
+    ),
+    [1, 2, 3],
+  );
+  assert.equal(engine.calls.length, 3);
+  assert.ok(engine.calls.every((call) => call.width <= 2000));
+});
+
+test("OCR is capped and page failures do not discard successful pages", async () => {
+  const raw = await scannedPdfFixture(3);
+  const engine = new QueuedOcrEngine([
+    ocrResult("first scanned page"),
+    new Error("local OCR failed"),
+  ]);
+
+  const extracted = await extractStructuredPdfText(raw, {
+    ocr: { engine, maxPages: 2 },
+  });
+
+  assert.equal(engine.calls.length, 2);
+  assert.match(extracted.text, /\[Page 1\]\nfirst scanned page/);
+  assert.match(extracted.text, /\[Page 2\]\n/);
+  assert.match(extracted.text, /\[Page 3\]$/);
+  assert.equal(extracted.ocr_pages, 1);
+});
+
+test("digital PDF pages at the ten-character threshold do not invoke OCR", async () => {
+  const pdf = await PDFDocument.create();
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  const page = pdf.addPage([300, 300]);
+  page.drawText("1234567890", { x: 20, y: 250, size: 12, font });
+  const bytes = await pdf.save();
+  const raw = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+  const engine = new QueuedOcrEngine([ocrResult("should not be used")]);
+
+  const extracted = await extractStructuredPdfText(raw, {
+    ocr: { engine, maxPages: 50 },
+  });
+
+  assert.equal(engine.calls.length, 0);
+  assert.equal(extracted.ocr_pages, 0);
+  assert.match(extracted.text, /1234567890/);
 });
 
 test("repeating page-edge headers are excluded only as heading candidates", () => {

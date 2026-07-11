@@ -33,6 +33,7 @@ import {
     deletePdfAnnotation,
     exportAnnotatedPdf,
     generateDocumentOutline,
+    getDocumentOcrRegions,
     getDocumentUrl,
     listPdfAnnotations,
     updatePdfAnnotation,
@@ -40,6 +41,7 @@ import {
 import { useSelectedModel } from "@/app/hooks/useSelectedModel";
 import { DocxView } from "./DocxView";
 import { MarkdownDocView } from "./MarkdownDocView";
+import { ImageDocView } from "./ImageDocView";
 import type { CitationQuote, PdfAnnotation, PdfAnnotationRect } from "./types";
 import {
     clearHighlights,
@@ -91,6 +93,8 @@ import {
     normalizeFindText,
     paintFindHighlights,
 } from "./pdfFind";
+import { normalizedOcrRegionToPdfRect } from "./ocrRegionGeometry";
+import { buildPdfAnnotationOverlayItems } from "./pdfAnnotationOverlay";
 
 interface Props {
     doc: { document_id: string; version_id?: string | null } | null;
@@ -163,6 +167,7 @@ export function DocView({
     const activeSelectionRef = useRef<ActivePdfSelection | null>(null);
     const selectedAnnotationIdRef = useRef<string | null>(null);
     const docIdRef = useRef<string | null>(null);
+    const versionIdRef = useRef<string | null>(null);
     const commentInputRef = useRef<HTMLTextAreaElement | null>(null);
     const zoomRef = useRef(1.0);
     const currentPageRef = useRef(1);
@@ -409,7 +414,8 @@ export function DocView({
 
     useEffect(() => {
         docIdRef.current = doc?.document_id ?? null;
-    }, [doc?.document_id]);
+        versionIdRef.current = displayVersionId ?? doc?.version_id ?? null;
+    }, [doc?.document_id, doc?.version_id, displayVersionId]);
 
     useEffect(() => {
         return () => {
@@ -1202,10 +1208,96 @@ export function DocView({
                 entry.page ??
                 resolvedQuotePagesRef.current.get(quotePageCacheKey(entry));
             if (resolvedPage !== pageNum) continue;
-            const found = await highlightQuote(pageEntry.textDivs, entry.quote);
+            let found = await highlightQuote(pageEntry.textDivs, entry.quote);
+            if (!found && resolvedPage === pageNum) {
+                found = await paintOcrCitationFallback(
+                    pageEntry,
+                    pageNum,
+                    entry.quote,
+                );
+            }
             if (found) foundAny = true;
         }
         return foundAny;
+    }
+
+    function clearOcrCitationLayers() {
+        for (const page of renderedPagesRef.current) {
+            page?.wrapper
+                .querySelectorAll(".pdf-ocr-citation-layer")
+                .forEach((element) => element.remove());
+        }
+    }
+
+    async function paintOcrCitationFallback(
+        pageEntry: RenderedPage,
+        pageNumber: number,
+        citation: string,
+    ): Promise<boolean> {
+        const documentId = docIdRef.current;
+        if (!documentId) return false;
+        const match = await getDocumentOcrRegions(
+            documentId,
+            versionIdRef.current,
+            pageNumber,
+            citation,
+        ).catch(() => null);
+        if (!match?.regions.length) return false;
+        const natural = pageEntry.page.getViewport({ scale: 1 });
+        const annotation: PdfAnnotation = {
+            id: `ocr-citation-${pageNumber}`,
+            document_id: documentId,
+            version_id: versionIdRef.current,
+            user_id: "",
+            page_number: pageNumber,
+            annotation_type: "highlight",
+            color: "#ffe066",
+            quote: citation,
+            comment: null,
+            rects: match.regions.map((region) =>
+                normalizedOcrRegionToPdfRect(region.bbox, pageNumber, natural),
+            ),
+            source: "citation_promotion",
+            source_citation: null,
+            created_at: "",
+            updated_at: "",
+        };
+        let layer = pageEntry.wrapper.querySelector<HTMLDivElement>(
+            ".pdf-ocr-citation-layer",
+        );
+        if (!layer) {
+            layer = document.createElement("div");
+            layer.className = "pdf-ocr-citation-layer";
+            Object.assign(layer.style, {
+                position: "absolute",
+                left: "0",
+                top: "0",
+                width: `${pageEntry.viewport.width}px`,
+                height: `${pageEntry.viewport.height}px`,
+                pointerEvents: "none",
+            });
+            pageEntry.wrapper.appendChild(layer);
+        }
+        for (const item of buildPdfAnnotationOverlayItems(
+            [annotation],
+            pageNumber,
+            pageEntry.viewport,
+        )) {
+            const marker = document.createElement("div");
+            marker.className = "pdf-ocr-citation";
+            Object.assign(marker.style, {
+                position: "absolute",
+                left: `${item.marker.left}px`,
+                top: `${item.marker.top}px`,
+                width: `${item.marker.width}px`,
+                height: `${item.marker.height}px`,
+                background: item.marker.background,
+                opacity: item.marker.opacity,
+                mixBlendMode: "multiply",
+            });
+            layer.appendChild(marker);
+        }
+        return true;
     }
 
     // Highlights requested quotes by rendering only the pages that can contain them.
@@ -1219,6 +1311,7 @@ export function DocView({
                 if (!p) continue;
                 clearHighlights(p.textDivs);
             }
+            clearOcrCitationLayers();
 
             let firstHitPage: number | null = null;
             for (const entry of list) {
@@ -1255,6 +1348,13 @@ export function DocView({
                             : false;
                         candidatePage = fallbackPage;
                     }
+                }
+                if (!found && candidatePage === entry.page) {
+                    found = await paintOcrCitationFallback(
+                        pageEntry,
+                        candidatePage,
+                        entry.quote,
+                    );
                 }
                 if (found && firstHitPage === null)
                     firstHitPage = candidatePage;
@@ -2544,6 +2644,17 @@ export function DocView({
                 quotes={quotes}
                 quote={quote}
                 fallbackPage={fallbackPage}
+            />
+        );
+    }
+
+    if (result?.type === "image") {
+        return (
+            <ImageDocView
+                buffer={result.buffer}
+                contentType={result.contentType}
+                rounded={rounded}
+                bordered={bordered}
             />
         );
     }

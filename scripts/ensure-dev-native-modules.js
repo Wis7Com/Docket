@@ -5,7 +5,7 @@ const path = require("path");
 
 const ROOT = path.join(__dirname, "..");
 const BACKEND = path.join(ROOT, "backend");
-const MODULES = ["better-sqlite3", "@napi-rs/canvas"];
+const MODULES = ["better-sqlite3", "@napi-rs/canvas", "onnxruntime-node"];
 
 const targetNode = findProjectNode();
 if (
@@ -22,19 +22,33 @@ if (
 }
 
 function loadNativeModule(name) {
-  try {
-    const loaded = require(path.join(BACKEND, "node_modules", name));
-    if (name === "better-sqlite3") {
-      const db = new loaded(":memory:");
-      db.close();
-    }
-    return { ok: true };
-  } catch (err) {
-    return {
-      ok: false,
-      message: err instanceof Error ? err.message : String(err),
-    };
-  }
+  // An Electron-ABI native binary can terminate Node at dlopen/constructor
+  // time instead of throwing. Probe out of process so this script can still
+  // reach the rebuild path after an Electron packaging run.
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      `const loaded = require(process.argv[1]);
+       if (process.argv[2] === "better-sqlite3") {
+         const db = new loaded(":memory:");
+         db.close();
+       }`,
+      path.join(BACKEND, "node_modules", name),
+      name,
+    ],
+    { cwd: BACKEND, encoding: "utf8" },
+  );
+  if (probe.status === 0) return { ok: true };
+  const detail = (probe.stderr || probe.stdout || "").trim();
+  return {
+    ok: false,
+    message:
+      detail ||
+      (probe.signal
+        ? `probe terminated by ${probe.signal}`
+        : `probe exited with ${probe.status}`),
+  };
 }
 
 const failures = MODULES.map((name) => [name, loadNativeModule(name)]).filter(

@@ -110,6 +110,26 @@ test("baseline revision migration adds version and index identity columns", () =
   assert.ok(
     indexColumns.some((column) => column.name === "index_schema_version"),
   );
+  assert.ok(indexColumns.some((column) => column.name === "ocr_pages"));
+  assert.ok(indexColumns.some((column) => column.name === "ocr_engine"));
+  const regionColumns = getDb()
+    .prepare("PRAGMA table_info(document_ocr_regions)")
+    .all() as { name: string }[];
+  assert.deepEqual(
+    regionColumns.map((column) => column.name),
+    [
+      "document_id",
+      "version_id",
+      "page_number",
+      "region_index",
+      "text",
+      "confidence",
+      "bbox_x",
+      "bbox_y",
+      "bbox_width",
+      "bbox_height",
+    ],
+  );
 });
 
 test("baseline reconciliation selects only missing interrupted and stale current indexes", () => {
