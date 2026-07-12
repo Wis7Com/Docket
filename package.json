@@ -36,12 +36,12 @@
   },
   "devDependencies": {
     "@types/node": "^22.14.1",
-    "concurrently": "^9.1.0",
+    "concurrently": "^9.2.4",
     "cross-env": "^7.0.3",
-    "electron": "^33.2.0",
-    "electron-builder": "^25.1.8",
+    "electron": "^39.8.5",
+    "electron-builder": "^26.15.3",
     "playwright-core": "^1.61.1",
-    "tsx": "^4.19.3",
+    "tsx": "^4.23.0",
     "typescript": "^5.8.3",
     "wait-on": "^8.0.1"
   },

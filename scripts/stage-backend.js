@@ -56,7 +56,7 @@ function main() {
   copyDir(distSrc, path.join(STAGE, "dist"));
   copyDir(path.join(BACKEND, "migrations"), path.join(STAGE, "migrations"));
 
-  // Write a CLEANED package.json that strips the `docketlocal-desktop: file:..`
+  // Write a CLEANED package.json that strips the `docket-desktop: file:..`
   // self-reference. That dep is harmless for local development (it symlinks
   // the parent project so backend can `import` from it if needed) but
   // catastrophic in a packaged installer — npm/electron-builder follow the
@@ -66,19 +66,15 @@ function main() {
     path.join(BACKEND, "package.json"),
     "utf8",
   );
-  const pkg = JSON.parse(pkgRaw);
-  if (pkg.dependencies && "docketlocal-desktop" in pkg.dependencies) {
-    delete pkg.dependencies["docketlocal-desktop"];
+  const pkg = cleanPackage(JSON.parse(pkgRaw));
+  if (pkg.strippedSelfReference) {
     console.log(
-      "[stage-backend] stripped docketlocal-desktop self-reference from staged package.json",
+      "[stage-backend] stripped docket-desktop self-reference from staged package.json",
     );
   }
-  // Also drop devDependencies entirely — npm install --omit=dev would skip
-  // them, but removing them from the manifest keeps the staged dir tidy.
-  delete pkg.devDependencies;
   fs.writeFileSync(
     path.join(STAGE, "package.json"),
-    JSON.stringify(pkg, null, 2),
+    JSON.stringify(pkg.manifest, null, 2),
   );
 
   console.log("[stage-backend] installing production deps");
@@ -139,4 +135,22 @@ function main() {
   }
 }
 
-main();
+function cleanPackage(pkg) {
+  const manifest = structuredClone(pkg);
+  const strippedSelfReference = Boolean(
+    manifest.dependencies && "docket-desktop" in manifest.dependencies,
+  );
+  if (strippedSelfReference) {
+    delete manifest.dependencies["docket-desktop"];
+  }
+  // npm install --omit=dev would skip these, but removing them keeps the
+  // staged manifest and bundle deterministic and easy to inspect.
+  delete manifest.devDependencies;
+  return { manifest, strippedSelfReference };
+}
+
+if (require.main === module) {
+  main();
+}
+
+module.exports = { cleanPackage };
