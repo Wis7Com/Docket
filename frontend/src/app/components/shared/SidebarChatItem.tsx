@@ -18,9 +18,20 @@ interface Props {
     isActive: boolean;
     onSelect: () => void;
     projectName?: string;
+    selectionMode?: boolean;
+    isSelected?: boolean;
+    onToggleSelected?: () => void;
 }
 
-export function SidebarChatItem({ chat, isActive, onSelect, projectName }: Props) {
+export function SidebarChatItem({
+    chat,
+    isActive,
+    onSelect,
+    projectName,
+    selectionMode = false,
+    isSelected = false,
+    onToggleSelected,
+}: Props) {
     const { renameChat, deleteChat } = useChatHistoryContext();
     const { user } = useAuth();
     const [isRenaming, setIsRenaming] = useState(false);
@@ -80,8 +91,25 @@ export function SidebarChatItem({ chat, isActive, onSelect, projectName }: Props
                 </div>
             ) : (
                 <>
+                    {selectionMode && (
+                        <input
+                            type="checkbox"
+                            checked={isSelected}
+                            disabled={!isChatOwner}
+                            onChange={onToggleSelected}
+                            onClick={(event) => event.stopPropagation()}
+                            aria-label={`Select ${chat.title ?? "Untitled chat"}`}
+                            title={
+                                isChatOwner
+                                    ? "Select chat"
+                                    : "Only the chat creator can delete this chat"
+                            }
+                            className="ml-3 h-3.5 w-3.5 shrink-0 accent-gray-900 disabled:cursor-not-allowed disabled:opacity-30"
+                        />
+                    )}
                     <button
-                        onClick={onSelect}
+                        onClick={selectionMode ? onToggleSelected : onSelect}
+                        disabled={selectionMode && !isChatOwner}
                         onMouseEnter={(e) => {
                             const el = e.currentTarget;
                             const overflow = el.scrollWidth - el.clientWidth;
@@ -90,9 +118,11 @@ export function SidebarChatItem({ chat, isActive, onSelect, projectName }: Props
                         onMouseLeave={(e) => {
                             e.currentTarget.scrollTo({ left: 0, behavior: "smooth" });
                         }}
-                        className={`flex-1 min-w-0 text-left px-3 py-2 text-xs overflow-x-hidden whitespace-nowrap scrollbar-none ${
+                        className={`flex-1 min-w-0 text-left py-2 text-xs overflow-x-hidden whitespace-nowrap scrollbar-none ${
+                            selectionMode ? "px-2" : "px-3"
+                        } ${
                             isActive ? "text-gray-900" : "text-gray-700"
-                        }`}
+                        } ${selectionMode && !isChatOwner ? "cursor-not-allowed opacity-50" : ""}`}
                         title={projectName ? `${projectName}: ${chat.title ?? "Untitled chat"}` : (chat.title ?? "Untitled chat")}
                     >
                         {projectName && (
@@ -101,7 +131,7 @@ export function SidebarChatItem({ chat, isActive, onSelect, projectName }: Props
                         {chat.title ?? "Untitled chat"}
                     </button>
 
-                    <DropdownMenu>
+                    {!selectionMode && <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                             <button
                                 className={`p-1 mr-1 text-gray-500 transition-opacity hover:text-gray-900 ${
@@ -141,7 +171,7 @@ export function SidebarChatItem({ chat, isActive, onSelect, projectName }: Props
                                 Delete
                             </DropdownMenuItem>
                         </DropdownMenuContent>
-                    </DropdownMenu>
+                    </DropdownMenu>}
                 </>
             )}
             <OwnerOnlyModal

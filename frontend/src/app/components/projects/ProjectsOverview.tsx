@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { FolderOpen, ChevronDown, Loader2 } from "lucide-react";
+import { FolderOpen, Loader2, Trash2 } from "lucide-react";
 import { HeaderSearchBtn } from "@/app/components/shared/HeaderSearchBtn";
 import {
     listProjects,
@@ -33,11 +33,11 @@ export function ProjectsOverview() {
     const [cmEditingId, setCmEditingId] = useState<string | null>(null);
     const [cmValue, setCmValue] = useState("");
     const [selectedIds, setSelectedIds] = useState<string[]>([]);
-    const [actionsOpen, setActionsOpen] = useState(false);
+    const [deletingIds, setDeletingIds] = useState<string[]>([]);
+    const [deleteError, setDeleteError] = useState<string | null>(null);
     const [search, setSearch] = useState("");
     const [openFolderBusy, setOpenFolderBusy] = useState(false);
     const [openFolderError, setOpenFolderError] = useState<string | null>(null);
-    const actionsRef = useRef<HTMLDivElement>(null);
     const router = useRouter();
 
     useEffect(() => {
@@ -46,18 +46,6 @@ export function ProjectsOverview() {
             .catch(() => setProjects([]))
             .finally(() => setLoading(false));
     }, []);
-
-    useEffect(() => {
-        function handleClick(e: MouseEvent) {
-            if (
-                actionsRef.current &&
-                !actionsRef.current.contains(e.target as Node)
-            )
-                setActionsOpen(false);
-        }
-        if (actionsOpen) document.addEventListener("mousedown", handleClick);
-        return () => document.removeEventListener("mousedown", handleClick);
-    }, [actionsOpen]);
 
     const q = search.toLowerCase();
     const filtered = projects.filter(
@@ -108,12 +96,33 @@ export function ProjectsOverview() {
         await updateProject(projectId, { cm_number: trimmed || undefined });
     }
 
-    async function handleDeleteSelected() {
-        const ids = [...selectedIds];
-        setActionsOpen(false);
-        setSelectedIds([]);
-        await Promise.all(ids.map((id) => deleteProject(id).catch(() => {})));
-        setProjects((prev) => prev.filter((p) => !ids.includes(p.id)));
+    async function handleDeleteProjects(ids: string[]) {
+        if (ids.length === 0) return;
+        setDeleteError(null);
+        setDeletingIds((prev) => [...new Set([...prev, ...ids])]);
+
+        const results = await Promise.allSettled(ids.map(deleteProject));
+        const deletedIds = ids.filter(
+            (_, index) => results[index].status === "fulfilled",
+        );
+        const failedIds = ids.filter(
+            (_, index) => results[index].status === "rejected",
+        );
+
+        setProjects((prev) =>
+            prev.filter((project) => !deletedIds.includes(project.id)),
+        );
+        setSelectedIds((prev) =>
+            prev.filter((id) => !deletedIds.includes(id)),
+        );
+        setDeletingIds((prev) => prev.filter((id) => !ids.includes(id)));
+        if (failedIds.length > 0) {
+            setDeleteError(
+                failedIds.length === 1
+                    ? "Could not delete the project. Please try again."
+                    : `Could not delete ${failedIds.length} projects. Please try again.`,
+            );
+        }
     }
 
     async function handleOpenFolder() {
@@ -153,25 +162,22 @@ export function ProjectsOverview() {
     const toolbarActions = (
         <div className="flex items-center gap-2">
             {selectedIds.length > 0 && (
-                <div ref={actionsRef} className="relative">
-                    <button
-                        onClick={() => setActionsOpen((v) => !v)}
-                        className="flex items-center gap-1 text-xs font-medium text-gray-700 hover:text-gray-900 transition-colors"
-                    >
-                        Actions
-                        <ChevronDown className="h-3.5 w-3.5" />
-                    </button>
-                    {actionsOpen && (
-                        <div className="absolute top-full right-0 mt-1 w-36 rounded-lg border border-gray-100 bg-white shadow-lg z-50 overflow-hidden">
-                            <button
-                                onClick={handleDeleteSelected}
-                                className="w-full px-3 py-1.5 text-left text-xs text-red-600 hover:bg-red-50 transition-colors"
-                            >
-                                Delete
-                            </button>
-                        </div>
+                <button
+                    onClick={() => handleDeleteProjects([...selectedIds])}
+                    disabled={selectedIds.some((id) =>
+                        deletingIds.includes(id),
                     )}
-                </div>
+                    className="flex items-center gap-1.5 text-xs font-medium text-red-600 hover:text-red-700 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                    {selectedIds.some((id) => deletingIds.includes(id)) ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                        <Trash2 className="h-3.5 w-3.5" />
+                    )}
+                    {selectedIds.length === 1
+                        ? "Delete project"
+                        : "Delete projects"}
+                </button>
             )}
         </div>
     );
@@ -216,6 +222,11 @@ export function ProjectsOverview() {
             {openFolderError && (
                 <div className="px-8 py-2 text-xs text-red-600">
                     {openFolderError}
+                </div>
+            )}
+            {deleteError && (
+                <div className="px-8 py-2 text-xs text-red-600">
+                    {deleteError}
                 </div>
             )}
 
@@ -445,17 +456,13 @@ export function ProjectsOverview() {
                                                     setCmEditingId(project.id);
                                                 }}
                                                 onDelete={async () => {
-                                                    await deleteProject(
+                                                    await handleDeleteProjects([
                                                         project.id,
-                                                    );
-                                                    setProjects((prev) =>
-                                                        prev.filter(
-                                                            (p) =>
-                                                                p.id !==
-                                                                project.id,
-                                                        ),
-                                                    );
+                                                    ]);
                                                 }}
+                                                deleting={deletingIds.includes(
+                                                    project.id,
+                                                )}
                                             />
                                         </div>
                                     </div>

@@ -24,7 +24,6 @@ import {
     X,
 } from "lucide-react";
 import {
-    deleteChat,
     deleteDocument,
     getChat,
     getProject,
@@ -52,6 +51,7 @@ import { buildDocumentSourceSelection } from "@/app/components/projects/document
 import { RenameableTitle } from "@/app/components/shared/RenameableTitle";
 import { DocView } from "@/app/components/shared/DocView";
 import { OwnerOnlyModal } from "@/app/components/shared/OwnerOnlyModal";
+import { ProjectChatHistoryMenu } from "@/app/components/shared/ProjectChatHistoryMenu";
 import { DocxView } from "@/app/components/shared/DocxView";
 import { DocketIcon } from "@/components/chat/docket-icon";
 import { useAuth } from "@/contexts/AuthContext";
@@ -94,6 +94,39 @@ type EditScrollTarget = {
     ins_w_id?: string | null;
     del_w_id?: string | null;
 };
+
+type PersistedViewerState = {
+    tabs: DocTab[];
+    activeTabId: string | null;
+};
+
+function viewerStateStorageKey(projectId: string) {
+    return `docket:project-viewer:${projectId}`;
+}
+
+function HeaderActionTooltip({
+    id,
+    text,
+    children,
+}: {
+    id: string;
+    text: string;
+    children: ReactNode;
+}) {
+    return (
+        <span className="group relative inline-flex">
+            {children}
+            <span
+                id={id}
+                role="tooltip"
+                className="pointer-events-none invisible absolute right-0 top-full z-[130] mt-2 w-max rounded-md bg-gray-900 px-2.5 py-1.5 text-[11px] font-normal text-white opacity-0 shadow-lg transition-opacity group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100"
+            >
+                <span className="absolute -top-1 right-3 h-2 w-2 rotate-45 bg-gray-900" />
+                {text}
+            </span>
+        </span>
+    );
+}
 
 function isDocxTab(filename: string) {
     const ext = filename.split(".").pop()?.toLowerCase();
@@ -461,6 +494,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         null,
     );
     const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
+    const [viewerStateRestored, setViewerStateRestored] = useState(false);
     const [deselectedDocIds, setDeselectedDocIds] = useState<Set<string>>(
         new Set(),
     );
@@ -473,6 +507,54 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     const activeTab = tabs.find((t) => t.documentId === activeTabId) ?? null;
     const tabBarRef = useRef<HTMLDivElement | null>(null);
     const tabItemRefs = useRef<Record<string, HTMLDivElement | null>>({});
+
+    useLayoutEffect(() => {
+        setViewerStateRestored(false);
+        try {
+            const raw = sessionStorage.getItem(
+                viewerStateStorageKey(projectId),
+            );
+            if (!raw) return;
+            const saved = JSON.parse(raw) as Partial<PersistedViewerState>;
+            if (!Array.isArray(saved.tabs)) return;
+            const restoredTabs = saved.tabs.filter(
+                (tab): tab is DocTab =>
+                    !!tab &&
+                    typeof tab.documentId === "string" &&
+                    typeof tab.filename === "string",
+            );
+            const restoredActiveTab =
+                restoredTabs.find(
+                    (tab) => tab.documentId === saved.activeTabId,
+                ) ?? restoredTabs[0] ?? null;
+            setTabs(restoredTabs);
+            setActiveTabId(restoredActiveTab?.documentId ?? null);
+            setActiveQuotes(restoredActiveTab?.quotes ?? null);
+            setSelectedDocId(restoredActiveTab?.documentId ?? null);
+        } catch {
+            try {
+                sessionStorage.removeItem(viewerStateStorageKey(projectId));
+            } catch {
+                // Ignore browsers that disable session storage entirely.
+            }
+        } finally {
+            setViewerStateRestored(true);
+        }
+    }, [projectId]);
+
+    useEffect(() => {
+        if (!viewerStateRestored) return;
+        const state: PersistedViewerState = { tabs, activeTabId };
+        try {
+            sessionStorage.setItem(
+                viewerStateStorageKey(projectId),
+                JSON.stringify(state),
+            );
+        } catch {
+            // Viewer persistence is best-effort; storage policy or quota must
+            // never prevent the document itself from rendering.
+        }
+    }, [activeTabId, projectId, tabs, viewerStateRestored]);
 
     const chatInputRef = useRef<ChatInputHandle | null>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -487,6 +569,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         chats,
         saveChat,
         renameChat,
+        deleteChat: deleteChatFromHistory,
     } = useChatHistoryContext();
     const [projectChats, setProjectChats] = useState<DocketChat[]>([]);
     const [initialMessages] = useState<DocketMessage[]>(newChatMessages ?? []);
@@ -1008,6 +1091,27 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         await renameChat(chatId, newTitle);
     }
 
+    async function handleRenameProjectChat(targetChatId: string, newTitle: string) {
+        if (targetChatId === chatId) {
+            await handleRenameChat(newTitle);
+            return;
+        }
+        setProjectChats((prev) =>
+            prev.map((chat) =>
+                chat.id === targetChatId ? { ...chat, title: newTitle } : chat,
+            ),
+        );
+        await renameChat(targetChatId, newTitle);
+    }
+
+    async function handleDeleteProjectChats(chatIds: string[]) {
+        await Promise.all(chatIds.map((id) => deleteChatFromHistory(id)));
+        setProjectChats((prev) => prev.filter((chat) => !chatIds.includes(chat.id)));
+        if (chatIds.includes(chatId)) {
+            router.push(`/projects/${projectId}?tab=assistant`);
+        }
+    }
+
     async function handleDeleteChat() {
         if (chatOwnerId && user?.id && chatOwnerId !== user.id) {
             setOwnerOnlyAction("delete this chat");
@@ -1015,8 +1119,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         }
         setDeletingChat(true);
         try {
-            await deleteChat(chatId);
-            router.push(`/projects/${projectId}?tab=assistant`);
+            await handleDeleteProjectChats([chatId]);
         } finally {
             setDeletingChat(false);
         }
@@ -1267,30 +1370,36 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                     )}
                 </div>
                 <div className="flex items-center gap-2">
-                    <button
-                        onClick={handleNewChat}
-                        disabled={creatingChat}
-                        title="New chat"
-                        className="flex items-center justify-center p-1.5 text-gray-500 hover:text-gray-900 transition-colors disabled:opacity-40"
-                    >
-                        {creatingChat ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                            <Plus className="h-4 w-4" />
-                        )}
-                    </button>
-                    <button
-                        onClick={handleDeleteChat}
-                        disabled={deletingChat}
-                        title="Delete chat"
-                        className="flex items-center justify-center p-1.5 text-gray-500 hover:text-red-600 transition-colors disabled:opacity-40"
-                    >
-                        {deletingChat ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                            <Trash2 className="h-4 w-4" />
-                        )}
-                    </button>
+                    <HeaderActionTooltip id="new-chat-tooltip" text="Start a new chat">
+                        <button
+                            onClick={handleNewChat}
+                            disabled={creatingChat}
+                            aria-label="Start a new chat"
+                            aria-describedby="new-chat-tooltip"
+                            className="flex items-center justify-center rounded-md p-1.5 text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300 disabled:opacity-40"
+                        >
+                            {creatingChat ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                                <Plus className="h-4 w-4" />
+                            )}
+                        </button>
+                    </HeaderActionTooltip>
+                    <HeaderActionTooltip id="delete-chat-tooltip" text="Delete this chat">
+                        <button
+                            onClick={handleDeleteChat}
+                            disabled={deletingChat}
+                            aria-label="Delete this chat"
+                            aria-describedby="delete-chat-tooltip"
+                            className="flex items-center justify-center rounded-md p-1.5 text-gray-500 transition-colors hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300 disabled:opacity-40"
+                        >
+                            {deletingChat ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                                <Trash2 className="h-4 w-4" />
+                            )}
+                        </button>
+                    </HeaderActionTooltip>
                 </div>
             </div>
 
@@ -1936,32 +2045,21 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                         <span className="shrink-0 text-xs text-gray-700">
                             Project Assistant
                         </span>
-                        <select
-                            data-session-check="project-chat-history-picker"
-                            value={chatId}
-                            onChange={(e) => {
-                                const selected = e.target.value;
-                                if (selected && selected !== chatId) {
-                                    router.push(
-                                        `/projects/${projectId}/assistant/chat/${selected}`,
-                                    );
-                                }
-                            }}
-                            className="min-w-0 flex-1 rounded-md border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 outline-none transition-colors hover:border-gray-300 focus:border-gray-400"
-                            title={chatTitle ?? "Untitled chat"}
-                        >
-                            {projectChats.length === 0 ? (
-                                <option value={chatId}>
-                                    {chatTitle ?? "Untitled chat"}
-                                </option>
-                            ) : (
-                                projectChats.map((chat) => (
-                                    <option key={chat.id} value={chat.id}>
-                                        {chat.title ?? "Untitled chat"}
-                                    </option>
-                                ))
-                            )}
-                        </select>
+                        <ProjectChatHistoryMenu
+                            chats={projectChats}
+                            currentChatId={chatId}
+                            currentTitle={chatTitle ?? "Untitled chat"}
+                            currentUserId={user?.id}
+                            creatingChat={creatingChat}
+                            onNewChat={handleNewChat}
+                            onOpenChat={(selectedChatId) =>
+                                router.push(
+                                    `/projects/${projectId}/assistant/chat/${selectedChatId}`,
+                                )
+                            }
+                            onRenameChat={handleRenameProjectChat}
+                            onDeleteChats={handleDeleteProjectChats}
+                        />
                     </div>
 
                     {/* Messages / greeting / shimmer */}

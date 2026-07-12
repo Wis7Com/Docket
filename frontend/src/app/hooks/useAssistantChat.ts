@@ -46,6 +46,14 @@ export function useAssistantChat({
 
     const abortControllerRef = useRef<AbortController | null>(null);
 
+    // Next can retain this hook instance while moving between dynamic chat
+    // routes. Keep the request id aligned with the id in the current URL so a
+    // completed response cannot navigate back to a stale chat and remount the
+    // project assistant (which would also discard its open document tabs).
+    useEffect(() => {
+        setChatId(initialChatId);
+    }, [initialChatId]);
+
     const dripIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const dripTargetRef = useRef<string>("");
     const dripDisplayLenRef = useRef<number>(0);
@@ -869,10 +877,10 @@ export function useAssistantChat({
                     );
                 }
             }
-            if (finalChatId && finalChatId !== chatId) {
-                if (chatId) {
+            if (finalChatId && finalChatId !== initialChatId) {
+                if (initialChatId) {
                     replaceChatId(
-                        chatId,
+                        initialChatId,
                         finalChatId,
                         message.content.trim().slice(0, 120) || "New Chat",
                     );

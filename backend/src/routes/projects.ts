@@ -218,6 +218,19 @@ projectsRouter.get("/:projectId/registry", requireAuth, async (req, res) => {
   });
 });
 
+// DELETE /projects/:projectId
+// Deleting a project unregisters it from Docket. Keep this registry-only so a
+// stale entry can still be removed after its local folder has been moved or
+// deleted.
+projectsRouter.delete("/:projectId", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const { projectId } = req.params;
+  getAppDb()
+    .prepare("DELETE FROM projects WHERE id = ? AND user_id = ?")
+    .run(projectId, userId);
+  res.status(204).send();
+});
+
 projectsRouter.use("/:projectId", requireAuth, projectDbRequestContext);
 
 // GET /projects/:projectId
@@ -680,16 +693,6 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
   }[];
   await attachActiveVersionPaths(db, docsTyped);
   res.json({ ...data, documents: docsTyped, folders: folderData ?? [] });
-});
-
-// DELETE /projects/:projectId
-projectsRouter.delete("/:projectId", requireAuth, async (req, res) => {
-  const userId = res.locals.userId as string;
-  const { projectId } = req.params;
-  getAppDb()
-    .prepare("DELETE FROM projects WHERE id = ? AND user_id = ?")
-    .run(projectId, userId);
-  res.status(204).send();
 });
 
 // GET /projects/:projectId/documents

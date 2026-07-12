@@ -682,6 +682,46 @@ test("project assistant document tabs expose previous and next navigation", () =
   assert.match(source, /disabled=\{activeTabIndex >= tabs\.length - 1\}/);
 });
 
+test("completed project chat responses do not reset open document tabs", () => {
+  const hookSource = fs.readFileSync(
+    new URL("../../hooks/useAssistantChat.ts", import.meta.url),
+    "utf8",
+  );
+  const pageSource = fs.readFileSync(
+    new URL(
+      "../../(pages)/projects/[id]/assistant/chat/[chatId]/page.tsx",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+
+  assert.match(
+    hookSource,
+    /useEffect\(\(\) => \{\s*setChatId\(initialChatId\);\s*\}, \[initialChatId\]\)/,
+    "the request chat id must follow dynamic route changes",
+  );
+  assert.match(
+    hookSource,
+    /finalChatId && finalChatId !== initialChatId/,
+    "completion navigation must compare against the current route id, not stale hook state",
+  );
+  assert.doesNotMatch(
+    hookSource,
+    /finalChatId && finalChatId !== chatId/,
+    "a stale internal chat id must not trigger a page-remounting route replacement",
+  );
+  assert.match(
+    pageSource,
+    /sessionStorage\.getItem\([\s\S]*viewerStateStorageKey\(projectId\)/,
+    "a route remount must restore the project's open viewer tabs",
+  );
+  assert.match(
+    pageSource,
+    /sessionStorage\.setItem\([\s\S]*viewerStateStorageKey\(projectId\)/,
+    "open viewer tabs must be saved before a completion route remount",
+  );
+});
+
 test("PDF annotation custom colors replace a persisted seven-color palette slot", () => {
   const docView = fs.readFileSync(
     new URL("./DocView.tsx", import.meta.url),

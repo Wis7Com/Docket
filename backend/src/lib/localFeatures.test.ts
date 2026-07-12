@@ -516,6 +516,54 @@ test("project detail rejects inaccessible registered folders without SQLite retr
   }
 });
 
+test("project deletion unregisters a project whose local folder is gone", async () => {
+  const { signLocalJwt } = await import("../auth/local");
+  const { projectsRouter } = await import("../routes/projects");
+  const { registerProjectFolder } = await import("./projectRegistry");
+  const { getAppDb } = await import("../db/sqlite");
+  const userId = "missing-folder-delete-user";
+  const userEmail = "missing-folder-delete@example.com";
+  const projectRoot = fs.mkdtempSync(
+    path.join(testRoot, "missing-folder-delete-root-"),
+  );
+  const project = registerProjectFolder({
+    folderPath: projectRoot,
+    userId,
+    name: "Missing Folder Project",
+  });
+  fs.rmSync(projectRoot, { recursive: true, force: true });
+
+  const app = express();
+  app.use("/projects", projectsRouter);
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/projects/${project.id}`,
+      {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${signLocalJwt(userId, userEmail)}`,
+        },
+      },
+    );
+
+    assert.equal(response.status, 204);
+    assert.equal(
+      getAppDb().prepare("SELECT 1 FROM projects WHERE id = ?").get(project.id),
+      undefined,
+    );
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  }
+});
+
 test("project uploads copy files into the opened project folder root", async () => {
   const { createServerSupabase } = await import("./supabase");
   const { signLocalJwt } = await import("../auth/local");

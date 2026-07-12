@@ -8,6 +8,7 @@ import {
   Library,
   Settings,
   ChevronDown,
+  Trash2,
 } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
@@ -31,12 +32,25 @@ interface AppSidebarProps {
 
 export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
   const { user } = useAuth();
-  const { chats, currentChatId, setCurrentChatId } = useChatHistoryContext();
+  const { chats, currentChatId, setCurrentChatId, deleteChat } =
+    useChatHistoryContext();
   const router = useRouter();
   const pathname = usePathname();
   const [shouldAnimate, setShouldAnimate] = useState(false);
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [projectNames, setProjectNames] = useState<Record<string, string>>({});
+  const [historySelectionMode, setHistorySelectionMode] = useState(false);
+  const [selectedChatIds, setSelectedChatIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [deletingSelectedChats, setDeletingSelectedChats] = useState(false);
+
+  const selectableChats = (chats ?? []).filter(
+    (chat) => !!user?.id && chat.user_id === user.id,
+  );
+  const allSelectableChatsSelected =
+    selectableChats.length > 0 &&
+    selectableChats.every((chat) => selectedChatIds.has(chat.id));
 
   useEffect(() => {
     if (!user) return;
@@ -52,6 +66,14 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
   useEffect(() => {
     if (!isOpen) setShouldAnimate(true);
   }, [isOpen]);
+
+  useEffect(() => {
+    const visibleIds = new Set((chats ?? []).map((chat) => chat.id));
+    setSelectedChatIds((previous) => {
+      const next = new Set([...previous].filter((id) => visibleIds.has(id)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [chats]);
 
   useEffect(() => {
     if (pathname.startsWith("/assistant/chat/")) {
@@ -74,6 +96,51 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
   }, [pathname, setCurrentChatId]);
 
   if (!user) return null;
+
+  const leaveHistorySelectionMode = () => {
+    setHistorySelectionMode(false);
+    setSelectedChatIds(new Set());
+  };
+
+  const toggleChatSelected = (chatId: string) => {
+    setSelectedChatIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(chatId)) next.delete(chatId);
+      else next.add(chatId);
+      return next;
+    });
+  };
+
+  const toggleAllChatsSelected = () => {
+    setSelectedChatIds(
+      allSelectableChatsSelected
+        ? new Set()
+        : new Set(selectableChats.map((chat) => chat.id)),
+    );
+  };
+
+  const handleDeleteSelectedChats = async () => {
+    const ids = [...selectedChatIds];
+    if (
+      ids.length === 0 ||
+      !window.confirm(
+        `Delete ${ids.length} selected chat${ids.length === 1 ? "" : "s"}? This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+
+    setDeletingSelectedChats(true);
+    try {
+      await Promise.all(ids.map((id) => deleteChat(id)));
+      leaveHistorySelectionMode();
+      if (currentChatId && ids.includes(currentChatId)) {
+        router.push("/assistant");
+      }
+    } finally {
+      setDeletingSelectedChats(false);
+    }
+  };
 
   return (
     <div
@@ -151,17 +218,69 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
       {/* Assistant History */}
       {isOpen && pathname.startsWith("/assistant") && (
         <div className="mt-4 flex-1 min-h-0 flex flex-col">
-          <button
-            onClick={() => setHistoryCollapsed((v) => !v)}
-            className={`mb-2 px-5 flex items-center justify-between text-xs font-semibold text-gray-500 hover:text-gray-700 transition-colors ${
+          <div
+            className={`mb-2 px-5 flex items-center gap-2 text-xs font-semibold text-gray-500 ${
               shouldAnimate ? "sidebar-fade-in" : ""
             }`}
           >
-            <span>Assistant History</span>
-            <ChevronDown
-              className={`h-3.5 w-3.5 transition-transform ${historyCollapsed ? "-rotate-90" : ""}`}
-            />
-          </button>
+            <button
+              onClick={() => setHistoryCollapsed((v) => !v)}
+              className="min-w-0 flex-1 text-left hover:text-gray-700 transition-colors"
+              aria-expanded={!historyCollapsed}
+            >
+              <span>Assistant History</span>
+            </button>
+            {chats && chats.length > 0 && (
+              <button
+                onClick={() => {
+                  if (historySelectionMode) leaveHistorySelectionMode();
+                  else {
+                    setHistoryCollapsed(false);
+                    setHistorySelectionMode(true);
+                  }
+                }}
+                className="font-medium text-gray-500 hover:text-gray-900 transition-colors"
+              >
+                {historySelectionMode ? "Cancel" : "Select"}
+              </button>
+            )}
+            <button
+              onClick={() => setHistoryCollapsed((v) => !v)}
+              className="hover:text-gray-700 transition-colors"
+              aria-label={
+                historyCollapsed
+                  ? "Expand assistant history"
+                  : "Collapse assistant history"
+              }
+            >
+              <ChevronDown
+                className={`h-3.5 w-3.5 transition-transform ${historyCollapsed ? "-rotate-90" : ""}`}
+              />
+            </button>
+          </div>
+          {historySelectionMode && !historyCollapsed && (
+            <div className="mb-1 flex h-8 items-center gap-2 border-y border-gray-200 px-5 text-xs">
+              <button
+                onClick={toggleAllChatsSelected}
+                disabled={selectableChats.length === 0}
+                className="text-gray-600 hover:text-gray-900 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {allSelectableChatsSelected ? "Clear all" : "Select all"}
+              </button>
+              <span className="ml-auto text-gray-400">
+                {selectedChatIds.size} selected
+              </span>
+              <button
+                onClick={() => void handleDeleteSelectedChats()}
+                disabled={selectedChatIds.size === 0 || deletingSelectedChats}
+                className="rounded p-1 text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-30"
+                title="Delete selected chats"
+                aria-label="Delete selected chats"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
           <div
             className={`overflow-y-auto flex-1 ${historyCollapsed ? "hidden" : ""}`}
           >
@@ -211,6 +330,9 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
                           : `/assistant/chat/${chat.id}`,
                       );
                     }}
+                    selectionMode={historySelectionMode}
+                    isSelected={selectedChatIds.has(chat.id)}
+                    onToggleSelected={() => toggleChatSelected(chat.id)}
                   />
                 ))}
               </div>
