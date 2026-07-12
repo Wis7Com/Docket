@@ -99,6 +99,7 @@ function createWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      ...(isSessionCheckEnabled() ? { backgroundThrottling: false } : {}),
     },
   });
   w.removeMenu();
@@ -364,12 +365,15 @@ function installSessionCheck(w: BrowserWindow): void {
   let featureSmokeRunning = false;
   const failTimer = setTimeout(async () => {
     if (finished) return;
-    const errorText = await w.webContents
-      .executeJavaScript(
-        "document.getElementById('error')?.textContent || ''",
-        true,
-      )
-      .catch(() => "");
+    const errorText = await Promise.race([
+      w.webContents
+        .executeJavaScript(
+          "document.getElementById('error')?.textContent || ''",
+          true,
+        )
+        .catch(() => ""),
+      new Promise<string>((resolve) => setTimeout(() => resolve(""), 1_500)),
+    ]);
     console.error(
       `[session-check] timed out after ${timeoutMs}ms${errorText ? `: ${errorText}` : ""}`,
     );
@@ -476,6 +480,10 @@ async function runSessionFeatureSmoke(
   }
   const sourceDir = process.env.DOCKET_SESSION_CHECK_SOURCE_DIR;
   if (!sourceDir) return { ok: true, summary: "skipped" };
+  const projectPath = process.env.DOCKET_SESSION_CHECK_PROJECT_PATH;
+  if (!projectPath) {
+    throw new Error("DOCKET_SESSION_CHECK_PROJECT_PATH is required for feature smoke");
+  }
   const result = await w.webContents.executeJavaScript(
     `
       (async () => {
@@ -483,6 +491,7 @@ async function runSessionFeatureSmoke(
         if (!token) throw new Error("session smoke token missing");
         const base = "http://localhost:${port}";
         const sourceDir = ${JSON.stringify(sourceDir)};
+        const projectPath = ${JSON.stringify(projectPath)};
         async function request(path, init = {}) {
           const response = await fetch(base + path, {
             ...init,
@@ -498,10 +507,10 @@ async function runSessionFeatureSmoke(
           if (response.status === 204) return null;
           return response.json();
         }
-        const project = await request("/projects", {
+        const project = await request("/projects/open-folder", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: "Session smoke project" }),
+          body: JSON.stringify({ path: projectPath }),
         });
         const outlineMarkdown = [
           "# Session Navigation Smoke",
@@ -1988,16 +1997,12 @@ async function inspectRealPromptCitationDom(
           "docket.selectedModel",
           ${JSON.stringify(process.env.DOCKET_SESSION_CHECK_MODEL ?? "free-router:free-router/best")}
         );
-        const project = await request("/projects", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: "Real prompt citation project" }),
-        });
-        const linked = await request("/projects/" + project.id + "/source-folders", {
+        const project = await request("/projects/open-folder", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ path: sourceDir }),
         });
+        const linked = project.scan;
         if ((linked.imported || []).length < 21) {
           throw new Error("expected at least 21 imports for real prompt search test, got " + (linked.imported || []).length);
         }
@@ -2691,7 +2696,13 @@ async function startSession(activeProjectPath: string | null): Promise<void> {
   const downloadSecret = crypto.randomBytes(32).toString("hex");
 
   const appData = app.getPath("userData");
-  const apiKeys = readSecrets(appData) as Record<string, string | undefined>;
+  const sessionCheckEnabled = isSessionCheckEnabled();
+  const apiKeys = sessionCheckEnabled
+    ? {}
+    : (readSecrets(appData) as Record<string, string | undefined>);
+  if (sessionCheckEnabled) {
+    console.log("[session-check] persisted secrets disabled");
+  }
   const cfg = readConfig();
   restoreProjectFolderAccess();
   spawnBackend({

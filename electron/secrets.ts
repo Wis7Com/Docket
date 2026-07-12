@@ -21,14 +21,14 @@ export interface SecretsReadResult {
 }
 
 export function readSecretsDetailed(appDataPath: string): SecretsReadResult {
-  if (!safeStorage.isEncryptionAvailable()) {
-    return { secrets: {}, cause: "encryption_unavailable" };
-  }
   let buf: Buffer;
   try {
     buf = fs.readFileSync(secretsFilePath(appDataPath));
   } catch {
     return { secrets: {}, cause: "absent" };
+  }
+  if (!safeStorage.isEncryptionAvailable()) {
+    return { secrets: {}, cause: "encryption_unavailable" };
   }
   try {
     const json = safeStorage.decryptString(buf);

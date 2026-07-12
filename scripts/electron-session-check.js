@@ -98,14 +98,10 @@ async function main() {
     process.stderr.write(s);
   });
 
-  const killAfter = setTimeout(() => {
-    proc.kill();
-  }, Number(process.env.DOCKET_SESSION_CHECK_TIMEOUT_MS ?? "120000") + 10_000);
-
-  const result = await new Promise((resolve) => {
-    proc.on("exit", (code, signal) => resolve({ code, signal }));
-  });
-  clearTimeout(killAfter);
+  const result = await waitForElectronExit(
+    proc,
+    Number(process.env.DOCKET_SESSION_CHECK_TIMEOUT_MS ?? "120000") + 10_000,
+  );
   stopFrontend();
   stopFakeOpenAiServer();
   cleanupTempDirs();
@@ -120,6 +116,43 @@ async function main() {
   console.error("---STDERR---");
   console.error(stderr);
   process.exit(1);
+}
+
+function waitForElectronExit(proc, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let sigkillTimer = null;
+    let finalTimer = null;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(killTimer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      if (finalTimer) clearTimeout(finalTimer);
+      resolve(result);
+    };
+
+    proc.once("exit", (code, signal) => finish({ code, signal }));
+    const killTimer = setTimeout(() => {
+      console.error(
+        `[session-check] Electron exceeded runner deadline (${timeoutMs}ms); sending SIGTERM`,
+      );
+      proc.kill("SIGTERM");
+      sigkillTimer = setTimeout(() => {
+        console.error(
+          "[session-check] Electron did not exit after SIGTERM; sending SIGKILL",
+        );
+        proc.kill("SIGKILL");
+        finalTimer = setTimeout(() => {
+          console.error(
+            "[session-check] Electron emitted no exit event after SIGKILL; continuing cleanup",
+          );
+          finish({ code: null, signal: "SIGKILL_TIMEOUT" });
+        }, 5_000);
+      }, 5_000);
+    }, timeoutMs);
+  });
 }
 
 function electronEnv() {
@@ -457,4 +490,5 @@ function cleanupTempDirs() {
   fs.rmSync(userDataRoot, { recursive: true, force: true });
   fs.rmSync(sourceRoot, { recursive: true, force: true });
   fs.rmSync(promptSourceRoot, { recursive: true, force: true });
+  console.log("[session-check] temporary directories cleaned up");
 }
