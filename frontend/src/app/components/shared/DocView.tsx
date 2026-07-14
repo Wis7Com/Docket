@@ -87,6 +87,7 @@ import {
     COLOR_WHEEL_GRADIENT,
     PdfCustomColorPicker,
 } from "./PdfCustomColorPicker";
+import { ctrlZoomFactor, useCtrlZoom } from "@/lib/ctrlZoom";
 import {
     clearFindHighlightLayer,
     findMatchesInTexts,
@@ -179,6 +180,7 @@ export function DocView({
     const pdfRenderRunRef = useRef(0);
     const annotationStatusTimerRef = useRef<number | null>(null);
     const scrollFrameRef = useRef<number | null>(null);
+    const wheelZoomTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const annotationStatusRunRef = useRef(0);
     // Ref'd so renderPDF (a useCallback) always reports to the latest
     // handler without re-rendering the PDF when the parent re-renders.
@@ -1803,39 +1805,31 @@ export function DocView({
         void ensurePageRendered(item.page);
     }
 
-    // Trackpad pinch-to-zoom (wheel + ctrlKey)
-    useEffect(() => {
-        const el = scrollContainerRef.current;
-        if (!el) return;
-        let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    useCtrlZoom(scrollContainerRef, (detail) => {
+        const next = Math.min(
+            ZOOM_MAX,
+            Math.max(
+                ZOOM_MIN,
+                Math.round(zoomRef.current * ctrlZoomFactor(detail) * 100) / 100,
+            ),
+        );
+        if (next === zoomRef.current) return;
+        zoomRef.current = next;
+        setZoom(next);
+        if (wheelZoomTimerRef.current) clearTimeout(wheelZoomTimerRef.current);
+        wheelZoomTimerRef.current = setTimeout(() => {
+            resetRenderedPagesAtCurrentScale(currentPageRef.current);
+        }, 150);
+    });
 
-        const handleWheel = (e: WheelEvent) => {
-            if (!e.ctrlKey) return;
-            e.preventDefault();
-            const delta = e.deltaMode === 0 ? e.deltaY / 300 : e.deltaY * 0.1;
-            const next = Math.min(
-                ZOOM_MAX,
-                Math.max(
-                    ZOOM_MIN,
-                    Math.round(zoomRef.current * Math.exp(-delta) * 100) / 100,
-                ),
-            );
-            if (next === zoomRef.current) return;
-            zoomRef.current = next;
-            setZoom(next);
-            if (debounceTimer) clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
-                resetRenderedPagesAtCurrentScale(currentPageRef.current);
-            }, 150);
-        };
-
-        el.addEventListener("wheel", handleWheel, { passive: false });
-        return () => {
-            el.removeEventListener("wheel", handleWheel);
-            if (debounceTimer) clearTimeout(debounceTimer);
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [renderPDF]);
+    useEffect(
+        () => () => {
+            if (wheelZoomTimerRef.current) {
+                clearTimeout(wheelZoomTimerRef.current);
+            }
+        },
+        [],
+    );
 
     // Touch pinch-to-zoom
     useEffect(() => {
@@ -2688,6 +2682,7 @@ export function DocView({
             <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
                 <div
                     data-session-check="doc-view-scroll"
+                    data-ctrl-zoom="doc"
                     ref={scrollContainerRef}
                     className="min-w-0 flex-1 overflow-auto bg-gray-100 px-3 pt-5 pb-3"
                     onPointerDown={handlePdfPointerDown}

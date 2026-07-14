@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ZoomIn, ZoomOut } from "lucide-react";
 import { DocketIcon } from "@/components/chat/docket-icon";
 import { useFetchDocxBytes } from "@/app/hooks/useFetchDocxBytes";
 import { useSelectedModel } from "@/app/hooks/useSelectedModel";
@@ -24,6 +25,11 @@ import {
     highlightDocxQuote,
 } from "./highlightDocxQuote";
 import type { CitationQuote } from "./types";
+import { ctrlZoomFactor, useCtrlZoom } from "@/lib/ctrlZoom";
+
+const DOCX_ZOOM_MIN = 0.5;
+const DOCX_ZOOM_MAX = 2;
+const DOCX_ZOOM_STEP = 0.1;
 
 interface Props {
     documentId: string;
@@ -263,6 +269,7 @@ export function DocxView({
     const containerRef = useRef<HTMLDivElement>(null);
     const lastScrollTopRef = useRef(0);
     const renderKeyRef = useRef(0);
+    const userZoomRef = useRef(1);
     // Ref-stabilize onReady and highlightEdit so the render effect only
     // re-fires when `bytes` actually change. Without this, any parent
     // re-render (e.g. clicking a new highlight) creates a new onReady
@@ -284,6 +291,7 @@ export function DocxView({
         null,
     );
     const [generatingNav, setGeneratingNav] = useState(false);
+    const [userZoom, setUserZoom] = useState(1);
     const [outlineModel] = useSelectedModel();
     const generatedOutlineKey = documentOutlineStorageKey(
         "docx",
@@ -388,10 +396,25 @@ export function DocxView({
         sections.forEach((s) => {
             const w = s.offsetWidth;
             if (!w) return;
-            const scale = Math.min(1, available / w);
+            const scale = Math.min(1, available / w) * userZoomRef.current;
             s.style.zoom = String(scale);
         });
     };
+
+    const updateUserZoom = (nextValue: number) => {
+        const next = Math.min(
+            DOCX_ZOOM_MAX,
+            Math.max(DOCX_ZOOM_MIN, Math.round(nextValue * 100) / 100),
+        );
+        if (next === userZoomRef.current) return;
+        userZoomRef.current = next;
+        setUserZoom(next);
+        requestAnimationFrame(() => applyDocxScale());
+    };
+
+    useCtrlZoom(scrollRef, (detail) => {
+        updateUserZoom(userZoomRef.current * ctrlZoomFactor(detail));
+    });
 
     // Observe the scroll container (which tracks the side panel's width)
     // and re-scale whenever it resizes. Also observe the docx container so
@@ -694,6 +717,7 @@ export function DocxView({
             )}
             <div
                 ref={scrollRef}
+                data-ctrl-zoom="doc"
                 className="min-w-0 flex-1 overflow-auto bg-gray-100 px-5 pt-5 pb-3 docx-view-scroll"
                 data-document-id={documentId}
                 data-version-id={versionId ?? ""}
@@ -709,6 +733,37 @@ export function DocxView({
                     </div>
                 )}
                 <div ref={containerRef} className="docx-view-container" />
+            </div>
+            <div className="absolute bottom-4 right-4 flex items-center gap-px rounded-full bg-white/25 backdrop-blur-md border border-white/30 shadow-md px-1 py-1">
+                <button
+                    type="button"
+                    aria-label="Zoom out"
+                    onClick={() =>
+                        updateUserZoom(
+                            userZoomRef.current - DOCX_ZOOM_STEP,
+                        )
+                    }
+                    disabled={userZoom <= DOCX_ZOOM_MIN}
+                    className="flex items-center justify-center w-7 h-7 rounded-full text-gray-600 hover:bg-white/80 disabled:opacity-30 transition-colors"
+                >
+                    <ZoomOut className="h-3.5 w-3.5" />
+                </button>
+                <span className="text-xs font-medium text-gray-600 tabular-nums w-9 text-center select-none">
+                    {Math.round(userZoom * 100)}%
+                </span>
+                <button
+                    type="button"
+                    aria-label="Zoom in"
+                    onClick={() =>
+                        updateUserZoom(
+                            userZoomRef.current + DOCX_ZOOM_STEP,
+                        )
+                    }
+                    disabled={userZoom >= DOCX_ZOOM_MAX}
+                    className="flex items-center justify-center w-7 h-7 rounded-full text-gray-600 hover:bg-white/80 disabled:opacity-30 transition-colors"
+                >
+                    <ZoomIn className="h-3.5 w-3.5" />
+                </button>
             </div>
         </div>
     );

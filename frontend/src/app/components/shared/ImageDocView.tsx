@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
+import { ctrlZoomFactor, useCtrlZoom } from "@/lib/ctrlZoom";
 
 export function ImageDocView({
   buffer,
@@ -20,7 +21,13 @@ export function ImageDocView({
   );
   const [zoom, setZoom] = useState(1);
   const [rotation, setRotation] = useState(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => () => URL.revokeObjectURL(url), [url]);
+  useCtrlZoom(scrollRef, (detail) => {
+    setZoom((value) =>
+      Math.min(4, Math.max(0.25, value * ctrlZoomFactor(detail))),
+    );
+  });
   return (
     <div
       className={`relative flex flex-1 flex-col overflow-hidden bg-gray-100 ${bordered ? "border border-gray-200" : ""} ${rounded ? "rounded-xl" : ""}`}
@@ -54,7 +61,11 @@ export function ImageDocView({
           <RotateCcw size={16} />
         </button>
       </div>
-      <div className="flex flex-1 items-start justify-center overflow-auto p-6">
+      <div
+        ref={scrollRef}
+        data-ctrl-zoom="doc"
+        className="flex flex-1 items-start justify-center overflow-auto p-6"
+      >
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={url}

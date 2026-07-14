@@ -104,6 +104,7 @@ function createWindow(): BrowserWindow {
   });
   w.removeMenu();
   installNavigationGuards(w);
+  pinWindowZoom(w);
   w.webContents.setWindowOpenHandler(({ url }) => {
     if (isDocumentViewerUrl(url)) {
       return {
@@ -191,6 +192,19 @@ function installNavigationGuards(w: BrowserWindow): void {
   w.webContents.on("will-redirect", blockOffOrigin);
 }
 
+// On macOS, Chromium applies Ctrl+wheel zoom at the browser level without a
+// cancelable renderer event (and without emitting zoom-changed); the preload
+// script detects the resulting zoom-factor drift and routes it — per-pane
+// zoom over the document viewer / chat, sanctioned app-wide zoom elsewhere.
+// Here we only make sure windows start at 100% with pinch zoom disabled.
+function pinWindowZoom(w: BrowserWindow): void {
+  const contents = w.webContents;
+  contents.on("did-finish-load", () => {
+    void contents.setVisualZoomLevelLimits(1, 1);
+    contents.setZoomFactor(1);
+  });
+}
+
 function loadMainApp(w: BrowserWindow): void {
   void w.loadURL(new URL("/projects", FRONTEND_URL).toString());
 }
@@ -264,6 +278,7 @@ function getOrCreateDocumentViewerWindow(): BrowserWindow {
   documentViewerWindow = new BrowserWindow(documentViewerWindowOptions());
   documentViewerWindow.removeMenu();
   installNavigationGuards(documentViewerWindow);
+  pinWindowZoom(documentViewerWindow);
   documentViewerWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (isAllowedExternalUrl(url)) {
       void shell.openExternal(url);
