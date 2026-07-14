@@ -41,6 +41,7 @@ function toNativeMessages(
 export async function streamClaude(
     params: StreamChatParams,
 ): Promise<StreamChatResult> {
+    params.signal?.throwIfAborted();
     const {
         model,
         systemPrompt,
@@ -76,7 +77,7 @@ export async function streamClaude(
                   } as unknown as Record<string, unknown>)
                 : {}),
             // Extended thinking requires temperature to be default (omitted).
-        });
+        }, { signal: params.signal });
 
         let sawThinking = false;
 

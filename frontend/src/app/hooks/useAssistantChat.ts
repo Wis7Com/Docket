@@ -614,6 +614,66 @@ export function useAssistantChat({
                             continue;
                         }
 
+                        if (data.type === "doc_summary_start") {
+                            pushEvent({
+                                type: "doc_summary",
+                                filename: data.filename as string,
+                                completed_batches: 0,
+                                total_batches: 0,
+                                isStreaming: true,
+                            });
+                            continue;
+                        }
+
+                        if (data.type === "doc_summary_progress") {
+                            updateMatchingEvent(
+                                (e) =>
+                                    e.type === "doc_summary" &&
+                                    e.filename === data.filename &&
+                                    !!e.isStreaming,
+                                (e) => ({
+                                    ...e,
+                                    completed_batches:
+                                        (data.completed_batches as number) ?? 0,
+                                    total_batches:
+                                        (data.total_batches as number) ?? 0,
+                                }),
+                            );
+                            continue;
+                        }
+
+                        if (data.type === "doc_summary") {
+                            updateMatchingEvent(
+                                (e) =>
+                                    e.type === "doc_summary" &&
+                                    e.filename === data.filename &&
+                                    !!e.isStreaming,
+                                (e) => {
+                                    if (e.type !== "doc_summary") return e;
+                                    return {
+                                        ...e,
+                                        document_id:
+                                            typeof data.document_id === "string"
+                                                ? data.document_id
+                                                : e.document_id,
+                                        coverage: data.coverage,
+                                        completed_batches:
+                                            typeof data.coverage?.batchCount ===
+                                            "number"
+                                                ? data.coverage.batchCount
+                                                : e.completed_batches,
+                                        total_batches:
+                                            typeof data.coverage?.batchCount ===
+                                            "number"
+                                                ? data.coverage.batchCount
+                                                : e.total_batches,
+                                        isStreaming: false,
+                                    };
+                                },
+                            );
+                            continue;
+                        }
+
                         if (data.type === "doc_read_start") {
                             pushEvent({
                                 type: "doc_read",
@@ -958,7 +1018,9 @@ export function useAssistantChat({
             } else {
                 stopDrip();
                 const rawErrorMessage =
-                    error instanceof Error && error.message ? error.message : "";
+                    error instanceof Error && error.message
+                        ? error.message
+                        : "";
                 const errorMessage =
                     /failed to fetch|networkerror|terminated|connection (?:was )?closed/i.test(
                         rawErrorMessage,

@@ -45,7 +45,7 @@ function routeProjectId(req: { params: Record<string, string> }): string {
     return req.params.projectId;
 }
 
-async function validateSourceBackedDocuments(
+export async function validateSourceBackedDocuments(
     db: ReturnType<typeof createServerSupabase>,
     projectId: string,
     documentIds: string[],

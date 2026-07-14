@@ -32,3 +32,18 @@ test("preprocessCitations fails closed for duplicate refs", () => {
     assert.match(result, /§unresolved:1§/);
     assert.deepEqual(citations, []);
 });
+
+test("preprocessCitations keeps other refs resolvable when one citation is missing", () => {
+    const thirdCitation = { ...citation, ref: 3, quote: "Third source." };
+    const citations = [] as DocketCitationAnnotation[];
+    const result = preprocessCitations(
+        "A [1]. B [2]. C [3].",
+        [citation, thirdCitation],
+        citations,
+    );
+
+    assert.match(result, /§0§/);
+    assert.match(result, /§unresolved:2§/);
+    assert.match(result, /§1§/);
+    assert.deepEqual(citations, [citation, thirdCitation]);
+});

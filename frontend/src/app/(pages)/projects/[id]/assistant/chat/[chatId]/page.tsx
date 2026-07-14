@@ -48,6 +48,10 @@ import {
     ProjectSourceSelector,
 } from "@/app/components/projects/ProjectExplorer";
 import { buildDocumentSourceSelection } from "@/app/components/projects/documentSourceSelection";
+import {
+    collectDescendantDocIds,
+    evidenceDocumentIds,
+} from "@/app/components/projects/folderDocScope";
 import { RenameableTitle } from "@/app/components/shared/RenameableTitle";
 import { DocView } from "@/app/components/shared/DocView";
 import { OwnerOnlyModal } from "@/app/components/shared/OwnerOnlyModal";
@@ -67,6 +71,7 @@ import type {
     DocketProject,
 } from "@/app/components/shared/types";
 import { expandCitationToEntries } from "@/app/components/shared/types";
+import { buildCitationNavigationKey } from "@/app/components/shared/citationNavigation";
 
 interface Props {
     params: Promise<{ id: string; chatId: string }>;
@@ -278,7 +283,11 @@ function renderAssistantSearchSnippet(snippet: string, query: string) {
     let highlighted = false;
     const hasServerHighlights = parts.length > 1;
     if (!hasServerHighlights) {
-        return renderHighlightedSearchText(snippet, query, "chat-search-snippet");
+        return renderHighlightedSearchText(
+            snippet,
+            query,
+            "chat-search-snippet",
+        );
     }
 
     return parts.map((part, index) => {
@@ -292,7 +301,10 @@ function renderAssistantSearchSnippet(snippet: string, query: string) {
         }
         if (!part) return null;
         return highlighted ? (
-            <mark key={index} className="rounded bg-yellow-100 px-0.5 text-gray-900">
+            <mark
+                key={index}
+                className="rounded bg-yellow-100 px-0.5 text-gray-900"
+            >
                 {part}
             </mark>
         ) : (
@@ -466,20 +478,20 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     const [explorerSearchQuery, setExplorerSearchQuery] = useState(
         initialExplorerSearchQuery,
     );
-    const [explorerSearchActiveQuery, setExplorerSearchActiveQuery] = useState("");
+    const [explorerSearchActiveQuery, setExplorerSearchActiveQuery] =
+        useState("");
     const [explorerSearchResults, setExplorerSearchResults] = useState<
         ProjectSearchResult[]
     >([]);
     const [explorerSearchLoading, setExplorerSearchLoading] = useState(false);
-    const [explorerSearchError, setExplorerSearchError] = useState<string | null>(
-        null,
-    );
+    const [explorerSearchError, setExplorerSearchError] = useState<
+        string | null
+    >(null);
     const [explorerSearchType, setExplorerSearchType] = useState(
         initialExplorerSearchType,
     );
-    const [explorerSearchPageSize, setExplorerSearchPageSize] = useState<number>(
-        CHAT_SEARCH_PAGE_SIZES[0],
-    );
+    const [explorerSearchPageSize, setExplorerSearchPageSize] =
+        useState<number>(CHAT_SEARCH_PAGE_SIZES[0]);
     const [explorerSearchPage, setExplorerSearchPage] = useState(1);
 
     // Upload state
@@ -493,6 +505,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     const [activeQuotes, setActiveQuotes] = useState<CitationQuote[] | null>(
         null,
     );
+    const [activeCitationNavigationKey, setActiveCitationNavigationKey] =
+        useState<string | null>(null);
+    const citationNavigationNonceRef = useRef(0);
     const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
     const [viewerStateRestored, setViewerStateRestored] = useState(false);
     const [deselectedDocIds, setDeselectedDocIds] = useState<Set<string>>(
@@ -526,7 +541,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
             const restoredActiveTab =
                 restoredTabs.find(
                     (tab) => tab.documentId === saved.activeTabId,
-                ) ?? restoredTabs[0] ?? null;
+                ) ??
+                restoredTabs[0] ??
+                null;
             setTabs(restoredTabs);
             setActiveTabId(restoredActiveTab?.documentId ?? null);
             setActiveQuotes(restoredActiveTab?.quotes ?? null);
@@ -615,7 +632,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                 setExplorerSearchActiveQuery(q);
                 setExplorerSearchPage(1);
             } catch (err) {
-                setExplorerSearchError((err as Error).message || "Search failed");
+                setExplorerSearchError(
+                    (err as Error).message || "Search failed",
+                );
             } finally {
                 setExplorerSearchLoading(false);
             }
@@ -797,6 +816,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         filename: string,
         quotes?: CitationQuote[],
         versionId?: string | null,
+        citationNavigationKey?: string | null,
     ) {
         setTabs((prev) => {
             const existing = prev.find((t) => t.documentId === docId);
@@ -823,6 +843,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         });
         setActiveTabId(docId);
         setActiveQuotes(quotes && quotes.length ? quotes : null);
+        setActiveCitationNavigationKey(citationNavigationKey ?? null);
         setSelectedDocId(docId);
     }
 
@@ -899,14 +920,42 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                 selected
                     ? new Set()
                     : new Set(
-                          (project?.documents ?? []).map((document) =>
-                              document.id,
+                          (project?.documents ?? []).map(
+                              (document) => document.id,
                           ),
                       ),
             );
         },
         [project?.documents],
     );
+
+    const handleToggleFolderSourceDocuments = useCallback(
+        (folderId: string, selected: boolean) => {
+            const documentIds = collectDescendantDocIds(
+                project?.folders ?? [],
+                project?.documents ?? [],
+                folderId,
+            );
+            setDeselectedDocIds((current) => {
+                const next = new Set(current);
+                for (const documentId of documentIds) {
+                    if (selected) next.delete(documentId);
+                    else next.add(documentId);
+                }
+                return next;
+            });
+        },
+        [project?.documents, project?.folders],
+    );
+
+    const handleSelectBriefSources = useCallback(() => {
+        const evidenceIds = evidenceDocumentIds(project?.documents ?? []);
+        setDeselectedDocIds((current) => {
+            const next = new Set(current);
+            for (const documentId of evidenceIds) next.add(documentId);
+            return next;
+        });
+    }, [project?.documents]);
 
     // True when the project has documents but the user has unchecked every
     // one as a chat source. In that state a message with no direct
@@ -923,7 +972,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     };
 
     const handleSearchResultClick = (result: ProjectSearchResult) => {
-        const doc = project?.documents?.find((d) => d.id === result.document_id);
+        const doc = project?.documents?.find(
+            (d) => d.id === result.document_id,
+        );
         const quote = buildAssistantSearchQuote(
             result,
             explorerSearchActiveQuery || explorerSearchQuery,
@@ -994,6 +1045,10 @@ export default function ProjectAssistantChatPage({ params }: Props) {
             normalizedCitation.filename,
             expandCitationToEntries(normalizedCitation),
             normalizedCitation.version_id ?? null,
+            buildCitationNavigationKey(
+                normalizedCitation,
+                ++citationNavigationNonceRef.current,
+            ),
         );
     };
 
@@ -1006,7 +1061,10 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         openTab(args.documentId, args.filename, undefined, args.versionId);
     };
 
-    const handleEditViewClick = (ann: DocketEditAnnotation, filename: string) => {
+    const handleEditViewClick = (
+        ann: DocketEditAnnotation,
+        filename: string,
+    ) => {
         openTab(ann.document_id, filename, undefined, ann.version_id ?? null);
         setEditScrollTarget({
             key: `${ann.edit_id}-${Date.now()}`,
@@ -1084,14 +1142,15 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         if (!newTitle || newTitle === chatTitle) return;
         setChatTitle(newTitle);
         setProjectChats((prev) =>
-            prev.map((c) =>
-                c.id === chatId ? { ...c, title: newTitle } : c,
-            ),
+            prev.map((c) => (c.id === chatId ? { ...c, title: newTitle } : c)),
         );
         await renameChat(chatId, newTitle);
     }
 
-    async function handleRenameProjectChat(targetChatId: string, newTitle: string) {
+    async function handleRenameProjectChat(
+        targetChatId: string,
+        newTitle: string,
+    ) {
         if (targetChatId === chatId) {
             await handleRenameChat(newTitle);
             return;
@@ -1106,7 +1165,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
 
     async function handleDeleteProjectChats(chatIds: string[]) {
         await Promise.all(chatIds.map((id) => deleteChatFromHistory(id)));
-        setProjectChats((prev) => prev.filter((chat) => !chatIds.includes(chat.id)));
+        setProjectChats((prev) =>
+            prev.filter((chat) => !chatIds.includes(chat.id)),
+        );
         if (chatIds.includes(chatId)) {
             router.push(`/projects/${projectId}?tab=assistant`);
         }
@@ -1306,9 +1367,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     );
     const explorerSearchActive = Boolean(
         explorerSearchActiveQuery ||
-            explorerSearchLoading ||
-            explorerSearchError ||
-            explorerSearchResults.length > 0,
+        explorerSearchLoading ||
+        explorerSearchError ||
+        explorerSearchResults.length > 0,
     );
 
     return (
@@ -1370,7 +1431,10 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                     )}
                 </div>
                 <div className="flex items-center gap-2">
-                    <HeaderActionTooltip id="new-chat-tooltip" text="Start a new chat">
+                    <HeaderActionTooltip
+                        id="new-chat-tooltip"
+                        text="Start a new chat"
+                    >
                         <button
                             onClick={handleNewChat}
                             disabled={creatingChat}
@@ -1385,7 +1449,10 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                             )}
                         </button>
                     </HeaderActionTooltip>
-                    <HeaderActionTooltip id="delete-chat-tooltip" text="Delete this chat">
+                    <HeaderActionTooltip
+                        id="delete-chat-tooltip"
+                        text="Delete this chat"
+                    >
                         <button
                             onClick={handleDeleteChat}
                             disabled={deletingChat}
@@ -1502,7 +1569,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                             type="button"
                                             onClick={() => {
                                                 setExplorerSearchQuery("");
-                                                setExplorerSearchActiveQuery("");
+                                                setExplorerSearchActiveQuery(
+                                                    "",
+                                                );
                                                 setExplorerSearchResults([]);
                                                 setExplorerSearchError(null);
                                                 setExplorerSearchPage(1);
@@ -1518,7 +1587,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     <select
                                         value={explorerSearchType}
                                         onChange={(e) =>
-                                            setExplorerSearchType(e.target.value)
+                                            setExplorerSearchType(
+                                                e.target.value,
+                                            )
                                         }
                                         className="h-8 min-w-0 flex-1 rounded-lg border border-gray-200 bg-white px-2 text-xs text-gray-600 outline-none focus:border-gray-400"
                                         aria-label="Search type"
@@ -1590,25 +1661,26 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                 {explorerSearchActive ? (
                                     <div className="p-2">
                                         <ProjectSourceSelector
-                                            documents={
-                                                project?.documents ?? []
-                                            }
-                                            deselectedDocIds={
-                                                deselectedDocIds
-                                            }
+                                            documents={project?.documents ?? []}
+                                            deselectedDocIds={deselectedDocIds}
                                             onToggleAll={
                                                 handleToggleAllSourceDocuments
+                                            }
+                                            onSelectBriefs={
+                                                handleSelectBriefSources
                                             }
                                         />
                                         <div className="mb-2 flex items-center justify-between gap-2 text-xs text-gray-500">
                                             <span>
-                                                {explorerSearchResults.length > 0
+                                                {explorerSearchResults.length >
+                                                0
                                                     ? `${explorerSearchStartIndex + 1}-${explorerSearchEndIndex} of ${explorerSearchResults.length}`
                                                     : explorerSearchLoading
                                                       ? "Searching..."
                                                       : "0 results"}
                                             </span>
-                                            {explorerSearchResults.length > 0 && (
+                                            {explorerSearchResults.length >
+                                                0 && (
                                                 <select
                                                     value={
                                                         explorerSearchPageSize
@@ -1619,7 +1691,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                                                 e.target.value,
                                                             ),
                                                         );
-                                                        setExplorerSearchPage(1);
+                                                        setExplorerSearchPage(
+                                                            1,
+                                                        );
                                                     }}
                                                     className="h-7 rounded border border-gray-200 bg-white px-1.5 text-xs text-gray-600 outline-none focus:border-gray-400"
                                                     aria-label="Search results per page"
@@ -1680,7 +1754,8 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                                                         hits
                                                                     </span>
                                                                 ) : null}
-                                                                {(result.match_reasons
+                                                                {(result
+                                                                    .match_reasons
                                                                     ?.length
                                                                     ? result.match_reasons
                                                                     : result.basic_match
@@ -1691,7 +1766,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                                                             "keyword",
                                                                         ] as const)
                                                                 ).map(
-                                                                    (reason) => (
+                                                                    (
+                                                                        reason,
+                                                                    ) => (
                                                                         <span
                                                                             key={
                                                                                 reason
@@ -1765,7 +1842,15 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                         selectable
                                         deselectedDocIds={deselectedDocIds}
                                         onToggleDoc={handleToggleSourceDocument}
-                                        onToggleAll={handleToggleAllSourceDocuments}
+                                        onToggleAll={
+                                            handleToggleAllSourceDocuments
+                                        }
+                                        onToggleFolder={
+                                            handleToggleFolderSourceDocuments
+                                        }
+                                        onSelectBriefs={
+                                            handleSelectBriefSources
+                                        }
                                         onDocClick={handleDocClick}
                                         onAnnotationClick={(doc, ann) => {
                                             openTab(
@@ -1843,99 +1928,98 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                 </span>
                             ) : (
                                 tabs.map((tab) => {
-                                const isActive = tab.documentId === activeTabId;
-                                const ext = tab.filename
-                                    .split(".")
-                                    .pop()
-                                    ?.toLowerCase();
-                                const iconColor =
-                                    ext === "pdf"
-                                        ? "text-red-500"
-                                        : ext === "doc" || ext === "docx"
-                                          ? "text-blue-500"
-                                          : "text-gray-400";
-                                // Pull the doc's latest_version_number out
-                                // of the project state so the tab shows V#
-                                // whenever the doc has been edited.
-                                const versionNumber = (
-                                    project?.documents ?? []
-                                ).find((d) => d.id === tab.documentId)
-                                    ?.latest_version_number as
-                                    | number
-                                    | null
-                                    | undefined;
-                                const showVersionBadge =
-                                    typeof versionNumber === "number" &&
-                                    Number.isFinite(versionNumber) &&
-                                    versionNumber > 1;
-                                return (
-                                    <div
-                                        key={tab.documentId}
-                                        role="tab"
-                                        aria-selected={isActive}
-                                        data-session-check="project-doc-tab"
-                                        data-document-id={tab.documentId}
-                                        ref={(el) => {
-                                            tabItemRefs.current[
-                                                tab.documentId
-                                            ] = el;
-                                        }}
-                                        onClick={() =>
-                                            switchTab(tab.documentId)
-                                        }
-                                        className={`group flex items-center gap-1.5 px-3 h-full border-r border-gray-200 cursor-pointer shrink-0 max-w-[260px] transition-colors ${
-                                            isActive
-                                                ? "bg-gray-100"
-                                                : "bg-white hover:bg-gray-50"
-                                        }`}
-                                    >
-                                        {typeof tab.renderProgress ===
-                                            "number" &&
-                                        tab.renderProgress < 1 ? (
-                                            // Clockwise-filling pie: pages render
-                                            // progressively, which reflows the
-                                            // scrollbar — show that it's loading,
-                                            // not glitching.
-                                            <span
-                                                data-session-check="doc-tab-render-progress"
-                                                title={`Rendering pages… ${Math.round(tab.renderProgress * 100)}%`}
-                                                className="h-3.5 w-3.5 shrink-0 rounded-full"
-                                                style={{
-                                                    background: `conic-gradient(#2563eb ${tab.renderProgress * 360}deg, #e5e7eb 0deg)`,
-                                                }}
-                                            />
-                                        ) : (
-                                            <FileText
-                                                className={`h-3.5 w-3.5 shrink-0 ${iconColor}`}
-                                            />
-                                        )}
-                                        <span
-                                            className={`text-xs truncate ${isActive ? "text-gray-900 font-medium" : "text-gray-500"}`}
-                                        >
-                                            {tab.filename}
-                                        </span>
-                                        {showVersionBadge && (
-                                            <span
-                                                className={`shrink-0 inline-flex items-center rounded border px-1 py-px text-[9px] font-medium ${
-                                                    isActive
-                                                        ? "border-gray-200 bg-white text-gray-600"
-                                                        : "border-gray-200 bg-gray-50 text-gray-500"
-                                                }`}
-                                            >
-                                                V{versionNumber}
-                                            </span>
-                                        )}
-                                        <button
-                                            onClick={(e) => {
-                                                e.stopPropagation();
-                                                closeTab(tab.documentId);
+                                    const isActive =
+                                        tab.documentId === activeTabId;
+                                    const ext = tab.filename
+                                        .split(".")
+                                        .pop()
+                                        ?.toLowerCase();
+                                    const iconColor =
+                                        ext === "pdf"
+                                            ? "text-red-500"
+                                            : ext === "doc" || ext === "docx"
+                                              ? "text-blue-500"
+                                              : "text-gray-400";
+                                    // Pull the doc's latest_version_number out
+                                    // of the project state so the tab shows V#
+                                    // whenever the doc has been edited.
+                                    const versionNumber = (
+                                        project?.documents ?? []
+                                    ).find((d) => d.id === tab.documentId)
+                                        ?.latest_version_number as
+                                        number | null | undefined;
+                                    const showVersionBadge =
+                                        typeof versionNumber === "number" &&
+                                        Number.isFinite(versionNumber) &&
+                                        versionNumber > 1;
+                                    return (
+                                        <div
+                                            key={tab.documentId}
+                                            role="tab"
+                                            aria-selected={isActive}
+                                            data-session-check="project-doc-tab"
+                                            data-document-id={tab.documentId}
+                                            ref={(el) => {
+                                                tabItemRefs.current[
+                                                    tab.documentId
+                                                ] = el;
                                             }}
-                                            className={`shrink-0 transition-colors ${isActive ? "text-gray-500 hover:text-gray-700" : "text-gray-300 hover:text-gray-600"}`}
+                                            onClick={() =>
+                                                switchTab(tab.documentId)
+                                            }
+                                            className={`group flex items-center gap-1.5 px-3 h-full border-r border-gray-200 cursor-pointer shrink-0 max-w-[260px] transition-colors ${
+                                                isActive
+                                                    ? "bg-gray-100"
+                                                    : "bg-white hover:bg-gray-50"
+                                            }`}
                                         >
-                                            <X className="h-3 w-3" />
-                                        </button>
-                                    </div>
-                                );
+                                            {typeof tab.renderProgress ===
+                                                "number" &&
+                                            tab.renderProgress < 1 ? (
+                                                // Clockwise-filling pie: pages render
+                                                // progressively, which reflows the
+                                                // scrollbar — show that it's loading,
+                                                // not glitching.
+                                                <span
+                                                    data-session-check="doc-tab-render-progress"
+                                                    title={`Rendering pages… ${Math.round(tab.renderProgress * 100)}%`}
+                                                    className="h-3.5 w-3.5 shrink-0 rounded-full"
+                                                    style={{
+                                                        background: `conic-gradient(#2563eb ${tab.renderProgress * 360}deg, #e5e7eb 0deg)`,
+                                                    }}
+                                                />
+                                            ) : (
+                                                <FileText
+                                                    className={`h-3.5 w-3.5 shrink-0 ${iconColor}`}
+                                                />
+                                            )}
+                                            <span
+                                                className={`text-xs truncate ${isActive ? "text-gray-900 font-medium" : "text-gray-500"}`}
+                                            >
+                                                {tab.filename}
+                                            </span>
+                                            {showVersionBadge && (
+                                                <span
+                                                    className={`shrink-0 inline-flex items-center rounded border px-1 py-px text-[9px] font-medium ${
+                                                        isActive
+                                                            ? "border-gray-200 bg-white text-gray-600"
+                                                            : "border-gray-200 bg-gray-50 text-gray-500"
+                                                    }`}
+                                                >
+                                                    V{versionNumber}
+                                                </span>
+                                            )}
+                                            <button
+                                                onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    closeTab(tab.documentId);
+                                                }}
+                                                className={`shrink-0 transition-colors ${isActive ? "text-gray-500 hover:text-gray-700" : "text-gray-300 hover:text-gray-600"}`}
+                                            >
+                                                <X className="h-3 w-3" />
+                                            </button>
+                                        </div>
+                                    );
                                 })
                             )}
                         </div>
@@ -1996,6 +2080,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                         version_id: activeTab.versionId ?? null,
                                     }}
                                     quotes={activeQuotes ?? undefined}
+                                    citationNavigationKey={
+                                        activeCitationNavigationKey
+                                    }
                                     focusAnnotationId={
                                         activeTab.focusAnnotationId ?? null
                                     }

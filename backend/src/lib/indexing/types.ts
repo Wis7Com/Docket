@@ -59,6 +59,8 @@ export type StructuredIndexText = {
   ocr_pages?: number;
   ocr_engine?: string | null;
   ocr_regions?: IndexedOcrRegion[];
+  ocr_scanned_pages?: number;
+  ocr_truncated?: boolean;
 };
 
 export type IndexedOcrRegion = {
@@ -78,6 +80,8 @@ export type ExtractedDocument = {
   ocr_pages: number;
   ocr_engine: string | null;
   ocr_regions: IndexedOcrRegion[];
+  ocr_scanned_pages: number;
+  ocr_truncated: boolean;
 };
 
 export type SearchResult = {

@@ -78,6 +78,8 @@ const JSON_COLUMNS_BY_TABLE: Record<string, Set<string>> = {
   documents: new Set(["structure_tree"]),
   chat_messages: new Set(["content", "files", "annotations"]),
   tabular_cells: new Set(["citations"]),
+  issue_matrices: new Set(["scope", "issues", "shared_with"]),
+  issue_matrix_cells: new Set(["citations"]),
   tabular_review_chat_messages: new Set(["content", "annotations"]),
 };
 

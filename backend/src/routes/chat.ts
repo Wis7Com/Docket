@@ -16,10 +16,12 @@ import {
     type ChatMessage,
 } from "../lib/chatTools";
 import { completeText } from "../lib/llm";
+import { sanitizeGeneratedChatTitle } from "../lib/chatTitle";
 import { getUserApiKeys, getUserModelSettings } from "../lib/userSettings";
 import { checkProjectAccess } from "../lib/access";
 import { listRegisteredProjects } from "../lib/projectRegistry";
 import { presentChatStreamError } from "../lib/chatStreamErrors";
+import { clientDisconnectSignal } from "../lib/clientDisconnect";
 
 export const chatRouter = Router();
 
@@ -403,6 +405,7 @@ chatRouter.post("/:chatId/generate-title", requireAuth, async (req, res) => {
     if (!canTitle)
         return void res.status(404).json({ detail: "Chat not found" });
 
+    let title: string;
     try {
         const { title_model, api_keys } = await getUserModelSettings(
             userId,
@@ -414,23 +417,27 @@ chatRouter.post("/:chatId/generate-title", requireAuth, async (req, res) => {
             maxTokens: 64,
             apiKeys: api_keys,
         });
-        const title = titleText.trim() || message.slice(0, 60);
-
-        await db
-            .from("chats")
-            .update({ title })
-            .eq("id", chatId)
-            .eq("user_id", userId);
-
-        res.json({ title });
+        title = sanitizeGeneratedChatTitle(titleText, message);
     } catch (err) {
         console.error("[generate-title]", err);
-        res.status(500).json({ detail: "Failed to generate title" });
+        // Title generation is cosmetic and must not turn a successful chat
+        // into a failed request when a provider is offline or rate-limited.
+        title = message.slice(0, 60);
     }
+
+    const { error: updateError } = await db
+        .from("chats")
+        .update({ title })
+        .eq("id", chatId)
+        .eq("user_id", userId);
+    if (updateError)
+        return void res.status(500).json({ detail: "Failed to save title" });
+    res.json({ title });
 });
 
 // POST /chat — streaming
 chatRouter.post("/", requireAuth, async (req, res) => {
+  const signal = clientDisconnectSignal(req, res);
   try {
     const userId = res.locals.userId as string;
     const { messages, chat_id, project_id, model, disabled_tools } = req.body as {
@@ -578,6 +585,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                       (name): name is string => typeof name === "string",
                   )
                 : [],
+            signal,
         });
 
         console.log("[chat/stream] LLM stream finished", {

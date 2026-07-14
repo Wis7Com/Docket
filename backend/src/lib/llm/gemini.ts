@@ -28,6 +28,38 @@ type GeminiContent = {
     parts: GeminiPart[];
 };
 
+function geminiErrorStatus(error: unknown): number | null {
+    if (!error || typeof error !== "object") return null;
+    for (const key of ["status", "statusCode", "code"] as const) {
+        const value = (error as Record<string, unknown>)[key];
+        const parsed = typeof value === "number" ? value : Number(value);
+        if (Number.isInteger(parsed) && parsed >= 100 && parsed <= 599) {
+            return parsed;
+        }
+    }
+    return null;
+}
+
+function isRetryableGeminiError(error: unknown): boolean {
+    const status = geminiErrorStatus(error);
+    if (status !== null) return status === 429 || status >= 500;
+    const message = error instanceof Error ? error.message : String(error);
+    return /(?:fetch failed|network|socket|ECONNRESET|ETIMEDOUT|temporar|unavailable|resource exhausted)/i.test(
+        message,
+    );
+}
+
+function geminiProviderError(error: unknown): Error & { code: string } {
+    const detail = error instanceof Error ? error.message : String(error);
+    const wrapped = new Error(`Gemini chat failed: ${detail}`) as Error & {
+        code: string;
+        cause?: unknown;
+    };
+    wrapped.code = "LLM_PROVIDER_ERROR";
+    wrapped.cause = error;
+    return wrapped;
+}
+
 function client(override?: string | null): GoogleGenAI {
     const apiKey = override?.trim() || process.env.GEMINI_API_KEY || "";
     return new GoogleGenAI({ apiKey });
@@ -43,6 +75,7 @@ function toNativeContents(messages: StreamChatParams["messages"]): GeminiContent
 export async function streamGemini(
     params: StreamChatParams,
 ): Promise<StreamChatResult> {
+    params.signal?.throwIfAborted();
     const { model, systemPrompt, tools = [], callbacks = {}, runTools, apiKeys, enableThinking } = params;
     const maxIter = params.maxIterations ?? 10;
     const ai = client(apiKeys?.gemini);
@@ -52,58 +85,75 @@ export async function streamGemini(
     let fullText = "";
 
     for (let iter = 0; iter < maxIter; iter++) {
-        const stream = await ai.models.generateContentStream({
-            model,
-            contents: contents as never,
-            config: {
-                systemInstruction: systemPrompt,
-                tools: functionDeclarations.length
-                    ? [{ functionDeclarations } as never]
-                    : undefined,
-                // When enabled, ask Gemini to surface thought summaries.
-                // When disabled, explicitly zero the thinking budget so the
-                // model skips thinking entirely (saves tokens and latency
-                // for bulk extraction jobs).
-                thinkingConfig: enableThinking
-                    ? { includeThoughts: true }
-                    : { thinkingBudget: 0 },
-            },
-        });
-
-        // Per-iteration accumulators.
-        const textParts: string[] = [];
-        const callParts: GeminiPart[] = [];
-        const toolCalls: NormalizedToolCall[] = [];
+        let textParts: string[] = [];
+        let callParts: GeminiPart[] = [];
+        let toolCalls: NormalizedToolCall[] = [];
         let sawThinking = false;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                params.signal?.throwIfAborted();
+                const stream = await ai.models.generateContentStream({
+                    model,
+                    contents: contents as never,
+                    config: {
+                        // The SDK documents this as client-side cancellation;
+                        // provider-side generation may continue after abort.
+                        abortSignal: params.signal,
+                        systemInstruction: systemPrompt,
+                        tools: functionDeclarations.length
+                            ? [{ functionDeclarations } as never]
+                            : undefined,
+                        thinkingConfig: enableThinking
+                            ? { includeThoughts: true }
+                            : { thinkingBudget: 0 },
+                    },
+                });
 
-        for await (const chunk of stream) {
-            console.log("[gemini stream chunk]", JSON.stringify(chunk, null, 2));
-            const parts =
-                (chunk as { candidates?: { content?: { parts?: GeminiPart[] } }[] })
-                    .candidates?.[0]?.content?.parts ?? [];
+                for await (const chunk of stream) {
+                    params.signal?.throwIfAborted();
+                    const parts =
+                        (chunk as { candidates?: { content?: { parts?: GeminiPart[] } }[] })
+                            .candidates?.[0]?.content?.parts ?? [];
 
-            for (const part of parts) {
-                if (part.text) {
-                    if (part.thought) {
-                        sawThinking = true;
-                        callbacks.onReasoningDelta?.(part.text);
-                    } else {
-                        textParts.push(part.text);
-                        callbacks.onContentDelta?.(part.text);
+                    for (const part of parts) {
+                        if (part.text) {
+                            if (part.thought) {
+                                sawThinking = true;
+                                callbacks.onReasoningDelta?.(part.text);
+                            } else {
+                                textParts.push(part.text);
+                                callbacks.onContentDelta?.(part.text);
+                            }
+                        }
+                        if (part.functionCall) {
+                            callParts.push(part);
+                            const call: NormalizedToolCall = {
+                                id: part.functionCall.id ?? `${part.functionCall.name}-${toolCalls.length}`,
+                                name: part.functionCall.name,
+                                input: part.functionCall.args ?? {},
+                            };
+                            callbacks.onToolCallStart?.(call);
+                            toolCalls.push(call);
+                        }
                     }
                 }
-                if (part.functionCall) {
-                    // Preserve the whole part (including thoughtSignature)
-                    // so it can be echoed verbatim in the replay turn.
-                    callParts.push(part);
-                    const call: NormalizedToolCall = {
-                        id: part.functionCall.id ?? `${part.functionCall.name}-${toolCalls.length}`,
-                        name: part.functionCall.name,
-                        input: part.functionCall.args ?? {},
-                    };
-                    callbacks.onToolCallStart?.(call);
-                    toolCalls.push(call);
-                }
+
+                break;
+            } catch (error) {
+                params.signal?.throwIfAborted();
+                if (sawThinking) callbacks.onReasoningBlockEnd?.();
+                const canRetry =
+                    attempt === 0 &&
+                    textParts.length === 0 &&
+                    callParts.length === 0 &&
+                    isRetryableGeminiError(error);
+                if (!canRetry) throw geminiProviderError(error);
+                await new Promise((resolve) => setTimeout(resolve, 500));
+                textParts = [];
+                callParts = [];
+                toolCalls = [];
+                sawThinking = false;
+                continue;
             }
         }
 
@@ -151,12 +201,23 @@ export async function completeGeminiText(params: {
     apiKeys?: { gemini?: string | null };
 }): Promise<string> {
     const ai = client(params.apiKeys?.gemini);
-    const resp = await ai.models.generateContent({
-        model: params.model,
-        contents: [{ role: "user", parts: [{ text: params.user }] }],
-        config: params.systemPrompt
-            ? { systemInstruction: params.systemPrompt }
-            : undefined,
-    });
-    return resp.text ?? "";
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const resp = await ai.models.generateContent({
+                model: params.model,
+                contents: [{ role: "user", parts: [{ text: params.user }] }],
+                config: params.systemPrompt
+                    ? { systemInstruction: params.systemPrompt }
+                    : undefined,
+            });
+            return resp.text ?? "";
+        } catch (error) {
+            if (attempt === 0 && isRetryableGeminiError(error)) {
+                await new Promise((resolve) => setTimeout(resolve, 500));
+                continue;
+            }
+            throw geminiProviderError(error);
+        }
+    }
+    return "";
 }

@@ -68,6 +68,7 @@ import {
   startProjectEmbedding,
   pauseProjectEmbedding,
   searchProjectDocuments,
+  requestFullDocumentOcr,
   type DocketDocumentVersion,
   type ProjectIndexStatus,
   type ProjectSearchResult,
@@ -93,12 +94,15 @@ import { useAuth } from "@/contexts/AuthContext";
 import { DocViewModal } from "@/app/components/shared/DocViewModal";
 import { AddNewTRModal } from "@/app/components/tabular/AddNewTRModal";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
+import { ProjectAnnotationBrowser } from "./ProjectAnnotationBrowser";
+import { ColorLegendEditor } from "./ColorLegendEditor";
 
 interface Props {
   projectId: string;
 }
 
 type Tab = "documents" | "assistant" | "reviews";
+type DocumentsPanel = "files" | "annotations";
 
 type ContextMenu = {
   x: number;
@@ -956,6 +960,8 @@ export function ProjectPage({ projectId }: Props) {
   const tabParam = searchParams.get("tab");
   const tab: Tab =
     tabParam === "assistant" || tabParam === "reviews" ? tabParam : "documents";
+  const [documentsPanel, setDocumentsPanel] =
+    useState<DocumentsPanel>("files");
   const [addDocsOpen, setAddDocsOpen] = useState(false);
   const [sourceFolderOpen, setSourceFolderOpen] = useState(false);
   const [sourceFolderPath, setSourceFolderPath] = useState("");
@@ -1327,6 +1333,17 @@ export function ProjectPage({ projectId }: Props) {
     }
   }
 
+  async function handleFullOcrForSelectedDocument() {
+    if (selectedDocIds.length !== 1) return;
+    setIndexBusy(true);
+    try {
+      await requestFullDocumentOcr(projectId, selectedDocIds[0]);
+      await refreshIndexStatus();
+    } finally {
+      setIndexBusy(false);
+    }
+  }
+
   async function submitProjectSearch() {
     const q = projectSearchQuery.trim();
     if (!q) {
@@ -1383,10 +1400,16 @@ export function ProjectPage({ projectId }: Props) {
       version?: { id: string; label: string } | null;
       searchTarget?: SearchDocTarget | null;
       annotation?: PdfAnnotation | null;
+      annotationTarget?: {
+        id: string;
+        page_number: number;
+        quote: string | null;
+      } | null;
     } = {},
   ) {
     const version = options.version ?? null;
     const annotation = options.annotation ?? null;
+    const annotationTarget = options.annotationTarget ?? null;
     // An annotation target rides the search params for the page hint and
     // fallback-modal scroll, plus annotation_id for the precise focus.
     const searchTarget =
@@ -1397,6 +1420,12 @@ export function ProjectPage({ projectId }: Props) {
             page: annotation.page_number,
             key: `annotation-${annotation.id}-${Date.now()}`,
           }
+        : annotationTarget
+          ? {
+              quote: annotationTarget.quote ?? "",
+              page: annotationTarget.page_number,
+              key: `annotation-${annotationTarget.id}-${Date.now()}`,
+            }
         : null);
     const payload: DocumentViewerPayload = {
       documentId: doc.id,
@@ -1406,7 +1435,7 @@ export function ProjectPage({ projectId }: Props) {
       searchQuote: searchTarget?.quote ?? null,
       searchPage: searchTarget?.page ?? null,
       searchKey: searchTarget?.key ?? null,
-      annotationId: annotation?.id ?? null,
+      annotationId: annotation?.id ?? annotationTarget?.id ?? null,
       projectId,
     };
     const bridge =
@@ -2234,6 +2263,7 @@ export function ProjectPage({ projectId }: Props) {
             <ChevronRight className="h-3.5 w-3.5 text-gray-300 shrink-0" />
             <FolderPlus className="h-4 w-4 text-amber-400 shrink-0" />
             <input
+              data-session-check="project-new-folder-input"
               autoFocus
               className="flex-1 min-w-0 text-sm text-gray-800 bg-transparent outline-none border-b border-gray-300"
               placeholder="Folder name"
@@ -2477,6 +2507,8 @@ export function ProjectPage({ projectId }: Props) {
           return (
             <div key={`folder-${folder.id}`}>
               <div
+                data-session-check="project-folder-row"
+                data-folder-name={folder.name}
                 draggable
                 onDragStart={(e) => {
                   e.dataTransfer.setData(
@@ -2716,7 +2748,9 @@ export function ProjectPage({ projectId }: Props) {
 
   const currentSelectionCount =
     tab === "documents"
-      ? selectedDocIds.length
+      ? documentsPanel === "files"
+        ? selectedDocIds.length
+        : 0
       : tab === "assistant"
         ? selectedChatIds.length
         : selectedReviewIds.length;
@@ -2784,9 +2818,10 @@ export function ProjectPage({ projectId }: Props) {
   const toolbarActions = (
     <div className="flex items-center gap-2">
       {actionsDropdown}
-      {tab === "documents" && (
+      {tab === "documents" && documentsPanel === "files" && (
         <>
           <button
+            data-session-check="project-add-subfolder"
             onClick={() => {
               setCreatingFolderIn(null);
               setNewFolderName("");
@@ -2953,6 +2988,35 @@ export function ProjectPage({ projectId }: Props) {
       />
 
       {tab === "documents" && (
+        <div className="border-b border-gray-100 px-8">
+          <div className="flex h-9 items-end gap-4 text-xs font-medium">
+            <button
+              type="button"
+              onClick={() => setDocumentsPanel("files")}
+              className={`h-9 border-b-2 px-0.5 transition-colors ${
+                documentsPanel === "files"
+                  ? "border-gray-900 text-gray-900"
+                  : "border-transparent text-gray-400 hover:text-gray-700"
+              }`}
+            >
+              Files
+            </button>
+            <button
+              type="button"
+              onClick={() => setDocumentsPanel("annotations")}
+              className={`h-9 border-b-2 px-0.5 transition-colors ${
+                documentsPanel === "annotations"
+                  ? "border-gray-900 text-gray-900"
+                  : "border-transparent text-gray-400 hover:text-gray-700"
+              }`}
+            >
+              All highlights
+            </button>
+          </div>
+        </div>
+      )}
+
+      {tab === "documents" && documentsPanel === "files" && (
         <div className="border-b border-gray-100 px-8 py-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs font-medium text-gray-500">
@@ -3063,6 +3127,25 @@ export function ProjectPage({ projectId }: Props) {
                     <span className="rounded bg-violet-50 px-2 py-0.5 text-violet-700">
                       OCR processed · {indexStatus.ocr_pages} pages
                     </span>
+                  ) : null}
+                  {(indexStatus.ocr_truncated_documents ?? 0) > 0 ? (
+                    <span
+                      className="rounded bg-amber-50 px-2 py-0.5 text-amber-700"
+                      title={`${indexStatus.ocr_truncated_documents} scanned documents are only partially OCR-indexed`}
+                    >
+                      부분 OCR · {indexStatus.ocr_truncated_documents}건
+                    </span>
+                  ) : null}
+                  {(indexStatus.ocr_truncated_documents ?? 0) > 0 &&
+                  selectedDocIds.length === 1 ? (
+                    <button
+                      type="button"
+                      disabled={indexBusy}
+                      onClick={() => void handleFullOcrForSelectedDocument()}
+                      className="rounded border border-amber-200 px-2 py-0.5 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
+                    >
+                      선택 문서 전체 OCR
+                    </button>
                   ) : null}
                   {indexStatus.status_counts.ready ? (
                     <span className="rounded bg-emerald-50 px-2 py-0.5 text-emerald-700">
@@ -3387,11 +3470,25 @@ export function ProjectPage({ projectId }: Props) {
         </div>
       )}
 
+      {tab === "documents" && <ColorLegendEditor projectId={projectId} />}
+
       {/* Table content */}
       <div className="w-full flex-1 min-h-0 overflow-x-auto">
-        <div className="min-w-max flex min-h-full flex-col">
+        <div
+          className={`${tab === "documents" && documentsPanel === "annotations" ? "w-full" : "min-w-max"} flex min-h-full flex-col`}
+        >
+          {tab === "documents" && documentsPanel === "annotations" && (
+            <ProjectAnnotationBrowser
+              projectId={projectId}
+              documents={project.documents ?? []}
+              onOpen={(doc, target) =>
+                openDocumentViewer(doc, { annotationTarget: target })
+              }
+            />
+          )}
+
           {/* Tab: Documents */}
-          {tab === "documents" && (
+          {tab === "documents" && documentsPanel === "files" && (
             <div className="flex-1 flex flex-col min-h-0">
               {/* Table header */}
               <div className="flex items-center h-8 pr-8 border-b border-gray-200 text-xs text-gray-500 font-medium select-none shrink-0">

@@ -39,6 +39,7 @@ import { projectsRouter } from "./routes/projects";
 import { projectChatRouter } from "./routes/projectChat";
 import { documentsRouter } from "./routes/documents";
 import { generateTabularPromptHandler, tabularRouter } from "./routes/tabular";
+import { issueMatrixRouter } from "./routes/issueMatrix";
 import { workflowsRouter } from "./routes/workflows";
 import { userRouter } from "./routes/user";
 import { downloadsRouter } from "./routes/downloads";
@@ -79,6 +80,12 @@ app.use(
   requireAuth,
   projectDbRequestContext,
   tabularRouter,
+);
+app.use(
+  "/projects/:projectId/issue-matrices",
+  requireAuth,
+  projectDbRequestContext,
+  issueMatrixRouter,
 );
 app.use("/projects", projectsRouter);
 app.use("/projects/:projectId/chat", requireAuth, projectDbRequestContext);

@@ -18,6 +18,7 @@ import type {
 } from "@/app/components/shared/types";
 import { VersionChip } from "@/app/components/shared/VersionChip";
 import { listPdfAnnotations, deletePdfAnnotation } from "@/app/lib/docketApi";
+import { collectDescendantDocIds } from "./folderDocScope";
 
 interface Props {
     projectName?: string | null;
@@ -36,16 +37,20 @@ interface Props {
     deselectedDocIds?: Set<string>;
     onToggleDoc?: (docId: string, selected: boolean) => void;
     onToggleAll?: (selected: boolean) => void;
+    onToggleFolder?: (folderId: string, selected: boolean) => void;
+    onSelectBriefs?: () => void;
 }
 
 export function ProjectSourceSelector({
     documents,
     deselectedDocIds,
     onToggleAll,
+    onSelectBriefs,
 }: {
     documents: DocketDocument[];
     deselectedDocIds: Set<string>;
     onToggleAll?: (selected: boolean) => void;
+    onSelectBriefs?: () => void;
 }) {
     const selectAllRef = useRef<HTMLInputElement>(null);
     const selectedCount = documents.filter(
@@ -74,6 +79,17 @@ export function ProjectSourceSelector({
                 className="h-3.5 w-3.5 rounded border-gray-300 text-gray-900 disabled:opacity-50"
             />
             <span>Select all</span>
+            <button
+                data-session-check="explorer-select-briefs"
+                type="button"
+                onClick={(event) => {
+                    event.stopPropagation();
+                    onSelectBriefs?.();
+                }}
+                className="rounded border border-gray-200 px-1.5 py-0.5 text-gray-600 hover:bg-gray-50"
+            >
+                서면만
+            </button>
             {selectedCount !== documents.length && (
                 <span className="ml-auto">
                     {selectedCount} of {documents.length} docs as chat sources
@@ -129,6 +145,8 @@ export function ProjectExplorer({
     deselectedDocIds = new Set<string>(),
     onToggleDoc,
     onToggleAll,
+    onToggleFolder,
+    onSelectBriefs,
 }: Props) {
     const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
     const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -390,9 +408,21 @@ export function ProjectExplorer({
                     const isExpanded = expandedIds.has(folder.id);
                     const isRenaming = renamingId === folder.id;
                     const isDragTarget = dragOverFolderId === folder.id;
+                    const descendantDocIds = collectDescendantDocIds(
+                        folders,
+                        documents,
+                        folder.id,
+                    );
+                    const allDescendantsSelected =
+                        descendantDocIds.length > 0 &&
+                        descendantDocIds.every(
+                            (docId) => !deselectedDocIds.has(docId),
+                        );
                     return (
                         <li key={`f-${folder.id}`}>
                             <div
+                                data-session-check="explorer-folder-row"
+                                data-folder-name={folder.name}
                                 draggable
                                 onDragStart={(e) => {
                                     e.dataTransfer.setData("application/docket-folder", folder.id);
@@ -429,6 +459,23 @@ export function ProjectExplorer({
                                     openContextMenu(e, folder.id, folder.id)
                                 }
                             >
+                                {selectable && (
+                                    <input
+                                        data-session-check="explorer-folder-source-checkbox"
+                                        type="checkbox"
+                                        checked={allDescendantsSelected}
+                                        disabled={descendantDocIds.length === 0}
+                                        aria-label={`Use all documents in ${folder.name} as chat sources`}
+                                        onChange={(event) =>
+                                            onToggleFolder?.(
+                                                folder.id,
+                                                event.target.checked,
+                                            )
+                                        }
+                                        onClick={(event) => event.stopPropagation()}
+                                        className="h-3.5 w-3.5 shrink-0 rounded border-gray-300 text-gray-900 disabled:opacity-50"
+                                    />
+                                )}
                                 {isExpanded
                                     ? <ChevronDown className="h-3 w-3 text-gray-400 shrink-0" />
                                     : <ChevronRight className="h-3 w-3 text-gray-400 shrink-0" />
@@ -748,11 +795,12 @@ export function ProjectExplorer({
         >
             {selectable && (
                 <li>
-                    <ProjectSourceSelector
-                        documents={documents}
-                        deselectedDocIds={deselectedDocIds}
-                        onToggleAll={onToggleAll}
-                    />
+                <ProjectSourceSelector
+                    documents={documents}
+                    deselectedDocIds={deselectedDocIds}
+                    onToggleAll={onToggleAll}
+                    onSelectBriefs={onSelectBriefs}
+                />
                 </li>
             )}
 

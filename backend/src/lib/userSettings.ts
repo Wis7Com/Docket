@@ -1,5 +1,5 @@
 import { createServerSupabase } from "./supabase";
-import { getAppDb } from "../db/sqlite";
+import { getAppDb, getDb } from "../db/sqlite";
 import {
   resolveModel,
   DEFAULT_TITLE_MODEL,
@@ -12,6 +12,8 @@ import type {
   OcrMode,
   OcrSettings,
 } from "./ocr/types";
+
+export const DEFAULT_OCR_MAX_PAGES_PER_DOC = 100;
 
 export type UserModelSettings = {
   title_model: string;
@@ -50,7 +52,7 @@ type UserProfileSettingsRow = {
 
 // Title generation is a lightweight task. Prefer Gemini's free-tier friendly
 // Flash Lite when configured, then free-router/API options, then local fallback.
-function resolveTitleModel(apiKeys: UserApiKeys): string {
+export function resolveTitleModel(apiKeys: UserApiKeys): string {
   if (apiKeys.gemini?.trim() || process.env.GEMINI_API_KEY)
     return DEFAULT_TITLE_MODEL;
   if (process.env.FREE_ROUTER_TITLE_MODEL || process.env.FREE_ROUTER_MODEL) {
@@ -65,8 +67,9 @@ function resolveTitleModel(apiKeys: UserApiKeys): string {
     return "free-router:auto";
   }
   if (apiKeys.claude?.trim()) return "claude-haiku-4-5";
+  if (process.env.OLLAMA_TITLE_MODEL) return process.env.OLLAMA_TITLE_MODEL;
   if (process.env.OLLAMA_BASE_URL || process.env.LOCAL_OLLAMA_BASE_URL) {
-    return "ollama:gemma4:26b-a4b-it-q4_K_M";
+    return "ollama:gemma4:12b-mlx";
   }
   return DEFAULT_TITLE_MODEL;
 }
@@ -186,10 +189,30 @@ export async function getUserOcrSettings(userId: string): Promise<OcrSettings> {
       ["auto", "korean+english", "english"],
       "auto",
     ),
-    maxPagesPerDocument: positiveInt(data?.ocr_max_pages_per_doc, 50),
+    maxPagesPerDocument: positiveInt(
+      data?.ocr_max_pages_per_doc,
+      DEFAULT_OCR_MAX_PAGES_PER_DOC,
+    ),
     gpuEndpoint: data?.ocr_gpu_endpoint?.trim() || null,
     externalProvider: data?.ocr_external_provider?.trim() || null,
   };
+}
+
+function nonNegativeIntOrNull(value: unknown): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
+}
+
+export function getProjectOcrMaxPagesOverride(
+  projectId: string,
+): number | null {
+  const row = getDb()
+    .prepare(
+      "SELECT ocr_max_pages_override AS value FROM projects WHERE id = ?",
+    )
+    .get(projectId) as { value: number | null } | undefined;
+  return nonNegativeIntOrNull(row?.value);
 }
 
 export async function getUserRetrievalSettings(

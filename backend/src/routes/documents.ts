@@ -61,6 +61,10 @@ import {
   mimeTypeForDocumentType,
 } from "../lib/documentTypes";
 import { findMatchingOcrRegions } from "../lib/ocr/ocrRegions";
+import {
+  inferDocRole,
+  inferPartyRole,
+} from "../lib/documentClassification";
 
 export const documentsRouter = Router();
 const ALLOWED_TYPES = new Set([
@@ -2268,6 +2272,8 @@ async function handleDocumentUpload(
     });
 
   const content = file.buffer;
+  const roleGuess = inferDocRole({ filename });
+  const partyGuess = inferPartyRole({ filename });
   const { data: doc, error: insertErr } = await db
     .from("documents")
     .insert({
@@ -2277,6 +2283,9 @@ async function handleDocumentUpload(
       file_type: suffix,
       size_bytes: content.byteLength,
       status: "processing",
+      doc_role: roleGuess.role,
+      doc_role_confidence: roleGuess.confidence,
+      ...(partyGuess ? { party_role: partyGuess.role } : {}),
     })
     .select("*")
     .single();
@@ -2309,6 +2318,10 @@ async function handleDocumentUpload(
         : isImageDocumentType(suffix)
           ? 1
           : null;
+    const pageAwareRoleGuess =
+      roleGuess.confidence === "low"
+        ? inferDocRole({ filename, pageCount })
+        : roleGuess;
 
     // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;
@@ -2362,6 +2375,8 @@ async function handleDocumentUpload(
         current_version_id: versionRow.id,
         size_bytes: content.byteLength,
         page_count: pageCount,
+        doc_role: pageAwareRoleGuess.role,
+        doc_role_confidence: pageAwareRoleGuess.confidence,
         structure_tree: tree ?? null,
         status: "ready",
         updated_at: new Date().toISOString(),

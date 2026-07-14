@@ -23,6 +23,7 @@ type QueueJob = {
   documentId: string;
   versionId: string | null;
   context: DatabaseContext;
+  ocrMode?: "full" | "deferred";
 };
 
 type EmbeddingQueueJob = {
@@ -34,6 +35,7 @@ const queue: QueueJob[] = [];
 const queuedKeys = new Set<string>();
 const activeKeys = new Set<string>();
 const rerunKeys = new Set<string>();
+const fullOcrRerunKeys = new Set<string>();
 let processing = false;
 let drainWaiters: (() => void)[] = [];
 
@@ -112,6 +114,8 @@ function markIndexStatus(args: {
   indexSchemaVersion?: number;
   ocrPages?: number;
   ocrEngine?: string | null;
+  ocrScannedPages?: number;
+  ocrTruncated?: number;
 }): void {
   getDb()
     .prepare(
@@ -125,6 +129,8 @@ function markIndexStatus(args: {
           index_schema_version = COALESCE(?, index_schema_version),
           ocr_pages = COALESCE(?, ocr_pages),
           ocr_engine = CASE WHEN ? = 'ready' THEN ? ELSE ocr_engine END,
+          ocr_scanned_pages = COALESCE(?, ocr_scanned_pages),
+          ocr_truncated = CASE WHEN ? = 'ready' THEN ? ELSE ocr_truncated END,
           indexed_at = CASE WHEN ? = 'ready' THEN CURRENT_TIMESTAMP ELSE indexed_at END,
           updated_at = CURRENT_TIMESTAMP
       WHERE document_id = ? AND version_id = ?
@@ -140,6 +146,9 @@ function markIndexStatus(args: {
       args.ocrPages ?? null,
       args.status,
       args.ocrEngine ?? null,
+      args.ocrScannedPages ?? null,
+      args.status,
+      args.ocrTruncated ?? 0,
       args.status,
       args.documentId,
       args.versionId,
@@ -214,6 +223,7 @@ export async function indexDocumentVersion(args: {
   documentId: string;
   versionId?: string | null;
   ocrEngine?: OcrEngine;
+  ocrMode?: "full" | "deferred";
 }): Promise<void> {
   const dbShim = createServerSupabase();
   const requestedRevision = args.versionId
@@ -224,6 +234,7 @@ export async function indexDocumentVersion(args: {
     documentId: args.documentId,
     versionId: args.versionId,
     ocrEngine: args.ocrEngine,
+    ocrMode: args.ocrMode,
   });
   const extractedRevision =
     requestedRevision ??
@@ -360,6 +371,8 @@ export async function indexDocumentVersion(args: {
       indexSchemaVersion: BASELINE_INDEX_SCHEMA_VERSION,
       ocrPages: extracted.ocr_pages,
       ocrEngine: extracted.ocr_engine,
+      ocrScannedPages: extracted.ocr_scanned_pages,
+      ocrTruncated: extracted.ocr_truncated ? 1 : 0,
     });
   });
   replaceChunks();
@@ -368,10 +381,27 @@ export async function indexDocumentVersion(args: {
 export function enqueueDocumentIndex(
   documentId: string,
   versionId?: string | null,
-  options?: { rerunIfActive?: boolean },
+  options?: {
+    rerunIfActive?: boolean;
+    ocrMode?: "full" | "deferred";
+  },
 ): boolean {
   const key = jobKey(documentId, versionId ?? null);
   if (queuedKeys.has(key)) {
+    if (options?.ocrMode === "full") {
+      const existing = queue.find(
+        (job) =>
+          job.documentId === documentId &&
+          job.versionId === (versionId ?? null) &&
+          `${job.context.dbPath}:${job.documentId}:${job.versionId ?? "current"}` ===
+            key,
+      );
+      if (existing) existing.ocrMode = "full";
+      if (activeKeys.has(key)) {
+        fullOcrRerunKeys.add(key);
+        rerunKeys.add(key);
+      }
+    }
     if (options?.rerunIfActive && activeKeys.has(key)) rerunKeys.add(key);
     return false;
   }
@@ -382,6 +412,7 @@ export function enqueueDocumentIndex(
     documentId,
     versionId: versionId ?? null,
     context: getCurrentDatabaseContext(),
+    ocrMode: options?.ocrMode,
   });
   queuedKeys.add(key);
   scheduleQueue();
@@ -393,18 +424,19 @@ async function processQueue(): Promise<void> {
   processing = true;
 
   try {
-    while (queue.length > 0) {
-      const job = queue.shift();
-      if (!job) continue;
-      const key = `${job.context.dbPath}:${job.documentId}:${job.versionId ?? "current"}`;
-      activeKeys.add(key);
+    const worker = async () => {
+      while (queue.length > 0) {
+        const job = queue.shift();
+        if (!job) continue;
+        const key = `${job.context.dbPath}:${job.documentId}:${job.versionId ?? "current"}`;
+        activeKeys.add(key);
 
-      try {
-        await runWithDatabaseContext(job.context, () =>
-          indexDocumentVersion(job),
-        );
-      } catch (err) {
-        await runWithDatabaseContext(job.context, async () => {
+        try {
+          await runWithDatabaseContext(job.context, () =>
+            indexDocumentVersion(job),
+          );
+        } catch (err) {
+          await runWithDatabaseContext(job.context, async () => {
           const dbShim = createServerSupabase();
           const { data: doc } = await dbShim
             .from("documents")
@@ -424,20 +456,32 @@ async function processQueue(): Promise<void> {
               errorMessage: (err as Error).message || "Indexing failed",
             });
           }
-        });
-      } finally {
-        activeKeys.delete(key);
-        queuedKeys.delete(key);
-        if (rerunKeys.delete(key)) {
-          queue.push(job);
-          queuedKeys.add(key);
+          });
+        } finally {
+          activeKeys.delete(key);
+          queuedKeys.delete(key);
+          if (rerunKeys.delete(key)) {
+            if (fullOcrRerunKeys.delete(key)) job.ocrMode = "full";
+            queue.push(job);
+            queuedKeys.add(key);
+          }
         }
       }
-    }
+    };
+    await Promise.all(
+      Array.from({ length: indexConcurrency() }, () => worker()),
+    );
   } finally {
     processing = false;
     notifyDrainIfIdle();
   }
+}
+
+function indexConcurrency(): number {
+  const raw = Number(process.env.DOCKET_INDEX_CONCURRENCY);
+  return Number.isFinite(raw) && raw >= 1
+    ? Math.min(4, Math.floor(raw))
+    : 1;
 }
 
 export type BaselineIndexWorkReason =
@@ -718,9 +762,10 @@ export function cancelProjectIndexing(projectId: string): number {
   let removed = 0;
   for (let i = queue.length - 1; i >= 0; i -= 1) {
     if (!docIds.has(queue[i].documentId)) continue;
-    queuedKeys.delete(
-      `${queue[i].context.dbPath}:${queue[i].documentId}:${queue[i].versionId ?? "current"}`,
-    );
+    const key = `${queue[i].context.dbPath}:${queue[i].documentId}:${queue[i].versionId ?? "current"}`;
+    queuedKeys.delete(key);
+    rerunKeys.delete(key);
+    fullOcrRerunKeys.delete(key);
     queue.splice(i, 1);
     removed += 1;
   }
@@ -746,6 +791,8 @@ export function getProjectIndexStatus(projectId: string): {
   text_bytes: number;
   chunk_count: number;
   ocr_pages: number;
+  ocr_scanned_pages: number;
+  ocr_truncated_documents: number;
   last_indexed_at: string | null;
 } {
   const db = getDb();
@@ -757,6 +804,9 @@ export function getProjectIndexStatus(projectId: string): {
       `
       SELECT f.status, COUNT(*) AS count, SUM(f.text_bytes) AS text_bytes,
              SUM(f.chunk_count) AS chunk_count, SUM(f.ocr_pages) AS ocr_pages,
+             SUM(f.ocr_scanned_pages) AS ocr_scanned_pages,
+             SUM(CASE WHEN f.ocr_truncated = 1 THEN 1 ELSE 0 END)
+               AS ocr_truncated_documents,
              MAX(f.indexed_at) AS last_indexed_at
       FROM document_index_files f
       JOIN documents d ON d.id = f.document_id
@@ -771,6 +821,8 @@ export function getProjectIndexStatus(projectId: string): {
     text_bytes: number | null;
     chunk_count: number | null;
     ocr_pages: number | null;
+    ocr_scanned_pages: number | null;
+    ocr_truncated_documents: number | null;
     last_indexed_at: string | null;
   }[];
 
@@ -778,12 +830,16 @@ export function getProjectIndexStatus(projectId: string): {
   let textBytes = 0;
   let chunkCount = 0;
   let ocrPages = 0;
+  let ocrScannedPages = 0;
+  let ocrTruncatedDocuments = 0;
   let lastIndexedAt: string | null = null;
   for (const row of rows) {
     statusCounts[row.status] = row.count;
     textBytes += row.text_bytes ?? 0;
     chunkCount += row.chunk_count ?? 0;
     ocrPages += row.ocr_pages ?? 0;
+    ocrScannedPages += row.ocr_scanned_pages ?? 0;
+    ocrTruncatedDocuments += row.ocr_truncated_documents ?? 0;
     if (
       row.last_indexed_at &&
       (!lastIndexedAt || row.last_indexed_at > lastIndexedAt)
@@ -803,6 +859,8 @@ export function getProjectIndexStatus(projectId: string): {
     text_bytes: textBytes,
     chunk_count: chunkCount,
     ocr_pages: ocrPages,
+    ocr_scanned_pages: ocrScannedPages,
+    ocr_truncated_documents: ocrTruncatedDocuments,
     last_indexed_at: lastIndexedAt,
   };
 }

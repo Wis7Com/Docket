@@ -1,6 +1,7 @@
 import { Router } from "express";
 import * as fs from "fs";
 import * as path from "path";
+import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
 import {
@@ -27,6 +28,7 @@ import {
   cancelProjectIndexing,
   compactProjectDatabase,
   enqueueDocumentIndex,
+  enqueueEmptyPdfIndexes,
   enqueueProjectIndexRebuild,
   ensureProjectBaselineCurrent,
   getProjectIndexStatus,
@@ -49,8 +51,22 @@ import {
   isImageDocumentType,
   mimeTypeForDocumentType,
 } from "../lib/documentTypes";
+import {
+  docRoleSchema,
+  inferDocRole,
+  inferPartyRole,
+  partyRoleNullableSchema,
+  partySideNullableSchema,
+} from "../lib/documentClassification";
+import {
+  buildProjectDocMeta,
+  fetchProjectAnnotations,
+  parseProjectAnnotationQuery,
+} from "../lib/projectAnnotations";
+import { parseColorLegendEntries } from "../lib/colorLegend";
 
 export const projectsRouter = Router();
+const ocrOverrideSchema = z.union([z.number().int().min(0), z.null()]);
 const ALLOWED_TYPES = new Set([
   "pdf",
   "docx",
@@ -279,6 +295,80 @@ projectsRouter.get("/:projectId", requireAuth, async (req, res) => {
     folders: folderData ?? [],
   });
 });
+
+// GET /projects/:projectId/color-legend
+projectsRouter.get(
+  "/:projectId/color-legend",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { projectId } = req.params;
+    const db = createServerSupabase();
+    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Project not found" });
+
+    const { data, error } = await db
+      .from("project_color_legend")
+      .select("color_family, label, party_role, party_side")
+      .eq("project_id", projectId)
+      .order("color_family", { ascending: true });
+    if (error) return void res.status(500).json({ detail: error.message });
+    res.json({ entries: data ?? [] });
+  },
+);
+
+// PUT /projects/:projectId/color-legend — replace the complete legend.
+projectsRouter.put(
+  "/:projectId/color-legend",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { projectId } = req.params;
+    const db = createServerSupabase();
+    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Project not found" });
+    if (!access.isOwner) {
+      return void res.status(403).json({
+        detail: "Only the project owner can edit the color legend",
+      });
+    }
+
+    const parsed = parseColorLegendEntries(req.body);
+    if (!parsed.ok)
+      return void res.status(400).json({ detail: parsed.detail });
+
+    const { error: deleteError } = await db
+      .from("project_color_legend")
+      .delete()
+      .eq("project_id", projectId);
+    if (deleteError)
+      return void res.status(500).json({ detail: deleteError.message });
+
+    if (parsed.entries.length > 0) {
+      const now = new Date().toISOString();
+      const rows = parsed.entries.map((entry) => ({
+        project_id: projectId,
+        color_family: entry.color_family,
+        label: entry.label,
+        party_role: entry.party_role ?? null,
+        party_side: entry.party_side ?? null,
+        created_at: now,
+        updated_at: now,
+      }));
+      const { error: insertError } = await db
+        .from("project_color_legend")
+        .insert(rows);
+      if (insertError)
+        return void res.status(500).json({ detail: insertError.message });
+    }
+
+    res.json({ entries: parsed.entries });
+  },
+);
 
 // GET /projects/:projectId/index-status
 projectsRouter.get(
@@ -641,6 +731,18 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
   const updates: Record<string, unknown> = {};
   if (req.body.name != null) updates.name = req.body.name;
   if (req.body.cm_number != null) updates.cm_number = req.body.cm_number;
+  if (Object.hasOwn(req.body, "ocr_max_pages_override")) {
+    const parsed = ocrOverrideSchema.safeParse(
+      req.body.ocr_max_pages_override,
+    );
+    if (!parsed.success) {
+      return void res.status(400).json({
+        detail:
+          "ocr_max_pages_override must be a non-negative integer or null",
+      });
+    }
+    updates.ocr_max_pages_override = parsed.data;
+  }
 
   const db = createServerSupabase();
   const { data, error } = await db
@@ -652,6 +754,9 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
     .single();
   if (error || !data)
     return void res.status(404).json({ detail: "Project not found" });
+  if (Object.hasOwn(updates, "ocr_max_pages_override")) {
+    enqueueEmptyPdfIndexes(projectId);
+  }
 
   const registryUpdates = {
     name: (data.name as string | undefined) ?? null,
@@ -717,6 +822,69 @@ projectsRouter.get("/:projectId/documents", requireAuth, async (req, res) => {
   }[];
   await attachActiveVersionPaths(db, docsTyped);
   res.json(docsTyped);
+});
+
+// GET /projects/:projectId/annotations
+// Read the current user's annotations across every document in the project.
+projectsRouter.get("/:projectId/annotations", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const userEmail = res.locals.userEmail as string | undefined;
+  const { projectId } = req.params;
+  const db = createServerSupabase();
+
+  const access = await checkProjectAccess(projectId, userId, userEmail, db);
+  if (!access.ok)
+    return void res.status(404).json({ detail: "Project not found" });
+
+  const parsed = parseProjectAnnotationQuery({
+    color_family: parseCsvQuery(req.query.color_family),
+    // Keep document IDs opaque and case-preserving.
+    doc_id: req.query.doc_id,
+    annotation_type: req.query.annotation_type,
+    has_comment: req.query.has_comment,
+    source: req.query.source,
+    order: req.query.order,
+    limit: req.query.limit,
+    offset: req.query.offset,
+    party_role: req.query.party_role,
+    party_side: req.query.party_side,
+    party: req.query.party,
+  });
+  if (!parsed.ok)
+    return void res.status(400).json({ detail: parsed.detail });
+
+  const [{ data: docs, error }, { data: folderRows }] = await Promise.all([
+    db
+      .from("documents")
+      .select(
+        "id, filename, current_version_id, folder_id, party_role, party_side",
+      )
+      .eq("project_id", projectId),
+    db
+      .from("project_subfolders")
+      .select("id, name, parent_folder_id")
+      .eq("project_id", projectId),
+  ]);
+  if (error) return void res.status(500).json({ detail: error.message });
+
+  const documents = buildProjectDocMeta(
+    (docs ?? []) as unknown as Parameters<typeof buildProjectDocMeta>[0],
+    (folderRows ?? []) as unknown as Parameters<typeof buildProjectDocMeta>[1],
+  );
+
+  try {
+    const result = await fetchProjectAnnotations({
+      db,
+      userId,
+      documents,
+      query: parsed.value,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({
+      detail: (err as Error).message || "Could not list project annotations",
+    });
+  }
 });
 
 // Documents enter a project only through its local source folders.
@@ -882,6 +1050,103 @@ projectsRouter.patch(
   },
 );
 
+projectsRouter.post(
+  "/:projectId/documents/:documentId/ocr",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { projectId, documentId } = req.params;
+    const db = createServerSupabase();
+    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Project not found" });
+
+    const { data: document } = await db
+      .from("documents")
+      .select("id, current_version_id")
+      .eq("id", documentId)
+      .eq("project_id", projectId)
+      .single();
+    const versionId = document?.current_version_id as string | null | undefined;
+    if (!versionId)
+      return void res.status(404).json({ detail: "Document not found" });
+
+    enqueueDocumentIndex(documentId, versionId, {
+      ocrMode: "full",
+      rerunIfActive: true,
+    });
+    res.status(202).json({
+      document_id: documentId,
+      version_id: versionId,
+      status: "queued",
+      ocr_mode: "full",
+    });
+  },
+);
+
+projectsRouter.patch(
+  "/:projectId/documents/:documentId/classification",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { projectId, documentId } = req.params;
+    const db = createServerSupabase();
+    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Project not found" });
+
+    const update: Record<string, unknown> = {
+      updated_at: new Date().toISOString(),
+    };
+    if ("doc_role" in req.body) {
+      const parsed = docRoleSchema.safeParse(req.body.doc_role);
+      if (!parsed.success)
+        return void res.status(400).json({ detail: "Invalid doc_role" });
+      update.doc_role = parsed.data;
+      update.doc_role_confidence = "manual";
+    }
+    if ("party_role" in req.body) {
+      const parsed = partyRoleNullableSchema.safeParse(req.body.party_role);
+      if (!parsed.success)
+        return void res.status(400).json({ detail: "Invalid party_role" });
+      update.party_role = parsed.data;
+    }
+    if ("party_side" in req.body) {
+      const parsed = partySideNullableSchema.safeParse(req.body.party_side);
+      if (!parsed.success)
+        return void res.status(400).json({ detail: "Invalid party_side" });
+      update.party_side = parsed.data;
+    }
+    if ("instance" in req.body) {
+      const value = req.body.instance;
+      if (
+        value !== null &&
+        (typeof value !== "string" || value.trim().length > 40)
+      ) {
+        return void res.status(400).json({ detail: "Invalid instance" });
+      }
+      update.instance =
+        typeof value === "string" ? value.trim() || null : value;
+    }
+    if (Object.keys(update).length === 1) {
+      return void res.status(400).json({ detail: "No classification fields" });
+    }
+
+    const { data, error } = await db
+      .from("documents")
+      .update(update)
+      .eq("id", documentId)
+      .eq("project_id", projectId)
+      .select("*")
+      .single();
+    if (error || !data)
+      return void res.status(404).json({ detail: "Document not found" });
+    res.json(data);
+  },
+);
+
 // DELETE /projects/:projectId/folders/:folderId
 projectsRouter.delete(
   "/:projectId/folders/:folderId",
@@ -983,6 +1248,8 @@ export async function handleDocumentUpload(
     }
   }
 
+  const roleGuess = inferDocRole({ filename });
+  const partyGuess = inferPartyRole({ filename });
   const { data: doc, error: insertErr } = await db
     .from("documents")
     .insert({
@@ -992,6 +1259,9 @@ export async function handleDocumentUpload(
       file_type: suffix,
       size_bytes: content.byteLength,
       status: "processing",
+      doc_role: roleGuess.role,
+      doc_role_confidence: roleGuess.confidence,
+      ...(partyGuess ? { party_role: partyGuess.role } : {}),
     })
     .select("*")
     .single();
@@ -1025,6 +1295,10 @@ export async function handleDocumentUpload(
         : isImageDocumentType(suffix)
           ? 1
           : null;
+    const pageAwareRoleGuess =
+      roleGuess.confidence === "low"
+        ? inferDocRole({ filename, pageCount })
+        : roleGuess;
 
     // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;
@@ -1077,6 +1351,8 @@ export async function handleDocumentUpload(
         current_version_id: versionRow.id,
         size_bytes: content.byteLength,
         page_count: pageCount,
+        doc_role: pageAwareRoleGuess.role,
+        doc_role_confidence: pageAwareRoleGuess.confidence,
         structure_tree: tree ?? null,
         status: "ready",
         updated_at: new Date().toISOString(),

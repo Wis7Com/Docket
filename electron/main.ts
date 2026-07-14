@@ -2357,6 +2357,7 @@ async function inspectRealPromptCitationDom(
         function diagnostics() {
           const viewer = document.querySelector('[data-session-check="doc-view"]');
           const citationButton = document.querySelector('[data-session-check="assistant-citation-button"][data-citation-ref="1"]');
+          const scroll = viewer?.querySelector('[data-session-check="doc-view-scroll"]');
           return {
             readyState: document.readyState,
             url: location.href,
@@ -2368,39 +2369,78 @@ async function inspectRealPromptCitationDom(
             openedDocId: viewer?.getAttribute("data-document-id") ?? null,
             canvasCount: viewer?.querySelectorAll("canvas").length ?? 0,
             tempHighlights: viewer?.querySelectorAll(".pdf-text-highlight").length ?? 0,
+            scrollTop: scroll?.scrollTop ?? null,
+            visiblePages: viewer
+              ? Array.from(viewer.querySelectorAll("[data-pdf-page-number]"))
+                  .filter((page) => {
+                    if (!scroll) return false;
+                    const pageRect = page.getBoundingClientRect();
+                    const scrollRect = scroll.getBoundingClientRect();
+                    return pageRect.bottom > scrollRect.top && pageRect.top < scrollRect.bottom;
+                  })
+                  .map((page) => page.getAttribute("data-pdf-page-number"))
+              : [],
           };
         }
-        // Clicking a freshly-streamed citation can land before React has
-        // committed the answer message's click handler, so the first click is
-        // occasionally a no-op and the viewer never opens. Re-dispatch the
-        // click while polling for the viewer, exactly as a user would click
-        // again when nothing happened.
-        async function openViaCitation() {
-          const deadline = Date.now() + 30000;
-          let clicks = 0;
-          while (Date.now() < deadline) {
-            const button = document.querySelector('[data-session-check="assistant-citation-button"][data-citation-ref="1"]');
-            if (button && (clicks === 0 || !document.querySelector('[data-session-check="doc-view"]'))) {
-              button.click();
-              clicks += 1;
-            }
-            const view = document.querySelector('[data-session-check="doc-view"]');
-            if (view) return view;
-            await new Promise((resolve) => setTimeout(resolve, 500));
-          }
-          throw new Error("timed out waiting for real prompt citation viewer after " + clicks + " clicks: " + JSON.stringify(diagnostics()));
+        function pageIsVisible(scroll, page) {
+          const pageRect = page.getBoundingClientRect();
+          const scrollRect = scroll.getBoundingClientRect();
+          return pageRect.bottom > scrollRect.top && pageRect.top < scrollRect.bottom;
         }
-        await waitFor("real prompt citation button before click", () =>
+        const citation = await waitFor("real prompt citation button before click", () =>
           document.querySelector('[data-session-check="assistant-citation-button"][data-citation-ref="1"]'),
           30000,
           diagnostics,
         );
-        const viewer = await openViaCitation();
-        await waitFor("real prompt PDF canvas", () => viewer.querySelector("canvas"), 30000, diagnostics);
+        citation.click();
+        const viewer = await waitFor("real prompt citation viewer after first click", () =>
+          document.querySelector('[data-session-check="doc-view"]'),
+          30000,
+          diagnostics,
+        );
+        const scroll = await waitFor("real prompt PDF scroll container", () =>
+          viewer.querySelector('[data-session-check="doc-view-scroll"]'),
+          30000,
+          diagnostics,
+        );
+        const citedPage = await waitFor("first citation click navigates to page 2", () => {
+          const target = viewer.querySelector('[data-pdf-page-number="2"]');
+          return target &&
+            target.querySelector("canvas") &&
+            pageIsVisible(scroll, target)
+            ? target
+            : null;
+        }, 30000, diagnostics);
         const tempHighlights = await waitFor("real prompt temporary citation highlight", () => {
           const items = Array.from(viewer.querySelectorAll(".pdf-text-highlight"));
           return items.length > 0 ? items : null;
         }, 30000, diagnostics);
+
+        const awayPage = await waitFor("page 4 placeholder before scrolling away", () =>
+          viewer.querySelector('[data-pdf-page-number="4"]'),
+          30000,
+          diagnostics,
+        );
+        awayPage.scrollIntoView({ behavior: "instant", block: "start" });
+        await waitFor("citation page leaves the viewport", () =>
+          !pageIsVisible(scroll, citedPage) ? true : null,
+          30000,
+          diagnostics,
+        );
+
+        const sameCitation = await waitFor("same citation button after scrolling away", () =>
+          document.querySelector('[data-session-check="assistant-citation-button"][data-citation-ref="1"]'),
+          30000,
+          diagnostics,
+        );
+        sameCitation.click();
+        await waitFor("same citation returns to page 2", () =>
+          pageIsVisible(scroll, citedPage) && viewer.querySelector(".pdf-text-highlight")
+            ? citedPage
+            : null,
+          30000,
+          diagnostics,
+        );
         const openedDocId = document.querySelector('[data-session-check="doc-view"]')?.getAttribute("data-document-id");
         if (openedDocId && openedDocId !== ${JSON.stringify(setup.docId)}) {
           throw new Error("citation opened wrong document: " + openedDocId);
@@ -2686,13 +2726,18 @@ async function inspectGeneratedPdfAnnotations(url: string): Promise<{
 }
 
 async function startSession(activeProjectPath: string | null): Promise<void> {
-  sessionSecret = crypto.randomBytes(32).toString("hex");
-  sessionJwt = signLocalJwt(
-    sessionSecret,
-    LOCAL_USER_ID,
-    LOCAL_USER_EMAIL,
-    JWT_TTL_SECONDS,
-  );
+  // Folder access changes restart the backend, but they do not start a new
+  // desktop session. Keep the renderer's cached token valid across that
+  // restart so the first request does not have to fail with 401 and retry.
+  if (!sessionSecret || !sessionJwt) {
+    sessionSecret = crypto.randomBytes(32).toString("hex");
+    sessionJwt = signLocalJwt(
+      sessionSecret,
+      LOCAL_USER_ID,
+      LOCAL_USER_EMAIL,
+      JWT_TTL_SECONDS,
+    );
+  }
   const downloadSecret = crypto.randomBytes(32).toString("hex");
 
   const appData = app.getPath("userData");

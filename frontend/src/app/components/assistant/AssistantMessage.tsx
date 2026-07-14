@@ -19,6 +19,10 @@ import { PreResponseWrapper } from "../shared/PreResponseWrapper";
 import { supabase } from "@/lib/supabase";
 import { getApiBase } from "@/app/lib/docketApi";
 import { preprocessCitations } from "./citations";
+import {
+    shouldActivateCitationOnClick,
+    shouldActivateCitationOnPointerDown,
+} from "../shared/citationNavigation";
 
 /**
  * Card rendered above the per-edit EditCards when a message produced
@@ -473,6 +477,60 @@ function DocReadBlock({
     );
 }
 
+function DocSummaryBlock({
+    filename,
+    completedBatches,
+    totalBatches,
+    coverage,
+    showConnector,
+    isStreaming,
+}: {
+    filename: string;
+    completedBatches: number;
+    totalBatches: number;
+    coverage?: Extract<AssistantEvent, { type: "doc_summary" }>["coverage"];
+    showConnector?: boolean;
+    isStreaming?: boolean;
+}) {
+    const pageRanges = coverage?.indexedPageRanges
+        .map((range) =>
+            range.start === range.end
+                ? String(range.start)
+                : `${range.start}–${range.end}`,
+        )
+        .join(", ");
+    return (
+        <div className="flex items-start text-sm font-serif text-gray-500 relative">
+            {showConnector && (
+                <div className="absolute bottom-0 w-[1px] bg-gray-300 top-[13px] left-[2.5px] h-[calc(100%+11px)]" />
+            )}
+            {isStreaming ? (
+                <div className="mt-2 w-1.5 h-1.5 rounded-full border border-gray-400 border-t-transparent animate-spin shrink-0" />
+            ) : (
+                <div
+                    className={`mt-2 w-1.5 h-1.5 rounded-full shrink-0 ${coverage?.complete ? "bg-green-400" : "bg-amber-400"}`}
+                />
+            )}
+            <div className="ml-2 min-w-0 flex-1 whitespace-normal break-words">
+                <span className="font-medium">
+                    {isStreaming ? "Summarizing" : "Summarized"}
+                </span>{" "}
+                <span>{filename}</span>
+                {isStreaming && totalBatches > 0 ? (
+                    <span>{` · batch ${completedBatches}/${totalBatches}`}</span>
+                ) : coverage ? (
+                    <span>
+                        {` · pages ${pageRanges || "unknown"} · ${coverage.processedChunkCount}/${coverage.indexedChunkCount} chunks`}
+                        {coverage.complete
+                            ? " · complete index coverage"
+                            : " · partial index coverage"}
+                    </span>
+                ) : null}
+            </div>
+        </div>
+    );
+}
+
 function DocFindBlock({
     filename,
     query,
@@ -562,7 +620,11 @@ function DocReplicatedBlock({
 }) {
     const label = isStreaming ? "Replicating" : "Replicated";
     const suffix =
-        !isStreaming && count > 1 ? ` ${count} times` : isStreaming ? "..." : "";
+        !isStreaming && count > 1
+            ? ` ${count} times`
+            : isStreaming
+              ? "..."
+              : "";
     return (
         <div className="flex items-start text-sm font-serif text-gray-500 relative">
             {showConnector && (
@@ -628,7 +690,9 @@ function DocDownloadBlock({
         };
     }, [isSafeHref]);
     const href =
-        isSafeHref && resolvedApiBase ? `${resolvedApiBase}${download_url}` : null;
+        isSafeHref && resolvedApiBase
+            ? `${resolvedApiBase}${download_url}`
+            : null;
     const [busy, setBusy] = useState(false);
 
     const handleDownload = async (e?: {
@@ -923,7 +987,8 @@ function MarkdownContent({
                     ),
                     code: ({ node, children, ...props }) => {
                         const text = String(children);
-                        const unresolvedMatch = text.match(/^§unresolved:(\d+)§$/);
+                        const unresolvedMatch =
+                            text.match(/^§unresolved:(\d+)§$/);
                         if (unresolvedMatch) {
                             return (
                                 <span
@@ -943,12 +1008,40 @@ function MarkdownContent({
                                 const tooltipText = `${formatCitationPage(annotation)}: "${displayCitationQuote(annotation)}"`;
                                 return (
                                     <button
+                                        type="button"
                                         data-session-check="assistant-citation-button"
                                         data-citation-index={idx}
                                         data-citation-ref={annotation.ref}
                                         data-document-id={annotation.document_id}
-                                        onClick={() => {
+                                        onPointerDown={(event) => {
+                                            if (
+                                                !shouldActivateCitationOnPointerDown(
+                                                    event,
+                                                )
+                                            )
+                                                return;
+                                            event.currentTarget.dataset.citationPointerActivated =
+                                                "true";
                                             onCitationClick?.(annotation);
+                                        }}
+                                        onPointerCancel={(event) => {
+                                            delete event.currentTarget.dataset
+                                                .citationPointerActivated;
+                                        }}
+                                        onClick={(event) => {
+                                            const pointerActivated =
+                                                event.currentTarget.dataset
+                                                    .citationPointerActivated ===
+                                                "true";
+                                            delete event.currentTarget.dataset
+                                                .citationPointerActivated;
+                                            if (
+                                                shouldActivateCitationOnClick({
+                                                    pointerActivated,
+                                                })
+                                            ) {
+                                                onCitationClick?.(annotation);
+                                            }
                                         }}
                                         className="mx-0.5 inline-flex items-center justify-center rounded-full w-4 h-4 text-[10px] font-medium transition-colors align-super bg-gray-100 text-gray-900 hover:bg-gray-200"
                                         title={tooltipText}
@@ -1265,6 +1358,19 @@ export function AssistantMessage({
                 />
             );
         }
+        if (event.type === "doc_summary") {
+            return (
+                <DocSummaryBlock
+                    key={globalIdx}
+                    filename={event.filename}
+                    completedBatches={event.completed_batches}
+                    totalBatches={event.total_batches}
+                    coverage={event.coverage}
+                    isStreaming={event.isStreaming}
+                    showConnector={showConnector}
+                />
+            );
+        }
         if (event.type === "doc_find") {
             return (
                 <DocFindBlock
@@ -1331,7 +1437,7 @@ export function AssistantMessage({
     };
 
     return (
-        <div style={{ minHeight }}>
+        <div data-session-check="assistant-message" style={{ minHeight }}>
             <ResponseStatus status={status} />
             <div className="w-full font-inter relative mt-2">
                 {events && events.length > 0 ? (

@@ -198,6 +198,33 @@ async function writeSamplePdf(filePath) {
   fs.writeFileSync(filePath, Buffer.from(bytes));
 }
 
+async function writePromptCitationPdf(filePath) {
+  const { PDFDocument, StandardFonts } = require(
+    path.join(root, "backend", "node_modules", "pdf-lib"),
+  );
+  const pdf = await PDFDocument.create();
+  const font = await pdf.embedFont(StandardFonts.Helvetica);
+  for (let pageNumber = 1; pageNumber <= 4; pageNumber += 1) {
+    const page = pdf.addPage([612, 792]);
+    page.drawText(`Session prompt fixture page ${pageNumber}.`, {
+      x: 72,
+      y: 720,
+      size: 12,
+      font,
+    });
+    if (pageNumber === 2) {
+      page.drawText("Session check source clause for citation promotion.", {
+        x: 72,
+        y: 680,
+        size: 12,
+        font,
+      });
+    }
+  }
+  const bytes = await pdf.save();
+  fs.writeFileSync(filePath, Buffer.from(bytes));
+}
+
 // A two-page PDF with no /Outlines (bookmarks) but visually distinct numbered
 // headings (large font) over body text — the shape the heuristic outline
 // generator is meant to detect. Returns raw bytes.
@@ -244,7 +271,7 @@ async function buildOutlineFixturePdfBytes() {
 }
 
 async function writePromptSourceFolder(rootDir) {
-  await writeSamplePdf(path.join(rootDir, "00-session-source.pdf"));
+  await writePromptCitationPdf(path.join(rootDir, "00-session-source.pdf"));
   for (let i = 1; i <= 20; i += 1) {
     const name = String(i).padStart(2, "0");
     fs.writeFileSync(

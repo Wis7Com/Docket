@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
     PROJECT_SYSTEM_PROMPT_EXTRA,
     PROJECT_ANNOTATION_TOOL_PROMPT,
+    buildProjectColorLegendPrompt,
     buildSourceScopePrompt,
     buildRequestedAnnotationContext,
     describeAnnotationColor,
@@ -17,21 +18,107 @@ test("project prompt includes the issue-by-issue comparison workflow", () => {
     assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /one row per issue/);
 });
 
+test("project prompt requires exhaustive summarization instead of one generic search", () => {
+    assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /WHOLE-DOCUMENT SUMMARY RULE/);
+    assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /call summarize_document/);
+    assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /every indexed chunk/);
+    assert.match(
+        PROJECT_SYSTEM_PROMPT_EXTRA,
+        /Never treat a single generic search_project_documents or find_in_document result as a whole-document summary/,
+    );
+    assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /never claim complete coverage/);
+});
+
 test("annotation prompt requires the dedicated tool instead of document search", () => {
-    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /MUST call get_user_pdf_annotations/);
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /MUST call get_user_pdf_annotations/,
+    );
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /hilighted/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /하이라이트/);
-    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /Never substitute search_project_documents/);
-    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /first call.*without color or document filters/s);
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /Never substitute search_project_documents/,
+    );
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /first call.*without color or document filters/s,
+    );
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /next_offset/);
-    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /summary is computed over the complete filtered result set/);
-    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /do not accumulate every raw annotation/);
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /summary is computed over the complete filtered result set/,
+    );
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /do not accumulate every raw annotation/,
+    );
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /read_annotation_context/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /indexed_quote/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /chunk_id/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /user's current message/);
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /PROJECT COLOR LEGEND/);
     assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /colors exact-hex filter/);
-    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /user notes.*not document facts/);
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /user notes.*not document facts/,
+    );
+});
+
+test("buildProjectColorLegendPrompt formats persisted entries", async () => {
+    const db = {
+        from(table: string) {
+            assert.equal(table, "project_color_legend");
+            return {
+                select(fields: string) {
+                    assert.match(fields, /party_role/);
+                    return this;
+                },
+                eq(field: string, value: string) {
+                    assert.equal(field, "project_id");
+                    assert.equal(value, "project-a");
+                    return this;
+                },
+                async order() {
+                    return {
+                        data: [
+                            {
+                                color_family: "green",
+                                label: "다툼 없는 사실",
+                                party_role: "피고",
+                                party_side: null,
+                            },
+                        ],
+                    };
+                },
+            };
+        },
+    };
+
+    const prompt = await buildProjectColorLegendPrompt({
+        db: db as never,
+        projectId: "project-a",
+    });
+    assert.match(prompt ?? "", /- green \(피고\): 다툼 없는 사실/);
+});
+
+test("buildProjectColorLegendPrompt omits empty query results", async () => {
+    const chain = {
+        select() {
+            return this;
+        },
+        eq() {
+            return this;
+        },
+        async order() {
+            return { data: [] };
+        },
+    };
+    const prompt = await buildProjectColorLegendPrompt({
+        db: { from: () => chain } as never,
+        projectId: "project-a",
+    });
+    assert.equal(prompt, null);
 });
 
 test("selected document scope ignores injected ids and fails open only for empty intersections", () => {
@@ -73,14 +160,20 @@ test("requestsAnnotationContext recognizes user-defined color emphasis prompts",
         ),
         true,
     );
-    assert.equal(requestsAnnotationContext("Find the red flags in this agreement"), false);
+    assert.equal(
+        requestsAnnotationContext("Find the red flags in this agreement"),
+        false,
+    );
     assert.equal(
         requestsAnnotationContext(
             "빨간 색은 원고 주장, 파란 색은 피고 주장이니까 annotation을 대비한 표를 만들어",
         ),
         true,
     );
-    assert.equal(requestsAnnotationContext("내가 comment 남긴 항목들을 정리해"), true);
+    assert.equal(
+        requestsAnnotationContext("내가 comment 남긴 항목들을 정리해"),
+        true,
+    );
     assert.equal(
         requestsAnnotationContext("회색은 다툼 없는 사실이니 표로 만들어"),
         true,
@@ -178,7 +271,8 @@ test("buildRequestedAnnotationContext includes and filters annotation color meta
                 version_id: "version-a",
             },
         },
-        latestUserText: "빨간색으로 하이라이트한 부분은 caveat이니까 강조점으로 요약해",
+        latestUserText:
+            "빨간색으로 하이라이트한 부분은 caveat이니까 강조점으로 요약해",
         displayedDoc: {
             document_id: "doc-outside",
             filename: "outside.pdf",

@@ -11,6 +11,7 @@ import {
   expectedDimensionsForSettings,
   readUserEmbeddingSettings,
 } from "./embeddings";
+import { DOC_ROLES, PARTY_ROLES } from "../documentClassification";
 
 function normalizeQuery(query: string): string {
   return query.normalize("NFC").trim().replace(/\s+/g, " ");
@@ -259,6 +260,9 @@ export async function searchProjectIndex(args: {
   fileTypes?: string[];
   folderId?: string | null;
   documentIds?: string[];
+  docRoles?: string[];
+  partyRoles?: string[];
+  partySides?: string[];
   group?: "chunks" | "documents";
 }): Promise<SearchResult[]> {
   const query = normalizeQuery(args.query);
@@ -293,6 +297,29 @@ export async function searchProjectIndex(args: {
   if (documentIds.length > 0) {
     filterSql.push(`AND d.id IN (${documentIds.map(() => "?").join(", ")})`);
     filterValues.push(...documentIds);
+  }
+  const validDocRoles = new Set<string>(DOC_ROLES);
+  const docRoles = (args.docRoles ?? [])
+    .map((role) => role.trim().toLowerCase())
+    .filter((role) => validDocRoles.has(role));
+  if (docRoles.length > 0) {
+    filterSql.push(`AND d.doc_role IN (${docRoles.map(() => "?").join(", ")})`);
+    filterValues.push(...docRoles);
+  }
+  const validPartyRoles = new Set<string>(PARTY_ROLES);
+  const partyRoles = (args.partyRoles ?? [])
+    .map((role) => role.trim())
+    .filter((role) => validPartyRoles.has(role));
+  if (partyRoles.length > 0) {
+    filterSql.push(`AND d.party_role IN (${partyRoles.map(() => "?").join(", ")})`);
+    filterValues.push(...partyRoles);
+  }
+  const partySides = (args.partySides ?? [])
+    .map((side) => side.trim().toUpperCase())
+    .filter((side) => side === "A" || side === "B");
+  if (partySides.length > 0) {
+    filterSql.push(`AND d.party_side IN (${partySides.map(() => "?").join(", ")})`);
+    filterValues.push(...partySides);
   }
   const filters = filterSql.length
     ? `\n          ${filterSql.join("\n          ")}`
@@ -992,6 +1019,54 @@ export function listProjectIndexGaps(
     version_id: string | null;
     filename: string;
     file_type: string | null;
+  }[];
+}
+
+export function listProjectPartialOcr(
+  projectId: string,
+  options?: { documentIds?: string[] },
+): {
+  document_id: string;
+  version_id: string | null;
+  filename: string;
+  file_type: string | null;
+  ocr_pages: number;
+  ocr_scanned_pages: number;
+}[] {
+  const documentIds = (options?.documentIds ?? [])
+    .map((id) => id.trim())
+    .filter(Boolean);
+  const documentFilter = documentIds.length
+    ? `AND d.id IN (${documentIds.map(() => "?").join(", ")})`
+    : "";
+  return getDb()
+    .prepare(
+      `
+      SELECT d.id AS document_id,
+             d.current_version_id AS version_id,
+             d.filename,
+             d.file_type,
+             f.ocr_pages,
+             f.ocr_scanned_pages
+      FROM documents d
+      JOIN document_index_files f
+        ON f.document_id = d.id
+       AND f.version_id = d.current_version_id
+      WHERE d.project_id = ?
+        AND d.status = 'ready'
+        AND d.current_version_id IS NOT NULL
+        AND f.ocr_truncated = 1
+        ${documentFilter}
+      ORDER BY (f.ocr_scanned_pages - f.ocr_pages) DESC
+    `,
+    )
+    .all(projectId, ...documentIds) as {
+    document_id: string;
+    version_id: string | null;
+    filename: string;
+    file_type: string | null;
+    ocr_pages: number;
+    ocr_scanned_pages: number;
   }[];
 }
 

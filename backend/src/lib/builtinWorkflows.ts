@@ -27,7 +27,7 @@ export const BUILTIN_WORKFLOWS: { id: string; title: string; prompt_md: string }
             "Compare two or more selected documents, or two sides' briefs, issue-by-issue. If it is unclear which documents or sides the user wants compared, ask once before proceeding.\n\n" +
             "Use this retrieval sequence:\n" +
             "1. Identify the comparison documents or sides from AVAILABLE DOCUMENTS or with list_documents.\n" +
-            "2. Discover the issue list with one or two broad search_project_documents calls, or by skimming opening sections with read_index_chunk.\n" +
+            "2. Discover the issue list with one or two broad search_project_documents calls using doc_roles:['brief'] unless the user explicitly includes evidence, or by skimming opening sections with read_index_chunk.\n" +
             "3. For every issue, run the same search_project_documents query once per document or side using doc_ids scoping.\n" +
             "4. Verify every quotation and page reference with read_index_chunk before citing it.\n" +
             "5. Produce a table whose rows are issues and whose columns are the compared documents or sides. Each cell must give the document's position or key point plus page citations; say when a document is silent on an issue rather than inventing a position.\n\n" +

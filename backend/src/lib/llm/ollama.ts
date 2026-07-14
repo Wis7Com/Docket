@@ -29,10 +29,23 @@ type OllamaChatResponse = {
 
 type OllamaChatStreamChunk = OllamaChatResponse & {
   done?: boolean;
+  done_reason?: string;
+  prompt_eval_count?: number;
+  eval_count?: number;
+  total_duration?: number;
+  load_duration?: number;
 };
 
 const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
 const OLLAMA_RESPONSE_START_TIMEOUT_ENV = "OLLAMA_RESPONSE_START_TIMEOUT_MS";
+// Measured against gemma4:12b on Korean/English legal text: ~1.9-2.0 chars per
+// token (delta method, prompt_eval_count). 2.5 over-fills batches for CJK-heavy
+// input; 1.9 keeps a small safety margin. Override with OLLAMA_CHARS_PER_TOKEN.
+const DEFAULT_OLLAMA_CHARS_PER_TOKEN = 1.9;
+const DEFAULT_OLLAMA_MAX_NUM_CTX = 16_384;
+const DEFAULT_OLLAMA_NUM_PREDICT = 1_024;
+const OLLAMA_CONTEXT_SAFETY_OVERHEAD = 768;
+const OLLAMA_CONTEXT_BUCKETS = [4_096, 8_192, 16_384, 32_768] as const;
 
 type OllamaResponse = {
   response: Response;
@@ -55,15 +68,63 @@ function ollamaBaseUrl(): string {
   ).replace(/\/+$/, "");
 }
 
-async function postOllamaChat(
-  body: Record<string, unknown>,
-): Promise<OllamaChatResponse> {
-  const { response } = await postOllamaChatResponse(body);
-  return (await response.json()) as OllamaChatResponse;
+function positiveNumberFromEnv(name: string): number | null {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function positiveIntegerFromEnv(name: string): number | null {
+  const parsed = positiveNumberFromEnv(name);
+  return parsed !== null && Number.isInteger(parsed) ? parsed : null;
+}
+
+export function resolveOllamaCharsPerToken(): number {
+  return (
+    positiveNumberFromEnv("OLLAMA_CHARS_PER_TOKEN") ??
+    DEFAULT_OLLAMA_CHARS_PER_TOKEN
+  );
+}
+
+export function resolveOllamaMaxNumCtx(): number {
+  return Math.min(
+    OLLAMA_CONTEXT_BUCKETS.at(-1)!,
+    Math.max(
+      OLLAMA_CONTEXT_BUCKETS[0],
+      positiveIntegerFromEnv("OLLAMA_MAX_NUM_CTX") ??
+        DEFAULT_OLLAMA_MAX_NUM_CTX,
+    ),
+  );
+}
+
+export function resolveOllamaContextWindow(): number {
+  return positiveIntegerFromEnv("OLLAMA_NUM_CTX") ?? resolveOllamaMaxNumCtx();
+}
+
+export function resolveOllamaNumCtx(params: {
+  promptChars: number;
+  maxTokens?: number;
+}): number {
+  const hardOverride = positiveIntegerFromEnv("OLLAMA_NUM_CTX");
+  if (hardOverride !== null) return hardOverride;
+
+  const estimatedPromptTokens = Math.ceil(
+    Math.max(0, params.promptChars) / resolveOllamaCharsPerToken(),
+  );
+  const needed =
+    estimatedPromptTokens +
+    Math.max(0, params.maxTokens ?? DEFAULT_OLLAMA_NUM_PREDICT) +
+    OLLAMA_CONTEXT_SAFETY_OVERHEAD;
+  const bucket =
+    OLLAMA_CONTEXT_BUCKETS.find((candidate) => candidate >= needed) ??
+    OLLAMA_CONTEXT_BUCKETS.at(-1)!;
+  return Math.min(resolveOllamaMaxNumCtx(), bucket);
 }
 
 async function postOllamaChatResponse(
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<OllamaResponse> {
   const model = typeof body.model === "string" ? body.model : "unknown";
   const baseUrl = ollamaBaseUrl();
@@ -72,6 +133,7 @@ async function postOllamaChatResponse(
     provider: "ollama",
     model,
     providerOverrideEnv: OLLAMA_RESPONSE_START_TIMEOUT_ENV,
+    signal,
     init: {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -112,13 +174,17 @@ async function readOllamaStream(params: {
   response: OllamaResponse;
   onThinking: (text: string) => void;
   onContent: (text: string) => void;
-}): Promise<NormalizedToolCall[]> {
+}): Promise<{
+  toolCalls: NormalizedToolCall[];
+  finalChunk: OllamaChatStreamChunk | null;
+}> {
   const reader = params.response.response.body?.getReader();
   if (!reader) throw new Error("Ollama chat returned no stream body");
 
   const decoder = new TextDecoder();
   let buffer = "";
   let toolCalls: NormalizedToolCall[] = [];
+  let finalChunk: OllamaChatStreamChunk | null = null;
 
   const applyLine = (line: string): void => {
     const trimmed = line.trim();
@@ -130,6 +196,7 @@ async function readOllamaStream(params: {
     if (content) params.onContent(content);
     const nextToolCalls = normalizeToolCalls(parsed.message?.tool_calls);
     if (nextToolCalls.length) toolCalls = nextToolCalls;
+    if (parsed.done) finalChunk = parsed;
   };
 
   while (true) {
@@ -153,12 +220,13 @@ async function readOllamaStream(params: {
 
   const tail = buffer.trim();
   if (tail) applyLine(tail);
-  return toolCalls;
+  return { toolCalls, finalChunk };
 }
 
 export async function streamOllama(
   params: StreamChatParams,
 ): Promise<StreamChatResult> {
+  params.signal?.throwIfAborted();
   const { tools = [], callbacks = {}, runTools, enableThinking } = params;
   const messages = toOllamaMessages(params);
   const maxIter = params.maxIterations ?? 10;
@@ -166,16 +234,19 @@ export async function streamOllama(
   let fullText = "";
 
   for (let iter = 0; iter < maxIter; iter++) {
-    const response = await postOllamaChatResponse({
-      model,
-      messages,
-      stream: true,
-      tools: tools.length ? tools : undefined,
-      think: enableThinking ? "high" : false,
-    });
+    const response = await postOllamaChatResponse(
+      {
+        model,
+        messages,
+        stream: true,
+        tools: tools.length ? tools : undefined,
+        think: enableThinking ? "high" : false,
+      },
+      params.signal,
+    );
     let sawThinking = false;
     let content = "";
-    const toolCalls = await readOllamaStream({
+    const { toolCalls } = await readOllamaStream({
       response,
       onThinking: (delta) => {
         sawThinking = true;
@@ -217,17 +288,65 @@ export async function completeOllamaText(params: {
   model: string;
   systemPrompt?: string;
   user: string;
+  maxTokens?: number;
+  responseJsonSchema?: Record<string, unknown>;
+  think?: boolean;
+  signal?: AbortSignal;
 }): Promise<string> {
-  const resp = await postOllamaChat({
-    model: ollamaModelName(params.model),
-    messages: [
-      ...(params.systemPrompt
-        ? [{ role: "system", content: params.systemPrompt }]
-        : []),
-      { role: "user", content: params.user },
-    ],
-    stream: false,
-    think: false,
+  const startedAt = Date.now();
+  const model = ollamaModelName(params.model);
+  const promptChars = (params.systemPrompt?.length ?? 0) + params.user.length;
+  const numPredict = params.maxTokens ?? DEFAULT_OLLAMA_NUM_PREDICT;
+  const numCtx = resolveOllamaNumCtx({
+    promptChars,
+    maxTokens: numPredict,
   });
-  return resp.message?.content ?? "";
+  let finalChunk: OllamaChatStreamChunk | null = null;
+
+  try {
+    const response = await postOllamaChatResponse(
+      {
+        model,
+        messages: [
+          ...(params.systemPrompt
+            ? [{ role: "system", content: params.systemPrompt }]
+            : []),
+          { role: "user", content: params.user },
+        ],
+        stream: true,
+        think: params.think ? "high" : false,
+        ...(params.think ? {} : { format: params.responseJsonSchema }),
+        keep_alive: process.env.OLLAMA_KEEP_ALIVE || "10m",
+        options: {
+          temperature: 0,
+          num_ctx: numCtx,
+          num_predict: numPredict,
+        },
+      },
+      params.signal,
+    );
+    let content = "";
+    const result = await readOllamaStream({
+      response,
+      onThinking: () => undefined,
+      onContent: (delta) => {
+        content += delta;
+      },
+    });
+    finalChunk = result.finalChunk;
+    return content;
+  } finally {
+    console.info("[ollama/complete]", {
+      model,
+      num_ctx: numCtx,
+      num_predict: numPredict,
+      prompt_chars: promptChars,
+      prompt_eval_count: finalChunk?.prompt_eval_count,
+      eval_count: finalChunk?.eval_count,
+      total_duration: finalChunk?.total_duration,
+      load_duration: finalChunk?.load_duration,
+      done_reason: finalChunk?.done_reason,
+      elapsed_ms: Date.now() - startedAt,
+    });
+  }
 }

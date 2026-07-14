@@ -26,6 +26,9 @@ export async function completeText(params: {
   systemPrompt?: string;
   user: string;
   maxTokens?: number;
+  responseJsonSchema?: Record<string, unknown>;
+  think?: boolean;
+  signal?: AbortSignal;
   apiKeys?: UserApiKeys;
 }): Promise<string> {
   const provider = providerForModel(params.model);

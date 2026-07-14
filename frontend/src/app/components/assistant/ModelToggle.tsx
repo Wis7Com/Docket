@@ -121,6 +121,7 @@ export function ModelToggle({ value, onChange, apiKeys }: Props) {
       <DropdownMenuTrigger asChild>
         <button
           type="button"
+          data-session-check="model-toggle"
           className={`flex items-center gap-1.5 rounded-lg px-2 h-8 text-sm transition-colors cursor-pointer text-gray-400 hover:bg-gray-100 hover:text-gray-700 ${isOpen ? "bg-gray-100 text-gray-700" : ""}`}
           title={
             !selectedAvailable
@@ -154,6 +155,8 @@ export function ModelToggle({ value, onChange, apiKeys }: Props) {
                 return (
                   <DropdownMenuItem
                     key={m.id}
+                    data-session-check="model-option"
+                    data-model-id={m.id}
                     className="cursor-pointer"
                     onSelect={() => onChange(m.id)}
                   >

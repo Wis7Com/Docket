@@ -12,13 +12,16 @@ import type {
   DocketDocument,
   DocketFolder,
   DocketMessage,
+  AnnotationColorFamily,
   PdfAnnotation,
   PdfAnnotationRect,
+  ProjectAnnotationsResponse,
   DocketProject,
   DocketWorkflow,
   TabularReview,
   TabularReviewDetailOut,
 } from "@/app/components/shared/types";
+import { buildProjectAnnotationQueryString } from "@/app/components/projects/projectAnnotationBrowser.logic";
 
 // Server-side shape before mapping
 interface ServerMessage {
@@ -193,6 +196,8 @@ export interface ProjectIndexStatus {
   text_bytes: number;
   chunk_count: number;
   ocr_pages: number;
+  ocr_scanned_pages?: number;
+  ocr_truncated_documents?: number;
   last_indexed_at: string | null;
   semantic?: {
     enabled: boolean;
@@ -207,6 +212,21 @@ export interface ProjectIndexStatus {
     total_vectors: number;
     last_error: string | null;
   };
+}
+
+export async function requestFullDocumentOcr(
+  projectId: string,
+  documentId: string,
+): Promise<{
+  document_id: string;
+  version_id: string;
+  status: "queued";
+  ocr_mode: "full";
+}> {
+  return apiRequest(
+    `/projects/${projectId}/documents/${documentId}/ocr`,
+    { method: "POST" },
+  );
 }
 
 export interface ProjectSearchResult {
@@ -388,6 +408,26 @@ export async function moveDocumentToFolder(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ folder_id: folderId }),
+    },
+  );
+}
+
+export async function updateDocumentClassification(
+  projectId: string,
+  documentId: string,
+  patch: {
+    doc_role?: "brief" | "evidence" | "other";
+    party_role?: string | null;
+    party_side?: "A" | "B" | null;
+    instance?: string | null;
+  },
+): Promise<DocketDocument> {
+  return apiRequest<DocketDocument>(
+    `/projects/${projectId}/documents/${documentId}/classification`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
     },
   );
 }
@@ -608,6 +648,51 @@ export async function listPdfAnnotations(
   return apiRequest<PdfAnnotation[]>(
     `/single-documents/${documentId}/annotations${qs}`,
   );
+}
+
+export type ProjectAnnotationFilters = {
+  colorFamily?: AnnotationColorFamily[];
+  docId?: string[];
+  annotationType?: "highlight" | "comment";
+  hasComment?: boolean;
+  source?: "user" | "citation_promotion";
+  order?: "position" | "recent";
+  limit?: number;
+  offset?: number;
+};
+
+export async function listProjectAnnotations(
+  projectId: string,
+  filters: ProjectAnnotationFilters = {},
+): Promise<ProjectAnnotationsResponse> {
+  const query = buildProjectAnnotationQueryString(filters);
+  return apiRequest<ProjectAnnotationsResponse>(
+    `/projects/${projectId}/annotations${query ? `?${query}` : ""}`,
+  );
+}
+
+export interface ColorLegendEntry {
+  color_family: AnnotationColorFamily;
+  label: string;
+  party_role: string | null;
+  party_side: "A" | "B" | null;
+}
+
+export async function getProjectColorLegend(
+  projectId: string,
+): Promise<{ entries: ColorLegendEntry[] }> {
+  return apiRequest(`/projects/${projectId}/color-legend`);
+}
+
+export async function putProjectColorLegend(
+  projectId: string,
+  entries: ColorLegendEntry[],
+): Promise<{ entries: ColorLegendEntry[] }> {
+  return apiRequest(`/projects/${projectId}/color-legend`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entries }),
+  });
 }
 
 export async function createPdfAnnotation(

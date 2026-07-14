@@ -987,7 +987,7 @@ test("project document search paginates and opens results at the matched page", 
   );
   assert.match(
     projectPage,
-    /const payload: DocumentViewerPayload = \{\s*documentId: doc\.id,\s*filename: options\.filename \|\| doc\.filename,\s*versionId: version\?\.id \?\? null,\s*versionLabel: version\?\.label \?\? null,\s*searchQuote: searchTarget\?\.quote \?\? null,\s*searchPage: searchTarget\?\.page \?\? null,\s*searchKey: searchTarget\?\.key \?\? null,\s*annotationId: annotation\?\.id \?\? null,\s*projectId,\s*\}/,
+    /const payload: DocumentViewerPayload = \{\s*documentId: doc\.id,\s*filename: options\.filename \|\| doc\.filename,\s*versionId: version\?\.id \?\? null,\s*versionLabel: version\?\.label \?\? null,\s*searchQuote: searchTarget\?\.quote \?\? null,\s*searchPage: searchTarget\?\.page \?\? null,\s*searchKey: searchTarget\?\.key \?\? null,\s*annotationId: annotation\?\.id \?\? annotationTarget\?\.id \?\? null,\s*projectId,\s*\}/,
     "Electron search-result opening should pass the matched quote, page, chunk key, annotation focus, and project to the native viewer window",
   );
   assert.match(
@@ -1014,6 +1014,24 @@ test("project document search paginates and opens results at the matched page", 
     modal,
     /quotes=\{searchQuotes\}/,
     "the document modal should pass the search quote to PDF and DOCX viewers",
+  );
+});
+
+test("project page wires the cross-document annotation browser to viewer focus", () => {
+  const projectPage = fs.readFileSync(
+    new URL("../projects/ProjectPage.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(
+    projectPage,
+    /<ProjectAnnotationBrowser/,
+    "the project documents area should expose the all-highlights browser",
+  );
+  assert.match(
+    projectPage,
+    /openDocumentViewer\(doc, \{ annotationTarget: target \}\)/,
+    "annotation browser rows should use the shared viewer opener",
   );
 });
 

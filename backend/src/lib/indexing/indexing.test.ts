@@ -6,7 +6,7 @@ import * as os from "os";
 import * as path from "path";
 import { closeDb, getDb, runWithDatabaseContext } from "../../db/sqlite";
 import { runMigrations } from "../../db/migrate";
-import { chunkTextForIndex } from "./extractors";
+import { chunkTextForIndex, resolveIndexSource } from "./extractors";
 import {
   setEmbeddingAdapterOverrideForTests,
   vectorToBlob,
@@ -92,6 +92,37 @@ test("chunkTextForIndex keeps PDF page metadata and overlapping chunk order", ()
   assert.equal(chunks[1].chunk_index, 1);
   assert.ok(chunks[0].content.includes("word0"));
   assert.ok(chunks[1].content.includes("word450"));
+});
+
+test("resolveIndexSource prefers the PDF rendition for DOCX and DOC", () => {
+  assert.deepEqual(
+    resolveIndexSource("docx", {
+      storage_path: "raw.docx",
+      pdf_storage_path: "rendition.pdf",
+    }),
+    { storagePath: "rendition.pdf", indexFileType: "pdf" },
+  );
+  assert.deepEqual(
+    resolveIndexSource("DOC", {
+      storage_path: "raw.doc",
+      pdf_storage_path: "rendition.pdf",
+    }),
+    { storagePath: "rendition.pdf", indexFileType: "pdf" },
+  );
+  assert.deepEqual(
+    resolveIndexSource("docx", {
+      storage_path: "raw.docx",
+      pdf_storage_path: null,
+    }),
+    { storagePath: "raw.docx", indexFileType: "docx" },
+  );
+  assert.deepEqual(
+    resolveIndexSource("pdf", {
+      storage_path: "source.pdf",
+      pdf_storage_path: "unused.pdf",
+    }),
+    { storagePath: "source.pdf", indexFileType: "pdf" },
+  );
 });
 
 test("searchProjectIndex returns current-version project chunks only", async () => {

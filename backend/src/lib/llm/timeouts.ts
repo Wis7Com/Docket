@@ -94,7 +94,9 @@ export async function fetchWithResponseStartTimeout(params: {
   provider: string;
   model: string;
   providerOverrideEnv: string;
+  signal?: AbortSignal;
 }): Promise<{ response: Response; controller: AbortController }> {
+  params.signal?.throwIfAborted();
   const startedAt = Date.now();
   const controller = new AbortController();
   const timeoutMs = resolveResponseStartTimeoutMs({
@@ -112,7 +114,9 @@ export async function fetchWithResponseStartTimeout(params: {
   try {
     const response = await fetch(params.url, {
       ...params.init,
-      signal: controller.signal,
+      signal: params.signal
+        ? AbortSignal.any([controller.signal, params.signal])
+        : controller.signal,
     });
     console.info("[llm/response-start]", {
       provider: params.provider,

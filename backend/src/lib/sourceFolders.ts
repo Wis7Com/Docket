@@ -6,6 +6,7 @@ import { docxToPdf } from "./convert";
 import { enqueueDocumentIndex } from "./indexing/indexer";
 import { linkedSourceKey, uploadFile } from "./storage";
 import { isAllowedDocumentType } from "./documentTypes";
+import { inferDocRole, inferPartyRole } from "./documentClassification";
 
 type Supa = ReturnType<typeof createServerSupabase>;
 
@@ -383,6 +384,14 @@ export async function scanSourceFolder(args: {
       continue;
     }
 
+    const roleGuess = inferDocRole({
+      folderName: path.dirname(relativePath),
+      filename: path.basename(realFile),
+    });
+    const partyGuess = inferPartyRole({
+      folderName: path.dirname(relativePath),
+      filename: path.basename(realFile),
+    });
     const { data: doc, error: docErr } = await args.db
       .from("documents")
       .insert({
@@ -392,6 +401,9 @@ export async function scanSourceFolder(args: {
         file_type: fileType,
         size_bytes: stat.size,
         status: "processing",
+        doc_role: roleGuess.role,
+        doc_role_confidence: roleGuess.confidence,
+        ...(partyGuess ? { party_role: partyGuess.role } : {}),
       })
       .select("*")
       .single();

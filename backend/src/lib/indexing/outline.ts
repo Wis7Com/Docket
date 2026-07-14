@@ -422,7 +422,13 @@ export function buildChunkSearchText(
 
 export async function extractStructuredPdfText(
   raw: ArrayBuffer,
-  options: { ocr?: { engine: OcrEngine; maxPages: number } } = {},
+  options: {
+    ocr?: {
+      engine: OcrEngine;
+      maxPages: number;
+      deferLargeScans?: boolean;
+    };
+  } = {},
 ): Promise<StructuredIndexText> {
   try {
     const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs" as string);
@@ -464,19 +470,24 @@ export async function extractStructuredPdfText(
     let globalOffset = 0;
     let ocrAttempts = 0;
     let ocrPages = 0;
+    let scannedPagesSeen = 0;
     const ocrRegions: NonNullable<StructuredIndexText["ocr_regions"]> = [];
     try {
       for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
         const page = await pdf.getPage(pageNumber);
         const content = await page.getTextContent();
         let reconstructed = reconstructPdfPageText(content);
-        if (
-          reconstructed.text.trim().length < 10 &&
-          options.ocr &&
-          ocrAttempts < Math.max(0, options.ocr.maxPages)
-        ) {
-          ocrAttempts += 1;
-          try {
+        if (reconstructed.text.trim().length < 10 && options.ocr) {
+          scannedPagesSeen += 1;
+          const deferred =
+            options.ocr.deferLargeScans === true && pdf.numPages > 50;
+          // A small scan is processed immediately, but an explicit positive
+          // project/user cap still applies. The normal default (100) already
+          // covers every page of a <=50-page scan; only zero means unlimited.
+          const unlimited = options.ocr.maxPages <= 0;
+          if (!deferred && (unlimited || ocrAttempts < options.ocr.maxPages)) {
+            ocrAttempts += 1;
+            try {
             const baseViewport = page.getViewport({ scale: 1 });
             const dpiScale = 200 / 72;
             const scale = Math.min(
@@ -526,8 +537,9 @@ export async function extractStructuredPdfText(
                 };
               }),
             };
-          } catch (err) {
-            console.warn(`[ocr] page ${pageNumber} failed`, err);
+            } catch (err) {
+              console.warn(`[ocr] page ${pageNumber} failed`, err);
+            }
           }
         }
         const pageText = `[Page ${pageNumber}]\n${reconstructed.text}`;
@@ -556,6 +568,8 @@ export async function extractStructuredPdfText(
       ocr_pages: ocrPages,
       ocr_engine: ocrPages > 0 ? (options.ocr?.engine.name ?? null) : null,
       ocr_regions: ocrRegions,
+      ocr_scanned_pages: scannedPagesSeen,
+      ocr_truncated: scannedPagesSeen > ocrAttempts,
     };
   } catch {
     return {
@@ -565,6 +579,8 @@ export async function extractStructuredPdfText(
       ocr_pages: 0,
       ocr_engine: null,
       ocr_regions: [],
+      ocr_scanned_pages: 0,
+      ocr_truncated: false,
     };
   }
 }

@@ -47,6 +47,7 @@ export function RowActions({ onDelete, onHide, onUnhide, onDownload, onExportAnn
     return (
         <>
             <button
+                data-session-check="row-actions-trigger"
                 ref={btnRef}
                 onClick={handleToggle}
                 className="flex items-center justify-center w-6 h-6 rounded text-gray-700 hover:text-gray-900 hover:bg-gray-100 transition-colors leading-none"

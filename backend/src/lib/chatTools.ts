@@ -14,16 +14,27 @@ import {
     type EditInput,
 } from "./docxTrackedChanges";
 import { buildDownloadUrl } from "./downloadTokens";
-import { attachActiveVersionPaths, loadActiveVersion } from "./documentVersions";
+import {
+    attachActiveVersionPaths,
+    loadActiveVersion,
+} from "./documentVersions";
 import {
     streamChatWithTools,
     resolveModel,
     DEFAULT_MAIN_MODEL,
     type LlmMessage,
     type OpenAIToolSchema,
+    type UserApiKeys,
 } from "./llm";
 import {
+    summarizeDocumentWithCoverage,
+    type DocumentSummaryChunk,
+    type DocumentSummaryCoverage,
+} from "./documentSummary";
+import { createSqliteDocumentSummaryBatchCache } from "./documentSummaryCache";
+import {
     listProjectIndexGaps,
+    listProjectPartialOcr,
     readProjectIndexChunk,
     searchProjectIndex,
 } from "./indexing/search";
@@ -41,6 +52,9 @@ import {
     classifyAnnotationColor,
     type AnnotationColorFamily,
 } from "./annotationColors";
+import type { DocRole, PartyRole } from "./documentClassification";
+
+export const SYSTEM_PROMPT_MAX_DOC_LIST = 200;
 
 const STANDARD_FONT_DATA_URL = (() => {
     try {
@@ -69,6 +83,9 @@ export type DocIndex = Record<
         filename: string;
         version_id?: string | null;
         version_number?: number | null;
+        doc_role?: DocRole;
+        party_role?: PartyRole | null;
+        party_side?: "A" | "B" | null;
     }
 >;
 
@@ -76,7 +93,10 @@ export type TabularCellStore = {
     columns: { index: number; name: string }[];
     documents: { id: string; filename: string }[];
     /** key: `${colIndex}:${docId}` */
-    cells: Map<string, { summary: string; flag?: string; reasoning?: string } | null>;
+    cells: Map<
+        string,
+        { summary: string; flag?: string; reasoning?: string } | null
+    >;
 };
 
 export type ToolCall = {
@@ -106,7 +126,8 @@ export function filterToolsByDisabled(
 ): unknown[] {
     const disabled = new Set(
         (disabledTools ?? []).filter(
-            (name): name is string => typeof name === "string" && name.length > 0,
+            (name): name is string =>
+                typeof name === "string" && name.length > 0,
         ),
     );
     return tools.filter((tool) => {
@@ -180,6 +201,21 @@ GENERAL GUIDANCE:
 - Do not use emojis in your responses.
 `;
 
+const LOCAL_MODEL_CITATION_REMINDER = `FINAL RESPONSE CITATION CHECK:
+Before finishing an answer that uses document content, add a sequential [N] marker immediately after every supported claim and append the required <CITATIONS> JSON block at the very end. Copy the exact chat-local doc_id and a short exact quote from the tool result. Do not merely name a source document in prose without a verified marker. Omit a claim rather than inventing a citation.`;
+
+export function systemPromptForModel(
+    systemPrompt: string,
+    model: string,
+): string {
+    return model.startsWith("ollama:") ||
+        model.startsWith("ollama/") ||
+        model.startsWith("free-router:") ||
+        model.startsWith("free-router/")
+        ? `${systemPrompt}\n\n${LOCAL_MODEL_CITATION_REMINDER}`
+        : systemPrompt;
+}
+
 export const PROJECT_EXTRA_TOOLS = [
     {
         type: "function",
@@ -210,14 +246,25 @@ export const PROJECT_EXTRA_TOOLS = [
                         type: "array",
                         items: {
                             type: "string",
-                            enum: ["red", "yellow", "green", "blue", "orange", "pink", "purple", "gray"],
+                            enum: [
+                                "red",
+                                "yellow",
+                                "green",
+                                "blue",
+                                "orange",
+                                "pink",
+                                "purple",
+                                "gray",
+                            ],
                         },
-                        description: "Optional computed color-family filters. Multiple values are ORed.",
+                        description:
+                            "Optional computed color-family filters. Multiple values are ORed.",
                     },
                     colors: {
                         type: "array",
                         items: { type: "string" },
-                        description: "Optional exact hex colors such as ['#feffa0'].",
+                        description:
+                            "Optional exact hex colors such as ['#feffa0'].",
                     },
                     source: {
                         type: "string",
@@ -226,23 +273,97 @@ export const PROJECT_EXTRA_TOOLS = [
                     },
                     has_comment: {
                         type: "boolean",
-                        description: "Whether the annotation has a non-empty user comment.",
+                        description:
+                            "Whether the annotation has a non-empty user comment.",
                     },
                     offset: {
                         type: "integer",
                         minimum: 0,
-                        description: "Zero-based pagination offset. Defaults to 0.",
+                        description:
+                            "Zero-based pagination offset. Defaults to 0.",
                     },
                     order: {
                         type: "string",
                         enum: ["position", "recent"],
-                        description: "Stable document position order (default) or newest first.",
+                        description:
+                            "Stable document position order (default) or newest first.",
                     },
                     limit: {
                         type: "integer",
                         minimum: 1,
                         maximum: 100,
-                        description: "Maximum annotations to return. Defaults to 30.",
+                        description:
+                            "Maximum annotations to return. Defaults to 30.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
+            name: "get_annotation_digest",
+            description:
+                "Collect an exhaustive, server-paged digest of saved PDF annotations in one tool call. Use this for item-by-item lists, exports, audits, or synthesis that must cover hundreds of annotations. The complete filtered summary is returned even when the item hard cap requires a follow-up cursor.",
+            parameters: {
+                type: "object",
+                properties: {
+                    color_family: {
+                        type: "array",
+                        items: {
+                            type: "string",
+                            enum: [
+                                "red",
+                                "yellow",
+                                "green",
+                                "blue",
+                                "orange",
+                                "pink",
+                                "purple",
+                                "gray",
+                            ],
+                        },
+                        description:
+                            "Optional computed color-family filters. Multiple values are ORed.",
+                    },
+                    annotation_type: {
+                        type: "string",
+                        enum: ["highlight", "comment"],
+                        description: "Optional annotation type filter.",
+                    },
+                    has_comment: {
+                        type: "boolean",
+                        description:
+                            "Whether the annotation has a non-empty user comment.",
+                    },
+                    doc_ids: {
+                        type: "array",
+                        items: { type: "string" },
+                        description:
+                            "Optional chat-local document IDs such as ['doc-0'].",
+                    },
+                    party_roles: {
+                        type: "array",
+                        items: { type: "string" },
+                        description:
+                            "Optional exact document party designations such as ['피고'] or ['defendant']. Use a persisted color-legend party binding here.",
+                    },
+                    party_sides: {
+                        type: "array",
+                        items: { type: "string", enum: ["A", "B"] },
+                        description:
+                            "Optional stable party sides for judge-bound cross-instance identities.",
+                    },
+                    grounded: {
+                        type: "boolean",
+                        description:
+                            "Attach indexed_quote and chunk_id evidence to every locatable item. Defaults to true.",
+                    },
+                    cursor: {
+                        type: "integer",
+                        minimum: 0,
+                        description:
+                            "Zero-based continuation cursor returned by a previous digest call.",
                     },
                 },
             },
@@ -261,13 +382,15 @@ export const PROJECT_EXTRA_TOOLS = [
                         type: "array",
                         items: { type: "string" },
                         maxItems: 20,
-                        description: "Annotation IDs returned by get_user_pdf_annotations.",
+                        description:
+                            "Annotation IDs returned by get_user_pdf_annotations.",
                     },
                     radius: {
                         type: "integer",
                         minimum: 1,
                         maximum: 2000,
-                        description: "Characters to return on each side. Defaults to 600.",
+                        description:
+                            "Characters to return on each side. Defaults to 600.",
                     },
                 },
                 required: ["annotation_ids"],
@@ -330,6 +453,27 @@ export const PROJECT_EXTRA_TOOLS = [
                         description:
                             "For initial broad discovery, return at most one best raw chunk per document so more distinct documents are considered. Default false. Follow with doc_ids-scoped chunk searches for evidence.",
                     },
+                    doc_roles: {
+                        type: "array",
+                        items: {
+                            type: "string",
+                            enum: ["brief", "evidence", "other"],
+                        },
+                        description:
+                            "Optional role filter. For substantive briefs only (증거 제외), pass ['brief'].",
+                    },
+                    party_roles: {
+                        type: "array",
+                        items: { type: "string" },
+                        description:
+                            "Optional party filter using the document's actual designation, such as 원고, 피고, 항소인, plaintiff, defendant, or appellant. Never remap appellate roles.",
+                    },
+                    party_sides: {
+                        type: "array",
+                        items: { type: "string", enum: ["A", "B"] },
+                        description:
+                            "Optional stable party identity across instances, when the judge has assigned side A or B.",
+                    },
                 },
                 required: ["query"],
             },
@@ -346,15 +490,18 @@ export const PROJECT_EXTRA_TOOLS = [
                 properties: {
                     document_id: {
                         type: "string",
-                        description: "The Docket document UUID returned by search_project_documents.",
+                        description:
+                            "The Docket document UUID returned by search_project_documents.",
                     },
                     version_id: {
                         type: "string",
-                        description: "The document version UUID returned by search_project_documents.",
+                        description:
+                            "The document version UUID returned by search_project_documents.",
                     },
                     chunk_index: {
                         type: "integer",
-                        description: "The chunk index returned by search_project_documents.",
+                        description:
+                            "The chunk index returned by search_project_documents.",
                     },
                     neighbors: {
                         type: "integer",
@@ -372,8 +519,7 @@ export const PROJECT_EXTRA_TOOLS = [
         type: "function",
         function: {
             name: "fetch_documents",
-            description:
-                `Read the full text content of selected documents in a single call. Use only for up to ${FULL_READ_MAX_DOCS} specifically selected documents, and prefer search_project_documents for broad project questions.`,
+            description: `Read the full text content of selected documents in a single call. Use only for up to ${FULL_READ_MAX_DOCS} specifically selected documents, and prefer search_project_documents for broad project questions.`,
             parameters: {
                 type: "object",
                 properties: {
@@ -483,9 +629,38 @@ export const TOOLS = [
     {
         type: "function",
         function: {
+            name: "summarize_document",
+            description:
+                "Create an evidence-grounded whole-document summary by processing every indexed chunk in page order and then synthesizing the batch summaries. MUST be used for requests to summarize, review, outline, or explain an entire document; do not replace it with one generic search_project_documents/find_in_document query. Returns explicit page/chunk coverage, OCR warnings, a prepared summary, and source-exact citations.",
+            parameters: {
+                type: "object",
+                properties: {
+                    doc_id: {
+                        type: "string",
+                        description:
+                            "The selected document slug from AVAILABLE DOCUMENTS (for example doc-3).",
+                    },
+                    focus: {
+                        type: "string",
+                        description:
+                            "Optional user-requested emphasis. Leave empty for a general whole-document summary.",
+                    },
+                    language: {
+                        type: "string",
+                        description:
+                            "Desired response language, such as Korean or English. Match the user's language when omitted.",
+                    },
+                },
+                required: ["doc_id"],
+            },
+        },
+    },
+    {
+        type: "function",
+        function: {
             name: "read_document",
             description:
-                "Read the full text content of a document attached by the user. Always call this before answering questions about, summarising, or citing from a document.",
+                "Read the full text content of a short document attached by the user. For a whole-document summary, review, outline, or explanation, call summarize_document instead so long documents are processed page-by-page rather than rejected by the full-read budget.",
             parameters: {
                 type: "object",
                 properties: {
@@ -544,25 +719,43 @@ export const TOOLS = [
                 properties: {
                     title: {
                         type: "string",
-                        description: "Document title (used as filename and heading)",
+                        description:
+                            "Document title (used as filename and heading)",
                     },
                     landscape: {
                         type: "boolean",
-                        description: "Set to true for landscape page orientation. Default is portrait.",
+                        description:
+                            "Set to true for landscape page orientation. Default is portrait.",
                     },
                     sections: {
                         type: "array",
-                        description: "List of document sections. Each section may contain a heading, prose content, or a table.",
+                        description:
+                            "List of document sections. Each section may contain a heading, prose content, or a table.",
                         items: {
                             type: "object",
                             properties: {
-                                heading: { type: "string", description: "Optional section heading" },
-                                level: { type: "integer", description: "Heading level: 1, 2, or 3" },
-                                content: { type: "string", description: "Prose text content (paragraphs separated by double newlines)" },
-                                pageBreak: { type: "boolean", description: "Set to true to start this section on a new page. Use for contract signature pages." },
+                                heading: {
+                                    type: "string",
+                                    description: "Optional section heading",
+                                },
+                                level: {
+                                    type: "integer",
+                                    description: "Heading level: 1, 2, or 3",
+                                },
+                                content: {
+                                    type: "string",
+                                    description:
+                                        "Prose text content (paragraphs separated by double newlines)",
+                                },
+                                pageBreak: {
+                                    type: "boolean",
+                                    description:
+                                        "Set to true to start this section on a new page. Use for contract signature pages.",
+                                },
                                 table: {
                                     type: "object",
-                                    description: "Optional table to render in this section",
+                                    description:
+                                        "Optional table to render in this section",
                                     properties: {
                                         headers: {
                                             type: "array",
@@ -575,7 +768,8 @@ export const TOOLS = [
                                                 type: "array",
                                                 items: { type: "string" },
                                             },
-                                            description: "Array of rows, each row is an array of cell strings matching the headers order",
+                                            description:
+                                                "Array of rows, each row is an array of cell strings matching the headers order",
                                         },
                                     },
                                     required: ["headers", "rows"],
@@ -614,22 +808,31 @@ export const TOOLS = [
                                 },
                                 replace: {
                                     type: "string",
-                                    description: "Replacement text. Empty string = pure deletion.",
+                                    description:
+                                        "Replacement text. Empty string = pure deletion.",
                                 },
                                 context_before: {
                                     type: "string",
-                                    description: "~40 chars immediately preceding `find`, used to disambiguate.",
+                                    description:
+                                        "~40 chars immediately preceding `find`, used to disambiguate.",
                                 },
                                 context_after: {
                                     type: "string",
-                                    description: "~40 chars immediately following `find`.",
+                                    description:
+                                        "~40 chars immediately following `find`.",
                                 },
                                 reason: {
                                     type: "string",
-                                    description: "Short explanation shown to the user on the card.",
+                                    description:
+                                        "Short explanation shown to the user on the card.",
                                 },
                             },
-                            required: ["find", "replace", "context_before", "context_after"],
+                            required: [
+                                "find",
+                                "replace",
+                                "context_before",
+                                "context_after",
+                            ],
                         },
                     },
                 },
@@ -830,6 +1033,10 @@ export async function enrichWithPriorEvents(
             lines.push(
                 `- read_document → ${refFor(ev.document_id, ev.filename)}`,
             );
+        } else if (ev?.type === "doc_summary") {
+            lines.push(
+                `- summarize_document → ${refFor(ev.document_id, ev.filename)}`,
+            );
         } else if (ev?.type === "doc_replicated") {
             // The model needs to know what each copy resolved to so it
             // can call edit_document / read_document on them. Emit one
@@ -878,7 +1085,14 @@ export async function enrichWithPriorEvents(
 
 export function buildMessages(
     messages: ChatMessage[],
-    docAvailability: { doc_id: string; filename: string; folder_path?: string }[],
+    docAvailability: {
+        doc_id: string;
+        filename: string;
+        folder_path?: string;
+        doc_role?: DocRole;
+        party_role?: PartyRole | null;
+        party_side?: "A" | "B" | null;
+    }[],
     systemPromptExtra?: string,
     docIndex?: DocIndex,
 ) {
@@ -891,12 +1105,24 @@ export function buildMessages(
 
     if (docAvailability.length) {
         systemContent += "\n\n---\nAVAILABLE DOCUMENTS:\n";
-        for (const doc of docAvailability) {
-            const label = doc.folder_path ? `${doc.folder_path} / ${doc.filename}` : doc.filename;
-            systemContent += `- ${doc.doc_id}: ${label}\n`;
+        const shown = docAvailability.slice(0, SYSTEM_PROMPT_MAX_DOC_LIST);
+        for (const doc of shown) {
+            const label = doc.folder_path
+                ? `${doc.folder_path} / ${doc.filename}`
+                : doc.filename;
+            const tags: string[] = [];
+            if (doc.doc_role) tags.push(`role=${doc.doc_role}`);
+            if (doc.party_role) tags.push(`party=${doc.party_role}`);
+            if (doc.party_side) tags.push(`side=${doc.party_side}`);
+            const suffix = tags.length ? `  [${tags.join(", ")}]` : "";
+            systemContent += `- ${doc.doc_id}: ${label}${suffix}\n`;
+        }
+        const hiddenCount = docAvailability.length - shown.length;
+        if (hiddenCount > 0) {
+            systemContent += `- …외 ${hiddenCount}개 문서(목록 생략). 전체 접근은 search_project_documents를 사용하세요.\n`;
         }
         systemContent +=
-            "\nYou do NOT retain document content between conversation turns. For project-wide questions, call search_project_documents first and cite from returned chunks or targeted follow-up reads. Use read_document/fetch_documents only for specifically selected short documents; full reads are intentionally bounded for performance and accuracy.\n---\n";
+            "\nYou do NOT retain document content between conversation turns. For project-wide questions, call search_project_documents first and cite from returned chunks or targeted follow-up reads. Use read_document/fetch_documents only for specifically selected short documents; full reads are intentionally bounded for performance and accuracy. For substantive briefs only (증거 제외), pass doc_roles:['brief']; use party_roles with the user's exact designation, and party_sides only for judge-bound cross-instance identities.\n---\n";
     }
     formatted.push({ role: "system", content: systemContent });
 
@@ -920,9 +1146,7 @@ export function buildMessages(
                 const slug = f.document_id
                     ? slugByDocumentId.get(f.document_id)
                     : undefined;
-                return slug
-                    ? `- ${slug}: ${f.filename}`
-                    : `- ${f.filename}`;
+                return slug ? `- ${slug}: ${f.filename}` : `- ${f.filename}`;
             });
             content = `[The user attached the following document(s) to this message:\n${lines.join("\n")}]\n\n${content}`;
         }
@@ -968,9 +1192,7 @@ export async function extractPdfText(buf: ArrayBuffer): Promise<string> {
 }
 
 export function meaningfulPdfTextLength(text: string): number {
-    return text
-        .replace(/^\s*\[Page\s+\d+\]\s*$/gim, "")
-        .replace(/\s+/g, "")
+    return text.replace(/^\s*\[Page\s+\d+\]\s*$/gim, "").replace(/\s+/g, "")
         .length;
 }
 
@@ -981,10 +1203,15 @@ export function reassembleIndexedDocumentText(
     const db = getDb();
     const resolvedVersionId =
         versionId ??
-        (db
-            .prepare("SELECT current_version_id FROM documents WHERE id = ?")
-            .get(documentId) as { current_version_id?: string | null } | undefined)
-            ?.current_version_id;
+        (
+            db
+                .prepare(
+                    "SELECT current_version_id FROM documents WHERE id = ?",
+                )
+                .get(documentId) as
+                | { current_version_id?: string | null }
+                | undefined
+        )?.current_version_id;
     if (!resolvedVersionId) return "";
 
     const ocr = db
@@ -992,7 +1219,9 @@ export function reassembleIndexedDocumentText(
             `SELECT ocr_pages FROM document_index_files
              WHERE document_id = ? AND version_id = ? AND status = 'ready'`,
         )
-        .get(documentId, resolvedVersionId) as { ocr_pages: number } | undefined;
+        .get(documentId, resolvedVersionId) as
+        | { ocr_pages: number }
+        | undefined;
     if (!ocr || ocr.ocr_pages <= 0) return "";
 
     const chunks = db
@@ -1015,14 +1244,18 @@ export function reassembleIndexedDocumentText(
     for (const chunk of chunks) {
         const page = pages.get(chunk.page_number) ?? { text: "", end: -1 };
         const overlap = Math.max(0, page.end - chunk.start_char);
-        const suffix = chunk.content.slice(Math.min(overlap, chunk.content.length));
+        const suffix = chunk.content.slice(
+            Math.min(overlap, chunk.content.length),
+        );
         page.text += `${page.text && suffix ? " " : ""}${suffix}`;
         page.end = Math.max(page.end, chunk.end_char);
         pages.set(chunk.page_number, page);
     }
     return [...pages.entries()]
         .map(([pageNumber, page]) =>
-            pageNumber === null ? page.text.trim() : `[Page ${pageNumber}]\n${page.text.trim()}`,
+            pageNumber === null
+                ? page.text.trim()
+                : `[Page ${pageNumber}]\n${page.text.trim()}`,
         )
         .filter(Boolean)
         .join("\n\n");
@@ -1037,30 +1270,50 @@ export async function generateDocx(
 ) {
     try {
         const {
-            Document, Paragraph, HeadingLevel, Packer,
-            Table, TableRow, TableCell, WidthType, BorderStyle,
-            TextRun, AlignmentType, PageOrientation, PageBreak,
+            Document,
+            Paragraph,
+            HeadingLevel,
+            Packer,
+            Table,
+            TableRow,
+            TableCell,
+            WidthType,
+            BorderStyle,
+            TextRun,
+            AlignmentType,
+            PageOrientation,
+            PageBreak,
         } = await import("docx");
 
         const FONT = "Times New Roman";
         const SIZE = 22; // 11pt in half-points
 
-        type DocChild = InstanceType<typeof Paragraph> | InstanceType<typeof Table>;
+        type DocChild =
+            | InstanceType<typeof Paragraph>
+            | InstanceType<typeof Table>;
         const children: DocChild[] = [];
         children.push(
             new Paragraph({
                 heading: HeadingLevel.TITLE,
                 spacing: { after: 200 },
                 alignment: AlignmentType.CENTER,
-                children: [new TextRun({ text: title.toUpperCase(), color: "000000", font: FONT, size: SIZE, bold: true })],
+                children: [
+                    new TextRun({
+                        text: title.toUpperCase(),
+                        color: "000000",
+                        font: FONT,
+                        size: SIZE,
+                        bold: true,
+                    }),
+                ],
             }),
         );
 
         const cellBorder = {
-            top:    { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
+            top: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
             bottom: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-            left:   { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
-            right:  { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
+            left: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
+            right: { style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" },
         };
 
         const headingLevels = [
@@ -1079,9 +1332,7 @@ export async function generateDocx(
             table?: { headers: string[]; rows: string[][] };
         }[]) {
             if (section.pageBreak) {
-                children.push(
-                    new Paragraph({ children: [new PageBreak()] }),
-                );
+                children.push(new Paragraph({ children: [new PageBreak()] }));
             }
             if (section.heading) {
                 const idx = Math.min((section.level ?? 1) - 1, 3);
@@ -1093,7 +1344,15 @@ export async function generateDocx(
                     new Paragraph({
                         heading: headingLevels[idx],
                         spacing: { after: 160 },
-                        children: [new TextRun({ text: headingText, color: "000000", font: FONT, size: SIZE, bold: true })],
+                        children: [
+                            new TextRun({
+                                text: headingText,
+                                color: "000000",
+                                font: FONT,
+                                size: SIZE,
+                                bold: true,
+                            }),
+                        ],
                     }),
                 );
             }
@@ -1112,7 +1371,14 @@ export async function generateDocx(
                                     shading: { fill: "F2F2F2" },
                                     children: [
                                         new Paragraph({
-                                            children: [new TextRun({ text: h, bold: true, font: FONT, size: SIZE })],
+                                            children: [
+                                                new TextRun({
+                                                    text: h,
+                                                    bold: true,
+                                                    font: FONT,
+                                                    size: SIZE,
+                                                }),
+                                            ],
                                             alignment: AlignmentType.LEFT,
                                         }),
                                     ],
@@ -1145,7 +1411,13 @@ export async function generateDocx(
                                         borders: cellBorder,
                                         children: [
                                             new Paragraph({
-                                                children: [new TextRun({ text: cell, font: FONT, size: SIZE })],
+                                                children: [
+                                                    new TextRun({
+                                                        text: cell,
+                                                        font: FONT,
+                                                        size: SIZE,
+                                                    }),
+                                                ],
                                             }),
                                         ],
                                     }),
@@ -1171,14 +1443,26 @@ export async function generateDocx(
                             new Paragraph({
                                 bullet: { level: 0 },
                                 spacing: { after: 120 },
-                                children: [new TextRun({ text: bulletMatch[1], font: FONT, size: SIZE })],
+                                children: [
+                                    new TextRun({
+                                        text: bulletMatch[1],
+                                        font: FONT,
+                                        size: SIZE,
+                                    }),
+                                ],
                             }),
                         );
                     } else {
                         children.push(
                             new Paragraph({
                                 spacing: { after: 120 },
-                                children: [new TextRun({ text: trimmed, font: FONT, size: SIZE })],
+                                children: [
+                                    new TextRun({
+                                        text: trimmed,
+                                        font: FONT,
+                                        size: SIZE,
+                                    }),
+                                ],
                             }),
                         );
                     }
@@ -1190,7 +1474,9 @@ export async function generateDocx(
             ? { page: { size: { orientation: PageOrientation.LANDSCAPE } } }
             : {};
 
-        const doc = new Document({ sections: [{ properties: pageSetup, children }] });
+        const doc = new Document({
+            sections: [{ properties: pageSetup, children }],
+        });
         const buf = await Packer.toBuffer(doc);
         const docId = crypto.randomUUID().replace(/-/g, "");
         const safeTitle =
@@ -1335,11 +1621,11 @@ export async function runEditDocument(params: {
     const current = await loadCurrentVersionBytes(documentId, db);
     if (!current) return { ok: false, error: "Could not load document bytes." };
 
-    const { bytes: editedBytes, changes, errors } = await applyTrackedEdits(
-        current.bytes,
-        edits,
-        { author: "Docket" },
-    );
+    const {
+        bytes: editedBytes,
+        changes,
+        errors,
+    } = await applyTrackedEdits(current.bytes, edits, { author: "Docket" });
 
     if (changes.length === 0) {
         return {
@@ -1394,7 +1680,8 @@ export async function runEditDocument(params: {
             .order("version_number", { ascending: false, nullsFirst: false })
             .limit(1)
             .maybeSingle();
-        nextVersionNumber = ((maxRow?.version_number as number | null) ?? 1) + 1;
+        nextVersionNumber =
+            ((maxRow?.version_number as number | null) ?? 1) + 1;
 
         // Inherit the display name from the most recent prior version so
         // user-applied renames carry forward through further edits. Falls
@@ -1447,7 +1734,9 @@ export async function runEditDocument(params: {
     const { data: insertedEdits, error: editsErr } = await db
         .from("document_edits")
         .insert(editRows)
-        .select("id, change_id, del_w_id, ins_w_id, deleted_text, inserted_text, context_before, context_after");
+        .select(
+            "id, change_id, del_w_id, ins_w_id, deleted_text, inserted_text, context_before, context_after",
+        );
 
     if (editsErr || !insertedEdits) {
         return { ok: false, error: "Failed to record edits." };
@@ -1459,25 +1748,34 @@ export async function runEditDocument(params: {
         .eq("id", documentId);
     if (!reuseVersion) enqueueDocumentIndex(documentId, versionRowId);
 
-    const annotations: EditAnnotation[] = insertedEdits.map((r: { id: string; change_id: string; deleted_text: string; inserted_text: string; context_before: string | null; context_after: string | null }) => {
-        const src = changes.find((c) => c.id === r.change_id);
-        return {
-            kind: "edit",
-            edit_id: r.id,
-            document_id: documentId,
-            version_id: versionRowId,
-            version_number: nextVersionNumber,
-            change_id: r.change_id,
-            del_w_id: src?.delId,
-            ins_w_id: src?.insId,
-            deleted_text: r.deleted_text ?? "",
-            inserted_text: r.inserted_text ?? "",
-            context_before: r.context_before ?? "",
-            context_after: r.context_after ?? "",
-            reason: src?.reason,
-            status: "pending",
-        };
-    });
+    const annotations: EditAnnotation[] = insertedEdits.map(
+        (r: {
+            id: string;
+            change_id: string;
+            deleted_text: string;
+            inserted_text: string;
+            context_before: string | null;
+            context_after: string | null;
+        }) => {
+            const src = changes.find((c) => c.id === r.change_id);
+            return {
+                kind: "edit",
+                edit_id: r.id,
+                document_id: documentId,
+                version_id: versionRowId,
+                version_number: nextVersionNumber,
+                change_id: r.change_id,
+                del_w_id: src?.delId,
+                ins_w_id: src?.insId,
+                deleted_text: r.deleted_text ?? "",
+                inserted_text: r.inserted_text ?? "",
+                context_before: r.context_before ?? "",
+                context_after: r.context_after ?? "",
+                reason: src?.reason,
+                status: "pending",
+            };
+        },
+    );
 
     // Persistent, non-expiring permalink. The backend streams fresh bytes
     // on each request, so this URL stays valid as long as the file exists.
@@ -1583,9 +1881,7 @@ async function readDocumentContent(
         {
             const head = Buffer.from(raw).subarray(0, 8);
             const hex = head.toString("hex");
-            const ascii = head
-                .toString("binary")
-                .replace(/[^\x20-\x7e]/g, ".");
+            const ascii = head.toString("binary").replace(/[^\x20-\x7e]/g, ".");
             console.log(
                 `[read_document] magic bytes hex=${hex} ascii="${ascii}" for filename="${docInfo.filename}"`,
             );
@@ -1647,7 +1943,9 @@ async function readDocumentContent(
             err,
         );
         if (emitEvents)
-            write(`data: ${JSON.stringify({ type: "doc_read", filename: docInfo.filename })}\n\n`);
+            write(
+                `data: ${JSON.stringify({ type: "doc_read", filename: docInfo.filename })}\n\n`,
+            );
         return "Document could not be read.";
     }
 }
@@ -1759,7 +2057,10 @@ async function findInDocumentContent(params: {
     const { norm, origIdx } = normalizeWithMap(text);
     const needle = normalizeQuery(query);
     if (!needle) {
-        return JSON.stringify({ ok: false, error: "Empty query after normalization." });
+        return JSON.stringify({
+            ok: false,
+            error: "Empty query after normalization.",
+        });
     }
 
     type Hit = {
@@ -1879,7 +2180,8 @@ export function boundDocumentToolResult(
     content: string,
     maxChars?: number,
 ): string {
-    if (!maxChars || maxChars <= 0 || content.length <= maxChars) return content;
+    if (!maxChars || maxChars <= 0 || content.length <= maxChars)
+        return content;
     return JSON.stringify({
         ok: false,
         code: "DOCUMENT_RESULT_TOO_LARGE",
@@ -1912,7 +2214,9 @@ type PdfAnnotationToolRow = {
 type AnnotationSource = "user" | "citation_promotion";
 type AnnotationOrder = "position" | "recent";
 
-function normalizeAnnotationHex(value: string | null | undefined): string | null {
+function normalizeAnnotationHex(
+    value: string | null | undefined,
+): string | null {
     const normalized = (value ?? "").trim().toLowerCase();
     return /^#[0-9a-f]{6}$/.test(normalized) ? normalized : null;
 }
@@ -1922,7 +2226,11 @@ function annotationIsCurrent(
     infoByDocumentId: Map<string, DocIndex[string]>,
 ): boolean {
     const info = infoByDocumentId.get(row.document_id);
-    return !!info && !row.deleted_at && (!info.version_id || row.version_id === info.version_id);
+    return (
+        !!info &&
+        !row.deleted_at &&
+        (!info.version_id || row.version_id === info.version_id)
+    );
 }
 
 function summarizeAnnotationRows(
@@ -1930,13 +2238,17 @@ function summarizeAnnotationRows(
     infoByDocumentId: Map<string, DocIndex[string]>,
     projectTotal: number,
 ) {
-    const colors = new Map<string, { color_family: AnnotationColorFamily | null; count: number }>();
+    const colors = new Map<
+        string,
+        { color_family: AnnotationColorFamily | null; count: number }
+    >();
     const documents = new Map<string, { filename: string; count: number }>();
     const byType: Record<string, number> = {};
     const bySource: Record<string, number> = {};
     let withComment = 0;
     for (const row of rows) {
-        const color = normalizeAnnotationHex(row.color) ?? row.color ?? "unknown";
+        const color =
+            normalizeAnnotationHex(row.color) ?? row.color ?? "unknown";
         const colorCount = colors.get(color) ?? {
             color_family: classifyAnnotationColor(row.color)?.family ?? null,
             count: 0,
@@ -1984,21 +2296,29 @@ async function queryAnnotationRows(args: {
         const version = args.versionByDocumentId?.get(documentId) ?? null;
         groups.set(version, [...(groups.get(version) ?? []), documentId]);
     }
-    const results = await Promise.all([...groups].map(async ([versionId, documentIds]) => {
-        let query = args.db
-            .from("pdf_annotations")
-            .select("id, document_id, version_id, page_number, annotation_type, color, quote, comment, source, created_at, deleted_at")
-            .eq("user_id", args.userId)
-            .in("document_id", documentIds)
-            .is("deleted_at", null);
-        if (versionId) query = query.eq("version_id", versionId);
-        if (args.annotationType) query = query.eq("annotation_type", args.annotationType);
-        if (args.source) query = query.eq("source", args.source);
-        if (args.hasComment === true) query = query.not("comment", "is", null).neq("comment", "");
-        return await query;
-    }));
+    const results = await Promise.all(
+        [...groups].map(async ([versionId, documentIds]) => {
+            let query = args.db
+                .from("pdf_annotations")
+                .select(
+                    "id, document_id, version_id, page_number, annotation_type, color, quote, comment, source, created_at, deleted_at",
+                )
+                .eq("user_id", args.userId)
+                .in("document_id", documentIds)
+                .is("deleted_at", null);
+            if (versionId) query = query.eq("version_id", versionId);
+            if (args.annotationType)
+                query = query.eq("annotation_type", args.annotationType);
+            if (args.source) query = query.eq("source", args.source);
+            if (args.hasComment === true)
+                query = query.not("comment", "is", null).neq("comment", "");
+            return await query;
+        }),
+    );
     return {
-        data: results.flatMap((result) => (result.data ?? []) as PdfAnnotationToolRow[]),
+        data: results.flatMap(
+            (result) => (result.data ?? []) as PdfAnnotationToolRow[],
+        ),
         error: results.find((result) => result.error)?.error ?? null,
     };
 }
@@ -2009,6 +2329,8 @@ export async function fetchUserPdfAnnotations(args: {
     docIndex: DocIndex;
     documentQuery?: string;
     docIds?: string[];
+    partyRoles?: string[];
+    partySides?: Array<"A" | "B">;
     annotationType?: "highlight" | "comment";
     colorFamily?: AnnotationColorFamily[];
     colors?: string[];
@@ -2019,6 +2341,8 @@ export async function fetchUserPdfAnnotations(args: {
     limit?: number;
 }): Promise<Record<string, unknown>> {
     const requestedSlugs = new Set(args.docIds ?? []);
+    const requestedPartyRoles = new Set(args.partyRoles ?? []);
+    const requestedPartySides = new Set(args.partySides ?? []);
     const lookupTokens = (value: string) =>
         (value.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(Boolean);
     const normalizedDocumentQuery = args.documentQuery?.trim().toLowerCase();
@@ -2029,6 +2353,11 @@ export async function fetchUserPdfAnnotations(args: {
     const candidates = allCandidates.filter(
         ([slug, info]) =>
             (requestedSlugs.size === 0 || requestedSlugs.has(slug)) &&
+            (requestedPartyRoles.size === 0 ||
+                requestedPartyRoles.has(info.party_role ?? "")) &&
+            (requestedPartySides.size === 0 ||
+                (!!info.party_side &&
+                    requestedPartySides.has(info.party_side))) &&
             (documentQueryTokens.length === 0 ||
                 documentQueryTokens.every((token) =>
                     lookupTokens(info.filename).includes(token),
@@ -2046,19 +2375,34 @@ export async function fetchUserPdfAnnotations(args: {
         };
     }
 
-    const allInfoByDocumentId = new Map(allCandidates.map(([, info]) => [info.document_id, info]));
+    const allInfoByDocumentId = new Map(
+        allCandidates.map(([, info]) => [info.document_id, info]),
+    );
     const projectQuery = await queryAnnotationRows({
         db: args.db,
         userId: args.userId,
         documentIds: [...allInfoByDocumentId.keys()],
-        versionByDocumentId: new Map([...allInfoByDocumentId].map(([id, info]) => [id, info.version_id])),
+        versionByDocumentId: new Map(
+            [...allInfoByDocumentId].map(([id, info]) => [id, info.version_id]),
+        ),
     });
-    const projectRows = projectQuery.data.filter((row) => annotationIsCurrent(row, allInfoByDocumentId));
+    const projectRows = projectQuery.data.filter((row) =>
+        annotationIsCurrent(row, allInfoByDocumentId),
+    );
     if (candidates.length === 0) {
         return {
-            annotations: [], total: 0, returned: 0, truncated: false, next_offset: null,
-            summary: summarizeAnnotationRows([], allInfoByDocumentId, projectRows.length),
-            message: "No in-scope project document matched the requested document filter.",
+            annotations: [],
+            total: 0,
+            returned: 0,
+            truncated: false,
+            next_offset: null,
+            summary: summarizeAnnotationRows(
+                [],
+                allInfoByDocumentId,
+                projectRows.length,
+            ),
+            message:
+                "No in-scope project document matched the requested document filter.",
         };
     }
 
@@ -2069,7 +2413,10 @@ export async function fetchUserPdfAnnotations(args: {
         candidates.map(([, info]) => [info.document_id, info]),
     );
     const documentIds = [...labelByDocumentId.keys()];
-    const boundedLimit = Math.max(1, Math.min(100, Math.floor(args.limit ?? 30)));
+    const boundedLimit = Math.max(
+        1,
+        Math.min(100, Math.floor(args.limit ?? 30)),
+    );
     const boundedOffset = Math.max(0, Math.floor(args.offset ?? 0));
     const normalizedColors = (args.colors ?? [])
         .map(normalizeAnnotationHex)
@@ -2078,7 +2425,9 @@ export async function fetchUserPdfAnnotations(args: {
         db: args.db,
         userId: args.userId,
         documentIds,
-        versionByDocumentId: new Map([...infoByDocumentId].map(([id, info]) => [id, info.version_id])),
+        versionByDocumentId: new Map(
+            [...infoByDocumentId].map(([id, info]) => [id, info.version_id]),
+        ),
         annotationType: args.annotationType,
         source: args.source,
         hasComment: args.hasComment,
@@ -2091,7 +2440,11 @@ export async function fetchUserPdfAnnotations(args: {
             returned: 0,
             truncated: false,
             next_offset: null,
-            summary: summarizeAnnotationRows([], infoByDocumentId, projectRows.length),
+            summary: summarizeAnnotationRows(
+                [],
+                infoByDocumentId,
+                projectRows.length,
+            ),
             error: "Failed to retrieve saved PDF annotations.",
         };
     }
@@ -2100,49 +2453,202 @@ export async function fetchUserPdfAnnotations(args: {
     const rows = data
         .filter((row) => annotationIsCurrent(row, infoByDocumentId))
         .filter((row) => {
-            if (normalizedColors.length && !normalizedColors.includes(normalizeAnnotationHex(row.color) ?? "")) return false;
-            if (args.hasComment !== undefined && Boolean(row.comment?.trim()) !== args.hasComment) return false;
+            if (
+                normalizedColors.length &&
+                !normalizedColors.includes(
+                    normalizeAnnotationHex(row.color) ?? "",
+                )
+            )
+                return false;
+            if (
+                args.hasComment !== undefined &&
+                Boolean(row.comment?.trim()) !== args.hasComment
+            )
+                return false;
             if (!requestedFamilies.size) return true;
             const family = classifyAnnotationColor(row.color)?.family;
             return !!family && requestedFamilies.has(family);
         })
         .sort((a, b) => {
             if (args.order === "recent") {
-                return b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id);
+                return (
+                    b.created_at.localeCompare(a.created_at) ||
+                    a.id.localeCompare(b.id)
+                );
             }
             const aName = infoByDocumentId.get(a.document_id)?.filename ?? "";
             const bName = infoByDocumentId.get(b.document_id)?.filename ?? "";
-            return aName.localeCompare(bName) || a.page_number - b.page_number ||
-                a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id);
+            return (
+                aName.localeCompare(bName) ||
+                a.page_number - b.page_number ||
+                a.created_at.localeCompare(b.created_at) ||
+                a.id.localeCompare(b.id)
+            );
         });
-    const annotations = rows.slice(boundedOffset, boundedOffset + boundedLimit).map((row) => {
-        const info = infoByDocumentId.get(row.document_id);
-        return {
-            id: row.id,
-            doc_id: labelByDocumentId.get(row.document_id),
-            document_id: row.document_id,
-            filename: info?.filename,
-            version_id: row.version_id,
-            page: row.page_number,
-            type: row.annotation_type,
-            color: row.color,
-            color_family: classifyAnnotationColor(row.color)?.family ?? null,
-            quote: row.quote,
-            comment: row.comment,
-            source: row.source,
-            created_at: row.created_at,
-        };
-    });
+    const annotations = rows
+        .slice(boundedOffset, boundedOffset + boundedLimit)
+        .map((row) => {
+            const info = infoByDocumentId.get(row.document_id);
+            return {
+                id: row.id,
+                doc_id: labelByDocumentId.get(row.document_id),
+                document_id: row.document_id,
+                filename: info?.filename,
+                version_id: row.version_id,
+                page: row.page_number,
+                type: row.annotation_type,
+                color: row.color,
+                color_family:
+                    classifyAnnotationColor(row.color)?.family ?? null,
+                quote: row.quote,
+                comment: row.comment,
+                source: row.source,
+                created_at: row.created_at,
+            };
+        });
 
     return {
         annotations,
         total: rows.length,
         returned: annotations.length,
         truncated: boundedOffset + annotations.length < rows.length,
-        next_offset: boundedOffset + annotations.length < rows.length
-            ? boundedOffset + annotations.length
-            : null,
-        summary: summarizeAnnotationRows(rows, infoByDocumentId, projectRows.length),
+        next_offset:
+            boundedOffset + annotations.length < rows.length
+                ? boundedOffset + annotations.length
+                : null,
+        summary: summarizeAnnotationRows(
+            rows,
+            infoByDocumentId,
+            projectRows.length,
+        ),
+    };
+}
+
+export const MAX_DIGEST_ITEMS = 400;
+const ANNOTATION_DIGEST_PAGE_SIZE = 100;
+const ANNOTATION_CONTEXT_BATCH_SIZE = 20;
+
+/**
+ * Exhaust the existing annotation pagination server-side, then ground each
+ * returned item against indexed source chunks in bounded context batches.
+ * Summary values always describe the complete filtered set, not just this
+ * cursor window.
+ */
+export async function collectProjectAnnotations(args: {
+    userId: string;
+    db: ReturnType<typeof createServerSupabase>;
+    docIndex: DocIndex;
+    colorFamily?: AnnotationColorFamily[];
+    annotationType?: "highlight" | "comment";
+    hasComment?: boolean;
+    docIds?: string[];
+    partyRoles?: string[];
+    partySides?: Array<"A" | "B">;
+    grounded?: boolean;
+    cursor?: number;
+    loadChunks?: AnnotationContextLoader;
+}): Promise<Record<string, unknown>> {
+    const cursor = Math.max(0, Math.floor(args.cursor ?? 0));
+    const items: Record<string, unknown>[] = [];
+    let offset = cursor;
+    let total = 0;
+    let summary: unknown = summarizeAnnotationRows([], new Map(), 0);
+
+    while (items.length < MAX_DIGEST_ITEMS) {
+        const page = await fetchUserPdfAnnotations({
+            userId: args.userId,
+            db: args.db,
+            docIndex: args.docIndex,
+            docIds: args.docIds,
+            partyRoles: args.partyRoles,
+            partySides: args.partySides,
+            annotationType: args.annotationType,
+            colorFamily: args.colorFamily,
+            hasComment: args.hasComment,
+            offset,
+            order: "position",
+            limit: Math.min(
+                ANNOTATION_DIGEST_PAGE_SIZE,
+                MAX_DIGEST_ITEMS - items.length,
+            ),
+        });
+        if ("error" in page) {
+            return {
+                summary: page.summary,
+                items: [],
+                total: 0,
+                truncated: false,
+                next_cursor: null,
+                error: page.error,
+            };
+        }
+        if (items.length === 0) {
+            total = typeof page.total === "number" ? page.total : 0;
+            summary = page.summary;
+        }
+        const annotations = Array.isArray(page.annotations)
+            ? (page.annotations as Record<string, unknown>[])
+            : [];
+        items.push(...annotations);
+        const nextOffset =
+            typeof page.next_offset === "number" ? page.next_offset : null;
+        if (nextOffset === null || annotations.length === 0) break;
+        offset = nextOffset;
+    }
+
+    let groundedItems = items;
+    if (args.grounded !== false && items.length > 0) {
+        const contextById = new Map<string, Record<string, unknown>>();
+        const annotationIds = items
+            .map((item) => item.id)
+            .filter((value): value is string => typeof value === "string");
+        for (
+            let index = 0;
+            index < annotationIds.length;
+            index += ANNOTATION_CONTEXT_BATCH_SIZE
+        ) {
+            const result = await readAnnotationContexts({
+                userId: args.userId,
+                db: args.db,
+                docIndex: args.docIndex,
+                annotationIds: annotationIds.slice(
+                    index,
+                    index + ANNOTATION_CONTEXT_BATCH_SIZE,
+                ),
+                loadChunks: args.loadChunks,
+            });
+            for (const context of Array.isArray(result.contexts)
+                ? (result.contexts as Record<string, unknown>[])
+                : []) {
+                if (typeof context.annotation_id === "string") {
+                    contextById.set(context.annotation_id, context);
+                }
+            }
+        }
+        groundedItems = items.map((item) => {
+            const context =
+                typeof item.id === "string"
+                    ? contextById.get(item.id)
+                    : undefined;
+            return context
+                ? {
+                      ...item,
+                      ...context,
+                      grounded: Boolean(
+                          context.chunk_id && context.indexed_quote,
+                      ),
+                  }
+                : { ...item, grounded: false };
+        });
+    }
+
+    const truncated = cursor + groundedItems.length < total;
+    return {
+        summary,
+        items: groundedItems,
+        total,
+        truncated,
+        next_cursor: truncated ? cursor + groundedItems.length : null,
     };
 }
 
@@ -2155,7 +2661,7 @@ export type AnnotationContextChunk = {
     end_char: number;
 };
 
-type AnnotationContextLoader = (
+export type AnnotationContextLoader = (
     documentId: string,
     versionId: string | null,
 ) => AnnotationContextChunk[] | Promise<AnnotationContextChunk[]>;
@@ -2170,7 +2676,8 @@ function defaultAnnotationContextLoader(
                 `SELECT id AS chunk_id, chunk_index, page_number, content, start_char, end_char
                  FROM document_index_chunks
                  WHERE document_id = ? AND (? IS NULL OR version_id = ?)
-                 ORDER BY chunk_index ASC`,
+                 ORDER BY chunk_index ASC
+                 LIMIT 4`,
             )
             .all(documentId, versionId, versionId) as AnnotationContextChunk[];
     } catch {
@@ -2192,11 +2699,15 @@ function mergeAnnotationChunksWithSegments(chunks: AnnotationContextChunk[]): {
     let text = "";
     let lastEnd: number | null = null;
     const segments: MergedAnnotationChunkSegment[] = [];
-    for (const chunk of [...chunks].sort((a, b) => a.chunk_index - b.chunk_index)) {
-        const overlap = lastEnd === null ? 0 : Math.max(0, lastEnd - chunk.start_char);
+    for (const chunk of [...chunks].sort(
+        (a, b) => a.chunk_index - b.chunk_index,
+    )) {
+        const overlap =
+            lastEnd === null ? 0 : Math.max(0, lastEnd - chunk.start_char);
         const contentStart = Math.min(overlap, chunk.content.length);
         const suffix = chunk.content.slice(contentStart);
-        if (text && suffix && lastEnd !== null && chunk.start_char > lastEnd) text += "\n";
+        if (text && suffix && lastEnd !== null && chunk.start_char > lastEnd)
+            text += "\n";
         const mergedStart = text.length;
         text += suffix;
         segments.push({
@@ -2214,14 +2725,20 @@ function mergeAnnotationChunksWithSegments(chunks: AnnotationContextChunk[]): {
         segments: segments
             .map((segment) => ({
                 ...segment,
-                mergedStart: Math.max(0, segment.mergedStart - leadingWhitespace),
+                mergedStart: Math.max(
+                    0,
+                    segment.mergedStart - leadingWhitespace,
+                ),
                 mergedEnd: Math.max(0, segment.mergedEnd - leadingWhitespace),
             }))
             .filter((segment) => segment.mergedStart < trimmedText.length),
     };
 }
 
-function normalizedTextWithOffsets(value: string): { text: string; offsets: number[] } {
+function normalizedTextWithOffsets(value: string): {
+    text: string;
+    offsets: number[];
+} {
     let text = "";
     const offsets: number[] = [];
     let previousWhitespace = false;
@@ -2256,12 +2773,15 @@ export function extractAnnotationContext(args: {
     chunk_id?: string;
     indexed_quote?: string;
 } {
-    const pageChunks = args.chunks.filter((chunk) => chunk.page_number === args.page);
+    const pageChunks = args.chunks.filter(
+        (chunk) => chunk.page_number === args.page,
+    );
     const pageIndexes = new Set(pageChunks.map((chunk) => chunk.chunk_index));
-    const expandedChunks = args.chunks.filter((chunk) =>
-        pageIndexes.has(chunk.chunk_index) ||
-        pageIndexes.has(chunk.chunk_index - 1) ||
-        pageIndexes.has(chunk.chunk_index + 1),
+    const expandedChunks = args.chunks.filter(
+        (chunk) =>
+            pageIndexes.has(chunk.chunk_index) ||
+            pageIndexes.has(chunk.chunk_index - 1) ||
+            pageIndexes.has(chunk.chunk_index + 1),
     );
     const pageMerge = mergeAnnotationChunksWithSegments(pageChunks);
     const expandedMerge = mergeAnnotationChunksWithSegments(
@@ -2269,7 +2789,9 @@ export function extractAnnotationContext(args: {
     );
     const pageText = pageMerge.text;
     const quote = normalizedTextWithOffsets(args.quote ?? "").text;
-    const locate = (merged: ReturnType<typeof mergeAnnotationChunksWithSegments>) => {
+    const locate = (
+        merged: ReturnType<typeof mergeAnnotationChunksWithSegments>,
+    ) => {
         const normalized = normalizedTextWithOffsets(merged.text);
         if (!quote || !normalized.text) return null;
         let matchIndex = normalized.text.indexOf(quote);
@@ -2283,36 +2805,54 @@ export function extractAnnotationContext(args: {
         }
         if (matchIndex < 0) return null;
         const originalStart = normalized.offsets[matchIndex] ?? 0;
-        const originalEnd = (normalized.offsets[Math.min(
-            normalized.offsets.length - 1,
-            matchIndex + matchLength - 1,
-        )] ?? originalStart) + 1;
+        const originalEnd =
+            (normalized.offsets[
+                Math.min(
+                    normalized.offsets.length - 1,
+                    matchIndex + matchLength - 1,
+                )
+            ] ?? originalStart) + 1;
         const segment = merged.segments.find(
-            (candidate) => originalStart >= candidate.mergedStart && originalStart < candidate.mergedEnd,
+            (candidate) =>
+                originalStart >= candidate.mergedStart &&
+                originalStart < candidate.mergedEnd,
         );
         const localStart = segment
             ? segment.contentStart + originalStart - segment.mergedStart
             : -1;
         const localEnd = segment
             ? Math.min(
-                segment.chunk.content.length,
-                segment.contentStart + originalEnd - segment.mergedStart,
-            )
+                  segment.chunk.content.length,
+                  segment.contentStart + originalEnd - segment.mergedStart,
+              )
             : -1;
-        let indexedQuote = segment && localStart >= 0
-            ? segment.chunk.content.slice(localStart, Math.max(localStart + 1, localEnd))
-            : "";
+        let indexedQuote =
+            segment && localStart >= 0
+                ? segment.chunk.content.slice(
+                      localStart,
+                      Math.max(localStart + 1, localEnd),
+                  )
+                : "";
         const words = [...indexedQuote.matchAll(/\S+/gu)];
         if (words.length > 50) {
             const lastWord = words[49];
-            indexedQuote = indexedQuote.slice(0, (lastWord.index ?? 0) + lastWord[0].length);
+            indexedQuote = indexedQuote.slice(
+                0,
+                (lastWord.index ?? 0) + lastWord[0].length,
+            );
         }
         return {
-            before: merged.text.slice(Math.max(0, originalStart - args.radius), originalStart),
+            before: merged.text.slice(
+                Math.max(0, originalStart - args.radius),
+                originalStart,
+            ),
             after: merged.text.slice(originalEnd, originalEnd + args.radius),
             located: true as const,
             ...(segment?.chunk.chunk_id && indexedQuote
-                ? { chunk_id: segment.chunk.chunk_id, indexed_quote: indexedQuote }
+                ? {
+                      chunk_id: segment.chunk.chunk_id,
+                      indexed_quote: indexedQuote,
+                  }
                 : {}),
         };
     };
@@ -2334,28 +2874,38 @@ export async function readAnnotationContexts(args: {
     radius?: number;
     loadChunks?: AnnotationContextLoader;
 }): Promise<Record<string, unknown>> {
-    const annotationIds = [...new Set(args.annotationIds.filter(Boolean))].slice(0, 20);
+    const annotationIds = [
+        ...new Set(args.annotationIds.filter(Boolean)),
+    ].slice(0, 20);
     const radius = Math.max(1, Math.min(2000, Math.floor(args.radius ?? 600)));
-    if (!annotationIds.length) return { contexts: [], requested: 0, returned: 0 };
+    if (!annotationIds.length)
+        return { contexts: [], requested: 0, returned: 0 };
     const infoByDocumentId = new Map(
         Object.values(args.docIndex).map((info) => [info.document_id, info]),
     );
     const labelByDocumentId = new Map(
-        Object.entries(args.docIndex).map(([label, info]) => [info.document_id, label]),
+        Object.entries(args.docIndex).map(([label, info]) => [
+            info.document_id,
+            label,
+        ]),
     );
     if (!infoByDocumentId.size) {
         return { contexts: [], requested: annotationIds.length, returned: 0 };
     }
     const { data, error } = await args.db
         .from("pdf_annotations")
-        .select("id, document_id, version_id, page_number, annotation_type, color, quote, comment, source, created_at, deleted_at")
+        .select(
+            "id, document_id, version_id, page_number, annotation_type, color, quote, comment, source, created_at, deleted_at",
+        )
         .eq("user_id", args.userId)
         .in("document_id", [...infoByDocumentId.keys()])
         .in("id", annotationIds)
         .is("deleted_at", null);
     if (error) {
         return {
-            contexts: [], requested: annotationIds.length, returned: 0,
+            contexts: [],
+            requested: annotationIds.length,
+            returned: 0,
             error: "Failed to retrieve annotation context.",
         };
     }
@@ -2374,7 +2924,9 @@ export async function readAnnotationContexts(args: {
         const cacheKey = `${row.document_id}:${row.version_id ?? ""}`;
         let chunksPromise = chunkCache.get(cacheKey);
         if (!chunksPromise) {
-            chunksPromise = Promise.resolve(loadChunks(row.document_id, row.version_id));
+            chunksPromise = Promise.resolve(
+                loadChunks(row.document_id, row.version_id),
+            );
             chunkCache.set(cacheKey, chunksPromise);
         }
         contexts.push({
@@ -2391,7 +2943,12 @@ export async function readAnnotationContexts(args: {
             }),
         });
     }
-    return { contexts, requested: annotationIds.length, returned: contexts.length, radius };
+    return {
+        contexts,
+        requested: annotationIds.length,
+        returned: contexts.length,
+        radius,
+    };
 }
 
 export async function runToolCalls(
@@ -2407,6 +2964,11 @@ export async function runToolCalls(
     projectId?: string | null,
     scopedDocumentIds?: string[],
     documentResultMaxChars?: number,
+    summaryRuntime?: {
+        model: string;
+        apiKeys?: UserApiKeys;
+        signal?: AbortSignal;
+    },
 ): Promise<{
     toolResults: unknown[];
     docsRead: { filename: string; document_id?: string }[];
@@ -2415,6 +2977,12 @@ export async function runToolCalls(
     docsReplicated: DocReplicatedResult[];
     workflowsApplied: { workflow_id: string; title: string }[];
     docsEdited: DocEditedResult[];
+    documentSummaries: {
+        filename: string;
+        document_id: string;
+        prepared_text: string;
+        coverage: DocumentSummaryCoverage;
+    }[];
 }> {
     const toolResults: unknown[] = [];
     const docsRead: { filename: string; document_id?: string }[] = [];
@@ -2427,6 +2995,12 @@ export async function runToolCalls(
     const docsReplicated: DocReplicatedResult[] = [];
     const workflowsApplied: { workflow_id: string; title: string }[] = [];
     const docsEdited: DocEditedResult[] = [];
+    const documentSummaries: {
+        filename: string;
+        document_id: string;
+        prepared_text: string;
+        coverage: DocumentSummaryCoverage;
+    }[] = [];
 
     for (const tc of toolCalls) {
         let args: Record<string, unknown> = {};
@@ -2436,9 +3010,215 @@ export async function runToolCalls(
             /* ignore */
         }
 
-        if (tc.function.name === "get_user_pdf_annotations") {
+        if (tc.function.name === "summarize_document") {
+            const rawDocId = typeof args.doc_id === "string" ? args.doc_id : "";
+            const docId =
+                resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
+            const info = docIndex?.[docId];
+            const filename = info?.filename ?? docStore.get(docId)?.filename;
+            const versionId = info?.version_id ?? null;
+            if (
+                !summaryRuntime ||
+                !info?.document_id ||
+                !versionId ||
+                !filename
+            ) {
+                toolResults.push({
+                    role: "tool",
+                    tool_call_id: tc.id,
+                    content: JSON.stringify({
+                        error: "The selected document is not ready for exhaustive summarization.",
+                    }),
+                });
+                continue;
+            }
+
+            const db = getDb();
+            const rows = db
+                .prepare(
+                    `SELECT id AS chunk_id, chunk_index, page_number, content,
+                            start_char, end_char
+                     FROM document_index_chunks
+                     WHERE document_id = ? AND version_id = ?
+                     ORDER BY chunk_index ASC`,
+                )
+                .all(info.document_id, versionId) as DocumentSummaryChunk[];
+            const indexMeta = db
+                .prepare(
+                    `SELECT d.page_count, f.ocr_pages, f.ocr_scanned_pages,
+                            f.ocr_truncated
+                     FROM documents d
+                     LEFT JOIN document_index_files f
+                       ON f.document_id = d.id AND f.version_id = ?
+                     WHERE d.id = ?`,
+                )
+                .get(versionId, info.document_id) as
+                | {
+                      page_count: number | null;
+                      ocr_pages: number | null;
+                      ocr_scanned_pages: number | null;
+                      ocr_truncated: number | null;
+                  }
+                | undefined;
+            const maxIndexedPage = rows.reduce(
+                (max, row) => Math.max(max, row.page_number ?? 0),
+                0,
+            );
+            const pageCount = indexMeta?.page_count ?? maxIndexedPage;
+            if (rows.length === 0 || pageCount < 1) {
+                toolResults.push({
+                    role: "tool",
+                    tool_call_id: tc.id,
+                    content: JSON.stringify({
+                        error: "No page-addressable index is available for this document. Re-index or run full OCR before requesting an exhaustive summary.",
+                    }),
+                });
+                continue;
+            }
+
+            write(
+                `data: ${JSON.stringify({
+                    type: "doc_summary_start",
+                    filename,
+                })}\n\n`,
+            );
+            const persistBatchSummaries = !/^(0|false|no|off)$/i.test(
+                process.env.DOCKET_SUMMARY_PERSIST_BATCHES?.trim() ?? "",
+            );
+            const summary = await summarizeDocumentWithCoverage({
+                model: summaryRuntime.model,
+                apiKeys: summaryRuntime.apiKeys ?? {},
+                filename,
+                docId,
+                documentId: info.document_id,
+                versionId,
+                chunks: rows,
+                pageCount,
+                ocrStatus: {
+                    truncated: Boolean(indexMeta?.ocr_truncated),
+                    ocrPages: indexMeta?.ocr_pages ?? undefined,
+                    scannedPages: indexMeta?.ocr_scanned_pages ?? undefined,
+                },
+                focus: typeof args.focus === "string" ? args.focus : undefined,
+                language:
+                    typeof args.language === "string"
+                        ? args.language
+                        : undefined,
+                signal: summaryRuntime.signal,
+                onProgress: (progress) => {
+                    write(
+                        `data: ${JSON.stringify({
+                            type: "doc_summary_progress",
+                            filename,
+                            completed_batches: progress.completedBatches,
+                            total_batches: progress.totalBatches,
+                            page_range: progress.pageRange,
+                            eta_ms: progress.etaMs,
+                        })}\n\n`,
+                    );
+                },
+            }, {
+                batchCache: persistBatchSummaries
+                    ? createSqliteDocumentSummaryBatchCache({
+                          db,
+                          documentId: info.document_id,
+                          versionId,
+                          model: summaryRuntime.model,
+                      })
+                    : undefined,
+            });
+            write(
+                `data: ${JSON.stringify({
+                    type: "doc_summary",
+                    filename,
+                    document_id: info.document_id,
+                    coverage: summary.coverage,
+                })}\n\n`,
+            );
+            documentSummaries.push({
+                filename,
+                document_id: info.document_id,
+                prepared_text: summary.preparedText,
+                coverage: summary.coverage,
+            });
+            toolResults.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: JSON.stringify({
+                    prepared_summary: summary.preparedText,
+                    coverage: summary.coverage,
+                    instruction:
+                        "Return prepared_summary verbatim. Do not replace, shorten, or renumber its citations.",
+                }),
+            });
+        } else if (tc.function.name === "get_annotation_digest") {
             const validColorFamilies = new Set<AnnotationColorFamily>([
-                "red", "yellow", "green", "blue", "orange", "pink", "purple", "gray",
+                "red",
+                "yellow",
+                "green",
+                "blue",
+                "orange",
+                "pink",
+                "purple",
+                "gray",
+            ]);
+            const content = await collectProjectAnnotations({
+                userId,
+                db,
+                docIndex: docIndex ?? {},
+                colorFamily: Array.isArray(args.color_family)
+                    ? args.color_family.filter(
+                          (value): value is AnnotationColorFamily =>
+                              typeof value === "string" &&
+                              validColorFamilies.has(
+                                  value as AnnotationColorFamily,
+                              ),
+                      )
+                    : undefined,
+                annotationType:
+                    args.annotation_type === "highlight" ||
+                    args.annotation_type === "comment"
+                        ? args.annotation_type
+                        : undefined,
+                hasComment:
+                    typeof args.has_comment === "boolean"
+                        ? args.has_comment
+                        : undefined,
+                docIds: Array.isArray(args.doc_ids)
+                    ? args.doc_ids.filter(
+                          (value): value is string => typeof value === "string",
+                      )
+                    : undefined,
+                partyRoles: Array.isArray(args.party_roles)
+                    ? args.party_roles.filter(
+                          (value): value is string => typeof value === "string",
+                      )
+                    : undefined,
+                partySides: Array.isArray(args.party_sides)
+                    ? args.party_sides.filter(
+                          (value): value is "A" | "B" =>
+                              value === "A" || value === "B",
+                      )
+                    : undefined,
+                grounded: args.grounded !== false,
+                cursor:
+                    typeof args.cursor === "number" ? args.cursor : undefined,
+            });
+            toolResults.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: JSON.stringify(content),
+            });
+        } else if (tc.function.name === "get_user_pdf_annotations") {
+            const validColorFamilies = new Set<AnnotationColorFamily>([
+                "red",
+                "yellow",
+                "green",
+                "blue",
+                "orange",
+                "pink",
+                "purple",
+                "gray",
             ]);
             const content = await fetchUserPdfAnnotations({
                 userId,
@@ -2462,7 +3242,9 @@ export async function runToolCalls(
                     ? args.color_family.filter(
                           (value): value is AnnotationColorFamily =>
                               typeof value === "string" &&
-                              validColorFamilies.has(value as AnnotationColorFamily),
+                              validColorFamilies.has(
+                                  value as AnnotationColorFamily,
+                              ),
                       )
                     : undefined,
                 colors: Array.isArray(args.colors)
@@ -2471,11 +3253,16 @@ export async function runToolCalls(
                       )
                     : undefined,
                 source:
-                    args.source === "user" || args.source === "citation_promotion"
+                    args.source === "user" ||
+                    args.source === "citation_promotion"
                         ? args.source
                         : undefined,
-                hasComment: typeof args.has_comment === "boolean" ? args.has_comment : undefined,
-                offset: typeof args.offset === "number" ? args.offset : undefined,
+                hasComment:
+                    typeof args.has_comment === "boolean"
+                        ? args.has_comment
+                        : undefined,
+                offset:
+                    typeof args.offset === "number" ? args.offset : undefined,
                 order:
                     args.order === "position" || args.order === "recent"
                         ? args.order
@@ -2487,7 +3274,6 @@ export async function runToolCalls(
                 tool_call_id: tc.id,
                 content: JSON.stringify(content),
             });
-
         } else if (tc.function.name === "read_annotation_context") {
             const content = await readAnnotationContexts({
                 userId,
@@ -2498,19 +3284,25 @@ export async function runToolCalls(
                           (value): value is string => typeof value === "string",
                       )
                     : [],
-                radius: typeof args.radius === "number" ? args.radius : undefined,
+                radius:
+                    typeof args.radius === "number" ? args.radius : undefined,
             });
             toolResults.push({
                 role: "tool",
                 tool_call_id: tc.id,
                 content: JSON.stringify(content),
             });
-
         } else if (tc.function.name === "read_document") {
             const rawDocId = args.doc_id as string;
             const docId =
                 resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
-            const fullContent = await readDocumentContent(docId, docStore, write, docIndex, db);
+            const fullContent = await readDocumentContent(
+                docId,
+                docStore,
+                write,
+                docIndex,
+                db,
+            );
             const content = boundDocumentToolResult(
                 fullContent,
                 documentResultMaxChars,
@@ -2526,14 +3318,19 @@ export async function runToolCalls(
                 bounded: content !== fullContent,
             });
             toolResults.push({ role: "tool", tool_call_id: tc.id, content });
-
         } else if (tc.function.name === "find_in_document") {
             const rawDocId = args.doc_id as string;
             const docId =
                 resolveDocLabel(rawDocId, docStore, docIndex) ?? rawDocId;
             const query = (args.query as string) ?? "";
-            const maxResults = typeof args.max_results === "number" ? args.max_results : undefined;
-            const contextChars = typeof args.context_chars === "number" ? args.context_chars : undefined;
+            const maxResults =
+                typeof args.max_results === "number"
+                    ? args.max_results
+                    : undefined;
+            const contextChars =
+                typeof args.context_chars === "number"
+                    ? args.context_chars
+                    : undefined;
             const content = await findInDocumentContent({
                 docLabel: docId,
                 query,
@@ -2562,7 +3359,6 @@ export async function runToolCalls(
                 });
             }
             toolResults.push({ role: "tool", tool_call_id: tc.id, content });
-
         } else if (tc.function.name === "list_documents") {
             const list = Array.from(docStore.entries()).map(
                 ([doc_id, info]) => ({
@@ -2576,7 +3372,6 @@ export async function runToolCalls(
                 tool_call_id: tc.id,
                 content: JSON.stringify(list),
             });
-
         } else if (tc.function.name === "search_project_documents") {
             const query = typeof args.query === "string" ? args.query : "";
             const groupByDocument = args.group_by_document === true;
@@ -2596,6 +3391,21 @@ export async function runToolCalls(
                 typeof args.folder_id === "string" && args.folder_id.trim()
                     ? args.folder_id.trim()
                     : null;
+            const docRoles = Array.isArray(args.doc_roles)
+                ? args.doc_roles.filter(
+                      (value): value is string => typeof value === "string",
+                  )
+                : undefined;
+            const partyRoles = Array.isArray(args.party_roles)
+                ? args.party_roles.filter(
+                      (value): value is string => typeof value === "string",
+                  )
+                : undefined;
+            const partySides = Array.isArray(args.party_sides)
+                ? args.party_sides.filter(
+                      (value): value is string => typeof value === "string",
+                  )
+                : undefined;
             if (!projectId) {
                 toolResults.push({
                     role: "tool",
@@ -2628,18 +3438,25 @@ export async function runToolCalls(
                 }
             }
 
-            const results = (await searchProjectIndex({
-                projectId,
-                userId,
-                query,
-                limit,
-                includeNeighbors,
-                fileTypes,
-                folderId,
-                documentIds: searchScope.documentIds,
-                group: groupByDocument ? "documents" : "chunks",
-            })).map((result) => ({
-                doc_id: labelByDocumentId.get(result.document_id) ?? result.document_id,
+            const results = (
+                await searchProjectIndex({
+                    projectId,
+                    userId,
+                    query,
+                    limit,
+                    includeNeighbors,
+                    fileTypes,
+                    folderId,
+                    documentIds: searchScope.documentIds,
+                    docRoles,
+                    partyRoles,
+                    partySides,
+                    group: groupByDocument ? "documents" : "chunks",
+                })
+            ).map((result) => ({
+                doc_id:
+                    labelByDocumentId.get(result.document_id) ??
+                    result.document_id,
                 document_id: result.document_id,
                 version_id: result.version_id,
                 chunk_id: result.chunk_id,
@@ -2660,12 +3477,18 @@ export async function runToolCalls(
             }));
             const unindexed_documents = listProjectIndexGaps(projectId, {
                 documentIds: searchScope.documentIds,
-            }).map(
-                (doc) => ({
-                    ...doc,
-                    doc_id: labelByDocumentId.get(doc.document_id) ?? doc.document_id,
-                }),
-            );
+            }).map((doc) => ({
+                ...doc,
+                doc_id:
+                    labelByDocumentId.get(doc.document_id) ?? doc.document_id,
+            }));
+            const partial_ocr_documents = listProjectPartialOcr(projectId, {
+                documentIds: searchScope.documentIds,
+            }).map((doc) => ({
+                ...doc,
+                doc_id:
+                    labelByDocumentId.get(doc.document_id) ?? doc.document_id,
+            }));
             for (const result of results) {
                 docsFound.push({
                     filename: result.filename,
@@ -2680,13 +3503,15 @@ export async function runToolCalls(
                     query,
                     results,
                     unindexed_documents,
+                    partial_ocr_documents,
                     fallback:
-                        results.length === 0 || unindexed_documents.length > 0
-                            ? "If search results are missing or insufficient, use read_document/find_in_document on relevant unindexed or selected documents rather than waiting for the index."
+                        results.length === 0 ||
+                        unindexed_documents.length > 0 ||
+                        partial_ocr_documents.length > 0
+                            ? "Some documents are unindexed or only partially OCR-processed. Use partial_ocr_documents to disclose coverage gaps, and use targeted source reads or run full OCR before claiming exhaustive coverage."
                             : undefined,
                 }),
             });
-
         } else if (tc.function.name === "read_index_chunk") {
             if (!projectId) {
                 toolResults.push({
@@ -2757,7 +3582,6 @@ export async function runToolCalls(
                 tool_call_id: tc.id,
                 content: JSON.stringify({ chunks }),
             });
-
         } else if (tc.function.name === "fetch_documents") {
             const rawDocIds = (args.doc_ids as string[]) ?? [];
             const docIds = rawDocIds.map(
@@ -2780,7 +3604,13 @@ export async function runToolCalls(
                 documentResultMaxChars ?? FULL_READ_MAX_TEXT_BYTES,
             );
             for (const docId of docIds) {
-                const content = await readDocumentContent(docId, docStore, write, docIndex, db);
+                const content = await readDocumentContent(
+                    docId,
+                    docStore,
+                    write,
+                    docIndex,
+                    db,
+                );
                 const filename = docStore.get(docId)?.filename ?? docId;
                 totalBytes += Buffer.byteLength(content, "utf8");
                 if (totalBytes > maxFetchBytes) {
@@ -2806,18 +3636,25 @@ export async function runToolCalls(
                 tool_call_id: tc.id,
                 content: parts.join("\n\n"),
             });
-
         } else if (tc.function.name === "list_workflows") {
             const list = workflowStore
-                ? Array.from(workflowStore.entries()).map(([id, w]) => ({ id, title: w.title }))
+                ? Array.from(workflowStore.entries()).map(([id, w]) => ({
+                      id,
+                      title: w.title,
+                  }))
                 : [];
-            toolResults.push({ role: "tool", tool_call_id: tc.id, content: JSON.stringify(list) });
-
+            toolResults.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: JSON.stringify(list),
+            });
         } else if (tc.function.name === "read_workflow") {
             const wfId = args.workflow_id as string;
             const wf = workflowStore?.get(wfId);
             if (wf) {
-                write(`data: ${JSON.stringify({ type: "workflow_applied", workflow_id: wfId, title: wf.title })}\n\n`);
+                write(
+                    `data: ${JSON.stringify({ type: "workflow_applied", workflow_id: wfId, title: wf.title })}\n\n`,
+                );
                 workflowsApplied.push({ workflow_id: wfId, title: wf.title });
             }
             toolResults.push({
@@ -2825,7 +3662,6 @@ export async function runToolCalls(
                 tool_call_id: tc.id,
                 content: wf ? wf.prompt_md : `Workflow '${wfId}' not found.`,
             });
-
         } else if (tc.function.name === "read_table_cells" && tabularStore) {
             const colIndices = args.col_indices as number[] | undefined;
             const rowIndices = args.row_indices as number[] | undefined;
@@ -2834,23 +3670,36 @@ export async function runToolCalls(
                 ? tabularStore.columns.filter((_, i) => colIndices.includes(i))
                 : tabularStore.columns;
             const filteredDocs = rowIndices?.length
-                ? tabularStore.documents.filter((_, i) => rowIndices.includes(i))
+                ? tabularStore.documents.filter((_, i) =>
+                      rowIndices.includes(i),
+                  )
                 : tabularStore.documents;
 
             const label = `${filteredCols.length} ${filteredCols.length === 1 ? "column" : "columns"} × ${filteredDocs.length} ${filteredDocs.length === 1 ? "row" : "rows"}`;
-            write(`data: ${JSON.stringify({ type: "doc_read_start", filename: label })}\n\n`);
+            write(
+                `data: ${JSON.stringify({ type: "doc_read_start", filename: label })}\n\n`,
+            );
 
             const lines: string[] = [];
             for (const col of filteredCols) {
-                const colPos = tabularStore.columns.findIndex((c) => c.index === col.index);
+                const colPos = tabularStore.columns.findIndex(
+                    (c) => c.index === col.index,
+                );
                 for (const doc of filteredDocs) {
-                    const rowPos = tabularStore.documents.findIndex((d) => d.id === doc.id);
-                    const cell = tabularStore.cells.get(`${col.index}:${doc.id}`);
-                    lines.push(`[COL:${colPos} "${col.name}" | ROW:${rowPos} "${doc.filename}"]`);
+                    const rowPos = tabularStore.documents.findIndex(
+                        (d) => d.id === doc.id,
+                    );
+                    const cell = tabularStore.cells.get(
+                        `${col.index}:${doc.id}`,
+                    );
+                    lines.push(
+                        `[COL:${colPos} "${col.name}" | ROW:${rowPos} "${doc.filename}"]`,
+                    );
                     if (cell?.summary) {
                         lines.push(`Summary: ${cell.summary}`);
                         if (cell.flag) lines.push(`Flag: ${cell.flag}`);
-                        if (cell.reasoning) lines.push(`Reasoning: ${cell.reasoning}`);
+                        if (cell.reasoning)
+                            lines.push(`Reasoning: ${cell.reasoning}`);
                     } else {
                         lines.push(`(not yet generated)`);
                     }
@@ -2858,14 +3707,15 @@ export async function runToolCalls(
                 }
             }
 
-            write(`data: ${JSON.stringify({ type: "doc_read", filename: label })}\n\n`);
+            write(
+                `data: ${JSON.stringify({ type: "doc_read", filename: label })}\n\n`,
+            );
             docsRead.push({ filename: label });
             toolResults.push({
                 role: "tool",
                 tool_call_id: tc.id,
                 content: lines.join("\n") || "No cells found.",
             });
-
         } else if (tc.function.name === "edit_document" && docIndex) {
             const rawDocId = args.doc_id as string;
             const editsRaw = args.edits as unknown[] | undefined;
@@ -2909,10 +3759,7 @@ export async function runToolCalls(
                     tool_call_id: tc.id,
                     content: JSON.stringify({ error: err }),
                 });
-            } else if (
-                !Array.isArray(editsRaw) ||
-                editsRaw.length === 0
-            ) {
+            } else if (!Array.isArray(editsRaw) || editsRaw.length === 0) {
                 const err = "edits array is required and must not be empty.";
                 emitEditError(docInfo.filename, indexed.document_id, err);
                 toolResults.push({
@@ -2935,15 +3782,15 @@ export async function runToolCalls(
                         filename: docInfo.filename,
                     })}\n\n`,
                 );
-                const edits: EditInput[] = (editsRaw as Record<string, unknown>[]).map(
-                    (e) => ({
-                        find: String(e.find ?? ""),
-                        replace: String(e.replace ?? ""),
-                        context_before: String(e.context_before ?? ""),
-                        context_after: String(e.context_after ?? ""),
-                        reason: e.reason ? String(e.reason) : undefined,
-                    }),
-                );
+                const edits: EditInput[] = (
+                    editsRaw as Record<string, unknown>[]
+                ).map((e) => ({
+                    find: String(e.find ?? ""),
+                    replace: String(e.replace ?? ""),
+                    context_before: String(e.context_before ?? ""),
+                    context_after: String(e.context_after ?? ""),
+                    reason: e.reason ? String(e.reason) : undefined,
+                }));
                 const reuseVersion = turnEditState?.get(indexed.document_id);
                 const result = await runEditDocument({
                     documentId: indexed.document_id,
@@ -3026,7 +3873,6 @@ export async function runToolCalls(
                     });
                 }
             }
-
         } else if (tc.function.name === "replicate_document" && docIndex) {
             const rawDocId = args.doc_id as string;
             const requestedFilename =
@@ -3135,7 +3981,11 @@ export async function runToolCalls(
                             .from("documents")
                             .insert(docRows)
                             .select("id, filename");
-                        if (docErr || !insertedDocs || insertedDocs.length === 0) {
+                        if (
+                            docErr ||
+                            !insertedDocs ||
+                            insertedDocs.length === 0
+                        ) {
                             fail(
                                 `Failed to record replicated documents: ${docErr?.message ?? "unknown"}`,
                             );
@@ -3210,7 +4060,10 @@ export async function runToolCalls(
                                     `Failed to record replicated document versions: ${verErr?.message ?? "unknown"}`,
                                 );
                             } else {
-                                const versionByDocId = new Map<string, string>();
+                                const versionByDocId = new Map<
+                                    string,
+                                    string
+                                >();
                                 for (const v of insertedVersions as {
                                     id: string;
                                     document_id: string;
@@ -3235,7 +4088,8 @@ export async function runToolCalls(
                                 );
                                 for (const d of newDocs) {
                                     const versionId = versionByDocId.get(d.id);
-                                    if (versionId) enqueueDocumentIndex(d.id, versionId);
+                                    if (versionId)
+                                        enqueueDocumentIndex(d.id, versionId);
                                 }
 
                                 // Register every copy under a fresh doc-N
@@ -3325,13 +4179,21 @@ export async function runToolCalls(
                     fail(`replicate_document failed: ${String(e)}`);
                 }
             }
-
         } else if (tc.function.name === "generate_docx") {
             const title = args.title as string;
-            const landscape = !!(args.landscape);
-            console.log(`[generate_docx] title="${title}" landscape=${landscape} args.landscape=${args.landscape}`);
-            const previewFilename = `${(title.replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, 64) || "document")}.docx`;
-            write(`data: ${JSON.stringify({ type: "doc_created_start", filename: previewFilename })}\n\n`);
+            const landscape = !!args.landscape;
+            console.log(
+                `[generate_docx] title="${title}" landscape=${landscape} args.landscape=${args.landscape}`,
+            );
+            const previewFilename = `${
+                title
+                    .replace(/[^a-zA-Z0-9 _-]/g, "")
+                    .trim()
+                    .slice(0, 64) || "document"
+            }.docx`;
+            write(
+                `data: ${JSON.stringify({ type: "doc_created_start", filename: previewFilename })}\n\n`,
+            );
             const result = await generateDocx(
                 title,
                 args.sections as unknown[],
@@ -3343,10 +4205,15 @@ export async function runToolCalls(
             if ("filename" in result && "download_url" in result) {
                 const dlFilename = result.filename as string;
                 const dlUrl = result.download_url as string;
-                const documentId = (result as { document_id?: string }).document_id;
-                const versionId = (result as { version_id?: string }).version_id;
-                const versionNumber = (result as { version_number?: number }).version_number ?? null;
-                const storagePath = (result as { storage_path?: string }).storage_path;
+                const documentId = (result as { document_id?: string })
+                    .document_id;
+                const versionId = (result as { version_id?: string })
+                    .version_id;
+                const versionNumber =
+                    (result as { version_number?: number }).version_number ??
+                    null;
+                const storagePath = (result as { storage_path?: string })
+                    .storage_path;
 
                 // Register the generated doc in the chat context so
                 // edit_document (and read_document / find_in_document)
@@ -3387,14 +4254,19 @@ export async function runToolCalls(
                     version_number: versionNumber,
                 });
             } else {
-                write(`data: ${JSON.stringify({ type: "doc_created", filename: previewFilename, download_url: "" })}\n\n`);
+                write(
+                    `data: ${JSON.stringify({ type: "doc_created", filename: previewFilename, download_url: "" })}\n\n`,
+                );
             }
             // Surface the chat-local doc label in the tool result so the
             // model can pass it as `doc_id` to edit_document / read_document
             // / find_in_document in the same turn. Without this the model
             // only sees the DB UUID, which isn't valid as a doc_id anchor.
             const toolResultPayload = newDocLabel
-                ? { ...(result as Record<string, unknown>), doc_id: newDocLabel }
+                ? {
+                      ...(result as Record<string, unknown>),
+                      doc_id: newDocLabel,
+                  }
                 : result;
             toolResults.push({
                 role: "tool",
@@ -3412,6 +4284,7 @@ export async function runToolCalls(
         docsReplicated,
         workflowsApplied,
         docsEdited,
+        documentSummaries,
     };
 }
 
@@ -3445,7 +4318,7 @@ function parseCitations(text: string): ParsedCitation[] {
 type CitationValidationError = {
     code:
         | "duplicate_ref"
-        | "invalid_ref_sequence"
+        | "orphan_citation"
         | "unknown_document"
         | "quote_not_found"
         | "invalid_chunk_span";
@@ -3476,34 +4349,33 @@ export function validateCitationContract(
     docIndex: DocIndex,
 ): { citations: ParsedCitation[]; errors: CitationValidationError[] } {
     const errors: CitationValidationError[] = [];
-    const refs = markerRefs(text);
-    const citationRefs = citations.map((citation) => citation.ref);
-    const uniqueRefs = new Set(citationRefs);
-
-    if (uniqueRefs.size !== citationRefs.length) {
-        for (const ref of uniqueRefs) {
-            if (citationRefs.filter((value) => value === ref).length > 1) {
-                errors.push({ code: "duplicate_ref", ref });
-            }
-        }
-    }
-
-    const expected = Array.from({ length: citations.length }, (_, index) => index + 1);
-    if (
-        refs.length !== expected.length ||
-        refs.some((ref, index) => ref !== expected[index]) ||
-        citationRefs.some((ref, index) => ref !== expected[index])
-    ) {
-        errors.push({ code: "invalid_ref_sequence" });
-    }
-
+    const markerRefSet = new Set(markerRefs(text));
+    const refCounts = new Map<number, number>();
     for (const citation of citations) {
+        refCounts.set(citation.ref, (refCounts.get(citation.ref) ?? 0) + 1);
+    }
+
+    const kept: ParsedCitation[] = [];
+    const reportedDuplicate = new Set<number>();
+    for (const citation of citations) {
+        if ((refCounts.get(citation.ref) ?? 0) > 1) {
+            if (!reportedDuplicate.has(citation.ref)) {
+                errors.push({ code: "duplicate_ref", ref: citation.ref });
+                reportedDuplicate.add(citation.ref);
+            }
+            continue;
+        }
         if (!resolveDoc(citation.doc_id, docIndex)) {
             errors.push({ code: "unknown_document", ref: citation.ref });
+            continue;
         }
+        if (!markerRefSet.has(citation.ref)) {
+            errors.push({ code: "orphan_citation", ref: citation.ref });
+            continue;
+        }
+        kept.push(citation);
     }
-
-    return errors.length > 0 ? { citations: [], errors } : { citations, errors };
+    return { citations: kept, errors };
 }
 
 type CitationEvidenceRow = {
@@ -3530,6 +4402,7 @@ function normaliseCitationText(value: string): string {
 
 function citationEvidenceRows(
     doc: NonNullable<ReturnType<typeof resolveDoc>>,
+    quote?: string,
 ): CitationEvidenceRow[] {
     try {
         const versionId = doc.version_id ?? null;
@@ -3538,12 +4411,108 @@ function citationEvidenceRows(
                 `SELECT id AS chunk_id, chunk_index, page_number, content, start_char, end_char
                  FROM document_index_chunks
                  WHERE document_id = ? AND (? IS NULL OR version_id = ?)
+                   AND (? IS NULL OR instr(lower(content), lower(?)) > 0)
                  ORDER BY chunk_index ASC`,
             )
-            .all(doc.document_id, versionId, versionId) as CitationEvidenceRow[];
+            .all(
+                doc.document_id,
+                versionId,
+                versionId,
+                quote || null,
+                quote || null,
+            ) as CitationEvidenceRow[];
     } catch {
         return [];
     }
+}
+
+type CitationRowLoader = (
+    doc: NonNullable<ReturnType<typeof resolveDoc>>,
+    quote?: string,
+) => CitationEvidenceRow[];
+
+function textNamesFilename(text: string, filename: string): boolean {
+    const haystack = text.toLocaleLowerCase();
+    const needle = filename.toLocaleLowerCase();
+    let offset = 0;
+    while (offset < haystack.length) {
+        const index = haystack.indexOf(needle, offset);
+        if (index < 0) return false;
+        const before = index > 0 ? haystack[index - 1] : "";
+        const after = haystack[index + needle.length] ?? "";
+        const isFilenameCharacter = (character: string) =>
+            character !== "" && /[\p{L}\p{N}_.-]/u.test(character);
+        if (!isFilenameCharacter(before) && !isFilenameCharacter(after)) {
+            return true;
+        }
+        offset = index + 1;
+    }
+    return false;
+}
+
+/**
+ * Small local models occasionally quote an exact source sentence and name the
+ * source file but omit the machine-readable citation block. Recover one
+ * marker only when the quoted phrase is found in that named document's index.
+ * Ambiguous unnamed matches fail closed.
+ */
+export function recoverNamedQuotedCitation(
+    text: string,
+    docIndex: DocIndex,
+    loadRows: CitationRowLoader = citationEvidenceRows,
+): { text: string; citations: ParsedCitation[] } {
+    const body = text.replace(CITATIONS_BLOCK_RE, "").trimEnd();
+    for (const match of body.matchAll(/["“]([^"”\n]{8,300})["”]/g)) {
+        const quote = match[1].trim();
+        const wordCount = quote.split(/\s+/).filter(Boolean).length;
+        if (wordCount < 3 || wordCount > 25 || match.index === undefined) {
+            continue;
+        }
+        const expected = normaliseCitationText(quote);
+        const entries = Object.entries(docIndex);
+        const nearbyText = body
+            .slice(
+                Math.max(0, match.index - 240),
+                Math.min(body.length, match.index + match[0].length + 240),
+            )
+            .toLocaleLowerCase();
+        const namedEntries = entries.filter(([, doc]) =>
+            textNamesFilename(nearbyText, doc.filename),
+        );
+        const mentionsUnknownFilename =
+            namedEntries.length === 0 &&
+            /(?:^|[^\p{L}\p{N}_.-])[\p{L}\p{N}_.-]+\.(?:pdf|docx?|txt|md|rtf|xlsx?|pptx?)(?=$|[^\p{L}\p{N}_.-])/iu.test(
+                nearbyText,
+            );
+        const searchableEntries =
+            namedEntries.length > 0
+                ? namedEntries
+                : mentionsUnknownFilename || entries.length > 16
+                  ? []
+                  : entries;
+        const candidates = searchableEntries.flatMap(([docId, doc]) => {
+            const row = loadRows(doc, quote).find((item) =>
+                normaliseCitationText(item.content).includes(expected),
+            );
+            return row ? [{ docId, doc, row }] : [];
+        });
+        const selected = candidates.length === 1 ? candidates[0] : undefined;
+        if (!selected) continue;
+
+        const markerAt = match.index + match[0].length;
+        return {
+            text: `${body.slice(0, markerAt)} [1]${body.slice(markerAt)}`,
+            citations: [
+                {
+                    ref: 1,
+                    doc_id: selected.docId,
+                    page: selected.row.page_number ?? 1,
+                    quote,
+                },
+            ],
+        };
+    }
+    return { text: body, citations: [] };
 }
 
 type CitationEvidenceMatch = CitationEvidenceRow & {
@@ -3557,34 +4526,43 @@ function mergedCitationEvidenceMatch(
     rows: CitationEvidenceRow[],
     expectedQuote: string,
 ): CitationEvidenceMatch | undefined {
-    if (citation.quote_start !== undefined || citation.quote_end !== undefined) {
+    if (
+        citation.quote_start !== undefined ||
+        citation.quote_end !== undefined
+    ) {
         return undefined;
     }
     const anchorChunk = citation.chunk_id
         ? rows.find((row) => row.chunk_id === citation.chunk_id)
         : undefined;
     if (citation.chunk_id && !anchorChunk) return undefined;
-    const citationPage = typeof citation.page === "number"
-        ? citation.page
-        : Number.parseInt(citation.page, 10);
+    const citationPage =
+        typeof citation.page === "number"
+            ? citation.page
+            : Number.parseInt(citation.page, 10);
     const pages = [anchorChunk?.page_number ?? citationPage];
     for (const page of pages) {
         const pageIndexes = new Set(
-            rows.filter((row) => row.page_number === page).map((row) => row.chunk_index),
+            rows
+                .filter((row) => row.page_number === page)
+                .map((row) => row.chunk_index),
         );
-        const windowRows = rows.filter((row) =>
-            pageIndexes.has(row.chunk_index) ||
-            pageIndexes.has(row.chunk_index - 1) ||
-            pageIndexes.has(row.chunk_index + 1),
+        const windowRows = rows.filter(
+            (row) =>
+                pageIndexes.has(row.chunk_index) ||
+                pageIndexes.has(row.chunk_index - 1) ||
+                pageIndexes.has(row.chunk_index + 1),
         );
-        const merged = mergeAnnotationChunksWithSegments(windowRows.map((row) => ({
-            chunk_id: row.chunk_id,
-            chunk_index: row.chunk_index,
-            page_number: row.page_number,
-            content: row.content,
-            start_char: row.start_char,
-            end_char: row.end_char,
-        })));
+        const merged = mergeAnnotationChunksWithSegments(
+            windowRows.map((row) => ({
+                chunk_id: row.chunk_id,
+                chunk_index: row.chunk_index,
+                page_number: row.page_number,
+                content: row.content,
+                start_char: row.start_char,
+                end_char: row.end_char,
+            })),
+        );
         const normalizedText = normaliseCitationText(merged.text);
         const matchIndex = normalizedText.indexOf(expectedQuote);
         if (matchIndex < 0) continue;
@@ -3602,7 +4580,9 @@ function mergedCitationEvidenceMatch(
         if (citation.chunk_id && segment.chunk.chunk_id !== citation.chunk_id) {
             continue;
         }
-        const source = rows.find((row) => row.chunk_id === segment.chunk.chunk_id);
+        const source = rows.find(
+            (row) => row.chunk_id === segment.chunk.chunk_id,
+        );
         if (!source) continue;
         const endSegment = segmentsWithNormalizedEnds.find(
             (candidate) => candidate.normalizedEnd >= matchEnd,
@@ -3613,11 +4593,13 @@ function mergedCitationEvidenceMatch(
         const exactChunkStart = segment.chunk.content.indexOf(citation.quote);
         return {
             ...source,
-            ...(withinSingleChunk && exactChunkStart >= 0 && normalizedChunkStart >= 0
+            ...(withinSingleChunk &&
+            exactChunkStart >= 0 &&
+            normalizedChunkStart >= 0
                 ? {
-                    quote_start: exactChunkStart,
-                    quote_end: exactChunkStart + citation.quote.length,
-                }
+                      quote_start: exactChunkStart,
+                      quote_end: exactChunkStart + citation.quote.length,
+                  }
                 : {}),
             merged: true,
         };
@@ -3650,22 +4632,26 @@ export function validateCitationEvidence(
             documentRows = citationEvidenceRows(doc);
             rowsByDocument.set(cacheKey, documentRows);
         }
-        const citationPage = typeof citation.page === "number"
-            ? citation.page
-            : Number.parseInt(citation.page, 10);
+        const citationPage =
+            typeof citation.page === "number"
+                ? citation.page
+                : Number.parseInt(citation.page, 10);
         const candidateRows = citation.chunk_id
             ? documentRows.filter((row) => row.chunk_id === citation.chunk_id)
             : [...documentRows].sort((a, b) => {
-                if (a.page_number === citationPage) return -1;
-                if (b.page_number === citationPage) return 1;
-                return a.chunk_index - b.chunk_index;
-            });
+                  if (a.page_number === citationPage) return -1;
+                  if (b.page_number === citationPage) return 1;
+                  return a.chunk_index - b.chunk_index;
+              });
         const singleChunkMatch = candidateRows.find((row) => {
             if (
                 citation.quote_start !== undefined &&
                 citation.quote_end !== undefined
             ) {
-                const span = row.content.slice(citation.quote_start, citation.quote_end);
+                const span = row.content.slice(
+                    citation.quote_start,
+                    citation.quote_end,
+                );
                 return normaliseCitationText(span) === expectedQuote;
             }
             return (
@@ -3675,7 +4661,11 @@ export function validateCitationEvidence(
         });
         const match: CitationEvidenceMatch | undefined = singleChunkMatch
             ? { ...singleChunkMatch, merged: false }
-            : mergedCitationEvidenceMatch(citation, documentRows, expectedQuote);
+            : mergedCitationEvidenceMatch(
+                  citation,
+                  documentRows,
+                  expectedQuote,
+              );
         if (!match) {
             errors.push({ code: "quote_not_found", ref: citation.ref });
             continue;
@@ -3683,13 +4673,13 @@ export function validateCitationEvidence(
 
         const start = match.merged
             ? match.quote_start
-            : citation.quote_start ?? match.content.indexOf(citation.quote);
+            : (citation.quote_start ?? match.content.indexOf(citation.quote));
         const end = match.merged
             ? match.quote_end
-            : citation.quote_end ??
-                (start !== undefined && start >= 0
-                    ? start + citation.quote.length
-                    : undefined);
+            : (citation.quote_end ??
+              (start !== undefined && start >= 0
+                  ? start + citation.quote.length
+                  : undefined));
         if (
             citation.chunk_id &&
             !match.merged &&
@@ -3716,6 +4706,31 @@ function stripCitationBlock(text: string): string {
     return text.replace(CITATIONS_BLOCK_RE, "").trimEnd();
 }
 
+function stripLeakedModelReasoning(text: string): string {
+    let cleaned = text.replace(/<think\b[^>]*>[\s\S]*?<\/think\s*>/gi, "");
+    const unmatchedClose = cleaned.match(/<\/think\s*>/i);
+    if (unmatchedClose?.index !== undefined) {
+        cleaned = cleaned.slice(
+            unmatchedClose.index + unmatchedClose[0].length,
+        );
+    }
+    const unmatchedOpen = cleaned.search(/<think\b[^>]*>/i);
+    if (unmatchedOpen >= 0) cleaned = cleaned.slice(0, unmatchedOpen);
+    cleaned = cleaned.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "");
+    const unmatchedToolClose = cleaned.match(/<\/tool_call\s*>/i);
+    if (unmatchedToolClose?.index !== undefined) {
+        cleaned = cleaned.slice(
+            unmatchedToolClose.index + unmatchedToolClose[0].length,
+        );
+    }
+    const unmatchedToolOpen = cleaned.search(/<tool_call\b[^>]*>/i);
+    if (unmatchedToolOpen >= 0) cleaned = cleaned.slice(0, unmatchedToolOpen);
+    return cleaned
+        .replace(/<\/?tool_call\b[^>]*>/gi, "")
+        .replace(/<\/?think\b[^>]*>/gi, "")
+        .trimStart();
+}
+
 function escapeRegExp(value: string): string {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -3725,7 +4740,7 @@ export function sanitizeAssistantVisibleText(
     citations: CitationForDisplay[],
     docIndex: DocIndex,
 ): string {
-    let cleaned = stripCitationBlock(text);
+    let cleaned = stripCitationBlock(stripLeakedModelReasoning(text));
     const validRefs = new Set(
         citations
             .map((c) => c.ref)
@@ -3741,7 +4756,10 @@ export function sanitizeAssistantVisibleText(
         const escapedLabel = escapeRegExp(label);
         const escapedFilename = escapeRegExp(info.filename);
         cleaned = cleaned.replace(
-            new RegExp(`(${escapedFilename})\\s*\\(\\s*${escapedLabel}\\s*\\)`, "g"),
+            new RegExp(
+                `(${escapedFilename})\\s*\\(\\s*${escapedLabel}\\s*\\)`,
+                "g",
+            ),
             "$1",
         );
         cleaned = cleaned.replace(
@@ -3759,6 +4777,93 @@ export function sanitizeAssistantVisibleText(
         .replace(/[ \t]+\n/g, "\n")
         .replace(/\n{3,}/g, "\n\n")
         .trimEnd();
+}
+
+/**
+ * Compact the surviving citation refs into a dense 1..K sequence, rewriting
+ * BOTH the inline [N] markers in `visibleText` and the citation objects
+ * together so a discarded citation never leaves a numbering gap or a dangling
+ * multi-ref marker. Numbering follows first marker appearance. A marker whose
+ * ref has no surviving citation is dropped; a multi-ref marker keeps only its
+ * surviving refs.
+ */
+export function renumberCitations<T extends { ref: number }>(
+    visibleText: string,
+    citations: T[],
+): { text: string; citations: T[] } {
+    const surviving = new Set(citations.map((citation) => citation.ref));
+    const remap = new Map<number, number>();
+    for (const match of visibleText.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g)) {
+        for (const raw of match[1].split(",")) {
+            const ref = Number.parseInt(raw.trim(), 10);
+            if (surviving.has(ref) && !remap.has(ref)) {
+                remap.set(ref, remap.size + 1);
+            }
+        }
+    }
+    const text = visibleText.replace(
+        /\[(\d+(?:,\s*\d+)*)\]/g,
+        (_whole, group: string) => {
+            const mapped = group
+                .split(",")
+                .map((raw) => remap.get(Number.parseInt(raw.trim(), 10)))
+                .filter((ref): ref is number => ref !== undefined);
+            return mapped.length ? `[${mapped.join(", ")}]` : "";
+        },
+    );
+    const nextCitations = citations
+        .filter((citation) => remap.has(citation.ref))
+        .map((citation) => ({
+            ...citation,
+            ref: remap.get(citation.ref) as number,
+        }))
+        .sort((a, b) => a.ref - b.ref);
+    return { text, citations: nextCitations };
+}
+
+export function dedupeCitationEvidence<
+    T extends {
+        ref: number;
+        doc_id?: unknown;
+        document_id?: unknown;
+        page?: unknown;
+        quote?: unknown;
+        chunk_id?: unknown;
+    },
+>(visibleText: string, citations: T[]): { text: string; citations: T[] } {
+    const canonicalRefByKey = new Map<string, number>();
+    const refMap = new Map<number, number>();
+    const unique: T[] = [];
+    for (const citation of citations) {
+        const key = JSON.stringify([
+            citation.document_id ?? citation.doc_id,
+            citation.page,
+            citation.quote,
+            citation.chunk_id,
+        ]);
+        const canonicalRef = canonicalRefByKey.get(key);
+        if (canonicalRef === undefined) {
+            canonicalRefByKey.set(key, citation.ref);
+            refMap.set(citation.ref, citation.ref);
+            unique.push(citation);
+        } else {
+            refMap.set(citation.ref, canonicalRef);
+        }
+    }
+    const text = visibleText
+        .replace(/\[(\d+(?:,\s*\d+)*)\]/g, (_whole, group: string) => {
+            const mapped = Array.from(
+                new Set(
+                    group
+                        .split(",")
+                        .map((raw) => Number.parseInt(raw.trim(), 10))
+                        .map((ref) => refMap.get(ref) ?? ref),
+                ),
+            );
+            return `[${mapped.join(", ")}]`;
+        })
+        .replace(/\[(\d+)\](?:\s*\[\1\])+/g, "[$1]");
+    return { text, citations: unique };
 }
 
 // ---------------------------------------------------------------------------
@@ -3785,6 +4890,12 @@ export type EditAnnotation = {
 type AssistantEvent =
     | { type: "reasoning"; text: string }
     | { type: "doc_read"; filename: string; document_id?: string }
+    | {
+          type: "doc_summary";
+          filename: string;
+          document_id: string;
+          coverage: DocumentSummaryCoverage;
+      }
     | {
           type: "doc_find";
           filename: string;
@@ -3824,6 +4935,48 @@ type AssistantEvent =
       }
     | { type: "content"; text: string };
 
+export function automaticWholeDocumentSummaryTarget(
+    apiMessages: unknown[],
+    docIndex: DocIndex,
+): { docId: string; focus: string; language: string } | null {
+    const messages = apiMessages as { role?: unknown; content?: unknown }[];
+    const lastUser = [...messages]
+        .reverse()
+        .find(
+            (message) =>
+                message.role === "user" && typeof message.content === "string",
+        );
+    if (!lastUser || typeof lastUser.content !== "string") return null;
+    const raw = lastUser.content;
+    const request = raw.split(/\n\ndisplayed_doc:/i)[0].trim();
+    const asksForSummary =
+        /(요약|개요|핵심\s*(?:내용|사항).*정리|summari[sz]e|whole[- ]document summary|document overview|outline (?:this|the) document)/i.test(
+            request,
+        );
+    const asksAboutAnnotations =
+        /(주석|하이라이트|형광펜|코멘트|annotation|highlight)/i.test(request);
+    const asksForPageRange =
+        /(?:페이지|page)\s*\d+\s*(?:[-–~]|부터|to)\s*(?:페이지|page)?\s*\d+/i.test(
+            request,
+        ) || /\d+\s*(?:[-–~]|부터)\s*\d+\s*(?:페이지|pages?)/i.test(request);
+    if (!asksForSummary || asksAboutAnnotations || asksForPageRange)
+        return null;
+
+    const displayedId = raw.match(/displayed_doc_id:\s*([0-9a-f-]{36})/i)?.[1];
+    const entries = Object.entries(docIndex);
+    const target = displayedId
+        ? entries.find(([, info]) => info.document_id === displayedId)
+        : entries.length === 1
+          ? entries[0]
+          : undefined;
+    if (!target) return null;
+    return {
+        docId: target[0],
+        focus: request,
+        language: /[가-힣]/.test(request) ? "Korean" : "English",
+    };
+}
+
 export async function runLLMStream(params: {
     apiMessages: unknown[];
     docStore: DocStore;
@@ -3846,16 +4999,36 @@ export async function runLLMStream(params: {
     scopedDocumentIds?: string[];
     documentResultMaxChars?: number;
     disabledTools?: string[];
+    maxIterations?: number;
+    signal?: AbortSignal;
 }): Promise<{
     fullText: string;
     events: AssistantEvent[];
     citations: unknown[];
 }> {
-    const { apiMessages, docStore, docIndex, userId, db, write, extraTools, workflowStore, tabularStore, buildCitations, model, apiKeys, projectId, scopedDocumentIds } = params;
+    const {
+        apiMessages,
+        docStore,
+        docIndex,
+        userId,
+        db,
+        write,
+        extraTools,
+        workflowStore,
+        tabularStore,
+        buildCitations,
+        model,
+        apiKeys,
+        projectId,
+        scopedDocumentIds,
+    } = params;
     const offeredTools = extraTools?.length
         ? [...TOOLS, ...WORKFLOW_TOOLS, ...extraTools]
         : [...TOOLS, ...WORKFLOW_TOOLS];
-    const activeTools = filterToolsByDisabled(offeredTools, params.disabledTools);
+    const activeTools = filterToolsByDisabled(
+        offeredTools,
+        params.disabledTools,
+    );
 
     // Extract system prompt; pass remaining turns to the adapter as
     // plain user/assistant messages.
@@ -3890,6 +5063,7 @@ export async function runLLMStream(params: {
     let iterReasoning = "";
     let visibleTailBuffer = "";
     let citationsOpenSeen = false;
+    let preparedDocumentSummary: string | null = null;
 
     const streamVisibleContent = (delta: string) => {
         if (!delta) return;
@@ -3951,162 +5125,254 @@ export async function runLLMStream(params: {
         selectedModel,
         params.documentResultMaxChars,
     );
+    const automaticSummaryTarget = automaticWholeDocumentSummaryTarget(
+        apiMessages,
+        docIndex,
+    );
 
-    await withSemanticIndexingPaused(() => streamChatWithTools({
-        model: selectedModel,
-        systemPrompt,
-        messages: chatMessages,
-        tools: activeTools as OpenAIToolSchema[],
-        maxIterations: 10,
-        apiKeys,
-        enableThinking: true,
-        callbacks: {
-            onContentDelta: (delta) => {
-                iterText += delta;
-                streamVisibleContent(delta);
-            },
-            onReasoningDelta: (delta) => {
-                iterReasoning += delta;
-                write(
-                    `data: ${JSON.stringify({ type: "reasoning_delta", text: delta })}\n\n`,
-                );
-            },
-            onReasoningBlockEnd: () => {
-                if (!iterReasoning) return;
-                events.push({ type: "reasoning", text: iterReasoning });
-                write(
-                    `data: ${JSON.stringify({ type: "reasoning_block_end" })}\n\n`,
-                );
-                iterReasoning = "";
-            },
-            // Fires after Claude's turn ends with stop_reason=tool_use, before
-            // the tool actually runs. Flushes any buffered assistant text so
-            // it's emitted in chronological order, then signals the client so
-            // it can open a fresh PreResponseWrapper (shows "Working…") while
-            // the tool executes — avoids the dead gap between message_stop
-            // and the first tool-specific event.
-            onToolCallStart: (call) => {
-                flushText();
-                write(
-                    `data: ${JSON.stringify({
-                        type: "tool_call_start",
-                        name: call.name,
-                    })}\n\n`,
-                );
-            },
-        },
-        runTools: async (calls) => {
-            // Emit any text the model produced before this tool turn so the
-            // UI sees it before the tool results stream in.
-            flushText();
-
-            const toolCalls: ToolCall[] = calls.map((c) => ({
-                id: c.id,
-                function: {
-                    name: c.name,
-                    arguments: JSON.stringify(c.input),
+    if (automaticSummaryTarget) {
+        write(
+            `data: ${JSON.stringify({
+                type: "tool_call_start",
+                name: "summarize_document",
+            })}\n\n`,
+        );
+        const summaryRun = await withSemanticIndexingPaused(() =>
+            runToolCalls(
+                [
+                    {
+                        id: `automatic-summary-${Date.now()}`,
+                        function: {
+                            name: "summarize_document",
+                            arguments: JSON.stringify({
+                                doc_id: automaticSummaryTarget.docId,
+                                focus: automaticSummaryTarget.focus,
+                                language: automaticSummaryTarget.language,
+                            }),
+                        },
+                    },
+                ],
+                docStore,
+                userId,
+                db,
+                write,
+                workflowStore,
+                tabularStore,
+                docIndex,
+                turnEditState,
+                projectId,
+                scopedDocumentIds,
+                documentResultMaxChars,
+                { model: selectedModel, apiKeys, signal: params.signal },
+            ),
+        );
+        const summary = summaryRun.documentSummaries.at(-1);
+        if (!summary) {
+            throw new Error(
+                "The displayed document could not be summarized from its index.",
+            );
+        }
+        preparedDocumentSummary = summary.prepared_text;
+        events.push({
+            type: "doc_summary",
+            filename: summary.filename,
+            document_id: summary.document_id,
+            coverage: summary.coverage,
+        });
+    } else {
+        await withSemanticIndexingPaused(() =>
+            streamChatWithTools({
+                model: selectedModel,
+                systemPrompt: systemPromptForModel(systemPrompt, selectedModel),
+                messages: chatMessages,
+                tools: activeTools as OpenAIToolSchema[],
+                maxIterations: Math.min(
+                    selectedModel.startsWith("free-router:") ||
+                        selectedModel.startsWith("free-router/")
+                        ? 3
+                        : 24,
+                    Math.max(1, Math.floor(params.maxIterations ?? 10)),
+                ),
+                apiKeys,
+                signal: params.signal,
+                enableThinking: true,
+                callbacks: {
+                    onContentDelta: (delta) => {
+                        iterText += delta;
+                        streamVisibleContent(delta);
+                    },
+                    onReasoningDelta: (delta) => {
+                        iterReasoning += delta;
+                        write(
+                            `data: ${JSON.stringify({ type: "reasoning_delta", text: delta })}\n\n`,
+                        );
+                    },
+                    onReasoningBlockEnd: () => {
+                        if (!iterReasoning) return;
+                        events.push({ type: "reasoning", text: iterReasoning });
+                        write(
+                            `data: ${JSON.stringify({ type: "reasoning_block_end" })}\n\n`,
+                        );
+                        iterReasoning = "";
+                    },
+                    // Fires after Claude's turn ends with stop_reason=tool_use, before
+                    // the tool actually runs. Flushes any buffered assistant text so
+                    // it's emitted in chronological order, then signals the client so
+                    // it can open a fresh PreResponseWrapper (shows "Working…") while
+                    // the tool executes — avoids the dead gap between message_stop
+                    // and the first tool-specific event.
+                    onToolCallStart: (call) => {
+                        flushText();
+                        write(
+                            `data: ${JSON.stringify({
+                                type: "tool_call_start",
+                                name: call.name,
+                            })}\n\n`,
+                        );
+                    },
                 },
-            }));
-            const {
-                toolResults,
-                docsRead,
-                docsFound,
-                docsCreated,
-                docsReplicated,
-                workflowsApplied,
-                docsEdited,
-            } = await runToolCalls(
-                    toolCalls,
-                    docStore,
-                    userId,
-                    db,
-                    write,
-                    workflowStore,
-                    tabularStore,
-                    docIndex,
-                    turnEditState,
-                    projectId,
-                    scopedDocumentIds,
-                    documentResultMaxChars,
-                );
-            for (const r of docsRead) {
-                events.push({
-                    type: "doc_read",
-                    filename: r.filename,
-                    document_id: r.document_id,
-                });
-            }
-            for (const f of docsFound) {
-                events.push({
-                    type: "doc_find",
-                    filename: f.filename,
-                    query: f.query,
-                    total_matches: f.total_matches,
-                });
-            }
-            for (const dl of docsCreated) {
-                events.push({
-                    type: "doc_created",
-                    filename: dl.filename,
-                    download_url: dl.download_url,
-                    document_id: dl.document_id,
-                    version_id: dl.version_id,
-                    version_number: dl.version_number ?? null,
-                });
-            }
-            for (const r of docsReplicated) {
-                events.push({
-                    type: "doc_replicated",
-                    filename: r.filename,
-                    count: r.count,
-                    copies: r.copies,
-                });
-            }
-            for (const wf of workflowsApplied) {
-                events.push({
-                    type: "workflow_applied",
-                    workflow_id: wf.workflow_id,
-                    title: wf.title,
-                });
-            }
-            for (const e of docsEdited) {
-                events.push({
-                    type: "doc_edited",
-                    filename: e.filename,
-                    document_id: e.document_id,
-                    version_id: e.version_id,
-                    version_number: e.version_number,
-                    download_url: e.download_url,
-                    annotations: e.annotations,
-                });
-            }
+                runTools: async (calls) => {
+                    // Emit any text the model produced before this tool turn so the
+                    // UI sees it before the tool results stream in.
+                    flushText();
 
-            // Index alignment would break if any tool branch skips its
-            // push (unhandled tool name, disabled store, guard failure).
-            // Each tool_result already carries its tool_call_id, so key off
-            // that directly — and fall back to an error result for any
-            // tool_use that didn't produce one, so Claude's next request
-            // has a tool_result for every tool_use it sent.
-            const resultByCallId = new Map<string, string>();
-            for (const r of toolResults) {
-                const row = r as { tool_call_id: string; content?: unknown };
-                resultByCallId.set(row.tool_call_id, String(row.content ?? ""));
-            }
-            return toolCalls.map((c) => ({
-                tool_use_id: c.id,
-                content:
-                    resultByCallId.get(c.id) ??
-                    JSON.stringify({
-                        error: `Tool '${c.function.name}' is not available.`,
-                    }),
-            }));
-        },
-    }));
+                    const toolCalls: ToolCall[] = calls.map((c) => ({
+                        id: c.id,
+                        function: {
+                            name: c.name,
+                            arguments: JSON.stringify(c.input),
+                        },
+                    }));
+                    const {
+                        toolResults,
+                        docsRead,
+                        docsFound,
+                        docsCreated,
+                        docsReplicated,
+                        workflowsApplied,
+                        docsEdited,
+                        documentSummaries,
+                    } = await runToolCalls(
+                        toolCalls,
+                        docStore,
+                        userId,
+                        db,
+                        write,
+                        workflowStore,
+                        tabularStore,
+                        docIndex,
+                        turnEditState,
+                        projectId,
+                        scopedDocumentIds,
+                        documentResultMaxChars,
+                        { model: selectedModel, apiKeys, signal: params.signal },
+                    );
+                    if (documentSummaries.length > 0) {
+                        preparedDocumentSummary =
+                            documentSummaries[documentSummaries.length - 1]
+                                .prepared_text;
+                    }
+                    for (const r of docsRead) {
+                        events.push({
+                            type: "doc_read",
+                            filename: r.filename,
+                            document_id: r.document_id,
+                        });
+                    }
+                    for (const summary of documentSummaries) {
+                        events.push({
+                            type: "doc_summary",
+                            filename: summary.filename,
+                            document_id: summary.document_id,
+                            coverage: summary.coverage,
+                        });
+                    }
+                    for (const f of docsFound) {
+                        events.push({
+                            type: "doc_find",
+                            filename: f.filename,
+                            query: f.query,
+                            total_matches: f.total_matches,
+                        });
+                    }
+                    for (const dl of docsCreated) {
+                        events.push({
+                            type: "doc_created",
+                            filename: dl.filename,
+                            download_url: dl.download_url,
+                            document_id: dl.document_id,
+                            version_id: dl.version_id,
+                            version_number: dl.version_number ?? null,
+                        });
+                    }
+                    for (const r of docsReplicated) {
+                        events.push({
+                            type: "doc_replicated",
+                            filename: r.filename,
+                            count: r.count,
+                            copies: r.copies,
+                        });
+                    }
+                    for (const wf of workflowsApplied) {
+                        events.push({
+                            type: "workflow_applied",
+                            workflow_id: wf.workflow_id,
+                            title: wf.title,
+                        });
+                    }
+                    for (const e of docsEdited) {
+                        events.push({
+                            type: "doc_edited",
+                            filename: e.filename,
+                            document_id: e.document_id,
+                            version_id: e.version_id,
+                            version_number: e.version_number,
+                            download_url: e.download_url,
+                            annotations: e.annotations,
+                        });
+                    }
+
+                    // Index alignment would break if any tool branch skips its
+                    // push (unhandled tool name, disabled store, guard failure).
+                    // Each tool_result already carries its tool_call_id, so key off
+                    // that directly — and fall back to an error result for any
+                    // tool_use that didn't produce one, so Claude's next request
+                    // has a tool_result for every tool_use it sent.
+                    const resultByCallId = new Map<string, string>();
+                    for (const r of toolResults) {
+                        const row = r as {
+                            tool_call_id: string;
+                            content?: unknown;
+                        };
+                        resultByCallId.set(
+                            row.tool_call_id,
+                            String(row.content ?? ""),
+                        );
+                    }
+                    return toolCalls.map((c) => ({
+                        tool_use_id: c.id,
+                        content:
+                            resultByCallId.get(c.id) ??
+                            JSON.stringify({
+                                error: `Tool '${c.function.name}' is not available.`,
+                            }),
+                    }));
+                },
+            }),
+        );
+    }
 
     flushText();
 
-    const parsedCitations = parseCitations(fullText);
-    const contract = validateCitationContract(fullText, parsedCitations, docIndex);
+    const answerText = stripLeakedModelReasoning(
+        preparedDocumentSummary ?? fullText,
+    );
+    const parsedCitations = parseCitations(answerText);
+    const contract = validateCitationContract(
+        answerText,
+        parsedCitations,
+        docIndex,
+    );
     const evidence = validateCitationEvidence(contract.citations, docIndex);
     if (contract.errors.length || evidence.errors.length) {
         console.warn("[citations] discarded or repaired invalid citations", {
@@ -4114,9 +5380,29 @@ export async function runLLMStream(params: {
             evidenceErrors: evidence.errors,
         });
     }
-    const citations = buildCitations
-        ? buildCitations(fullText)
-        : evidence.citations.map((c) => {
+    let citationText = answerText;
+    let verifiedCitations = evidence.citations;
+    if (
+        !buildCitations &&
+        verifiedCitations.length === 0 &&
+        (selectedModel.startsWith("ollama:") ||
+            selectedModel.startsWith("ollama/") ||
+            selectedModel.startsWith("free-router:") ||
+            selectedModel.startsWith("free-router/"))
+    ) {
+        const recovered = recoverNamedQuotedCitation(answerText, docIndex);
+        const recoveredEvidence = validateCitationEvidence(
+            recovered.citations,
+            docIndex,
+        );
+        if (recoveredEvidence.citations.length > 0) {
+            citationText = recovered.text;
+            verifiedCitations = recoveredEvidence.citations;
+        }
+    }
+    const builtCitations = buildCitations
+        ? buildCitations(answerText)
+        : verifiedCitations.map((c) => {
               const docInfo = resolveDoc(c.doc_id, docIndex);
               return {
                   ref: c.ref,
@@ -4132,14 +5418,33 @@ export async function runLLMStream(params: {
                   quote_end: c.quote_end,
               };
           });
-    const sanitizedVisibleText = sanitizeAssistantVisibleText(
-        fullText,
-        citations as CitationForDisplay[],
+    const preSanitized = sanitizeAssistantVisibleText(
+        citationText,
+        builtCitations as CitationForDisplay[],
         docIndex,
     );
+    let sanitizedVisibleText = preSanitized;
+    let citations = builtCitations;
+    if (!buildCitations) {
+        const deduped = dedupeCitationEvidence(
+            preSanitized,
+            builtCitations as Array<{
+                ref: number;
+                doc_id?: unknown;
+                document_id?: unknown;
+                page?: unknown;
+                quote?: unknown;
+                chunk_id?: unknown;
+            }>,
+        );
+        const renumbered = renumberCitations(deduped.text, deduped.citations);
+        sanitizedVisibleText = renumbered.text;
+        citations = renumbered.citations;
+    }
     const currentVisibleText = events
-        .filter((event): event is Extract<AssistantEvent, { type: "content" }> =>
-            event.type === "content",
+        .filter(
+            (event): event is Extract<AssistantEvent, { type: "content" }> =>
+                event.type === "content",
         )
         .map((event) => event.text)
         .join("");
@@ -4159,7 +5464,7 @@ export async function runLLMStream(params: {
     write(`data: ${JSON.stringify({ type: "citations", citations })}\n\n`);
     write("data: [DONE]\n\n");
 
-    return { fullText, events, citations };
+    return { fullText: answerText, events, citations };
 }
 
 // ---------------------------------------------------------------------------
@@ -4169,7 +5474,7 @@ export async function runLLMStream(params: {
 export function extractAnnotations(
     fullText: string,
     docIndex: DocIndex,
-    events?: { type: string } & Record<string, unknown>[] | unknown[],
+    events?: ({ type: string } & Record<string, unknown>[]) | unknown[],
     validatedCitations?: unknown[],
 ): unknown[] {
     const sourceCitations = validatedCitations ?? parseCitations(fullText);
@@ -4187,14 +5492,20 @@ export function extractAnnotations(
             page: c.page,
             quote: c.quote,
             ...(c.chunk_id ? { chunk_id: c.chunk_id } : {}),
-            ...(c.quote_start !== undefined ? { quote_start: c.quote_start } : {}),
+            ...(c.quote_start !== undefined
+                ? { quote_start: c.quote_start }
+                : {}),
             ...(c.quote_end !== undefined ? { quote_end: c.quote_end } : {}),
         };
     });
     if (Array.isArray(events)) {
-        for (const ev of events as { type?: string; annotations?: EditAnnotation[] }[]) {
+        for (const ev of events as {
+            type?: string;
+            annotations?: EditAnnotation[];
+        }[]) {
             if (ev?.type === "doc_edited" && Array.isArray(ev.annotations)) {
-                for (const a of ev.annotations) out.push({ ...a, type: "edit_data" });
+                for (const a of ev.annotations)
+                    out.push({ ...a, type: "edit_data" });
             }
         }
     }
@@ -4238,8 +5549,7 @@ export async function buildDocContext(
             if (!Array.isArray(content)) continue;
             for (const ev of content as Record<string, unknown>[]) {
                 if (
-                    (ev?.type === "doc_created" ||
-                        ev?.type === "doc_edited") &&
+                    (ev?.type === "doc_created" || ev?.type === "doc_edited") &&
                     typeof ev.document_id === "string"
                 ) {
                     documentIds.add(ev.document_id);
@@ -4299,17 +5609,25 @@ export async function buildProjectDocContext(
     projectId: string,
     _userId: string,
     db: ReturnType<typeof createServerSupabase>,
-): Promise<{ docIndex: DocIndex; docStore: DocStore; folderPaths: Map<string, string> }> {
+): Promise<{
+    docIndex: DocIndex;
+    docStore: DocStore;
+    folderPaths: Map<string, string>;
+}> {
     const docIndex: DocIndex = {};
     const docStore: DocStore = new Map();
 
     const [{ data: docs }, { data: folders }] = await Promise.all([
-        db.from("documents")
-            .select("id, filename, file_type, current_version_id, status, folder_id")
+        db
+            .from("documents")
+            .select(
+                "id, filename, file_type, current_version_id, status, folder_id, doc_role, party_role, party_side",
+            )
             .eq("project_id", projectId)
             .eq("status", "ready")
             .order("created_at", { ascending: true }),
-        db.from("project_subfolders")
+        db
+            .from("project_subfolders")
             .select("id, name, parent_folder_id")
             .eq("project_id", projectId),
     ]);
@@ -4321,12 +5639,22 @@ export async function buildProjectDocContext(
         active_version_number?: number | null;
         folder_id?: string | null;
         storage_path?: string | null;
+        doc_role?: DocRole;
+        party_role?: PartyRole | null;
+        party_side?: "A" | "B" | null;
     }[];
     await attachActiveVersionPaths(db, docList);
 
     // Build folder id → full path map
-    const folderMap = new Map<string, { name: string; parent_folder_id: string | null }>();
-    for (const f of folders ?? []) folderMap.set(f.id, { name: f.name, parent_folder_id: f.parent_folder_id });
+    const folderMap = new Map<
+        string,
+        { name: string; parent_folder_id: string | null }
+    >();
+    for (const f of folders ?? [])
+        folderMap.set(f.id, {
+            name: f.name,
+            parent_folder_id: f.parent_folder_id,
+        });
 
     function resolvePath(folderId: string | null): string {
         if (!folderId) return "";
@@ -4352,6 +5680,9 @@ export async function buildProjectDocContext(
             filename: doc.filename,
             version_id: doc.current_version_id ?? null,
             version_number: doc.active_version_number ?? null,
+            doc_role: doc.doc_role,
+            party_role: doc.party_role ?? null,
+            party_side: doc.party_side ?? null,
         };
         docStore.set(docLabel, {
             storage_path: doc.storage_path,
@@ -4379,7 +5710,11 @@ export function filterDocContext(
     docStore: DocStore,
     folderPaths: Map<string, string>,
     selectedDocumentIds: Iterable<string>,
-): { docIndex: DocIndex; docStore: DocStore; folderPaths: Map<string, string> } {
+): {
+    docIndex: DocIndex;
+    docStore: DocStore;
+    folderPaths: Map<string, string>;
+} {
     const selected = new Set(selectedDocumentIds);
     const filteredIndex: DocIndex = {};
     const filteredStore: DocStore = new Map();
@@ -4433,7 +5768,9 @@ export async function buildWorkflowStore(
             .from("workflow_shares")
             .select("workflow_id")
             .eq("shared_with_email", normalizedUserEmail);
-        const sharedIds = [...new Set((shares ?? []).map((share) => share.workflow_id))];
+        const sharedIds = [
+            ...new Set((shares ?? []).map((share) => share.workflow_id)),
+        ];
         if (sharedIds.length > 0) {
             const { data: sharedWorkflows } = await db
                 .from("workflows")
@@ -4442,7 +5779,10 @@ export async function buildWorkflowStore(
                 .eq("type", "assistant");
             for (const wf of sharedWorkflows ?? []) {
                 if (wf.prompt_md) {
-                    store.set(wf.id, { title: wf.title, prompt_md: wf.prompt_md });
+                    store.set(wf.id, {
+                        title: wf.title,
+                        prompt_md: wf.prompt_md,
+                    });
                 }
             }
         }

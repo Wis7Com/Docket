@@ -45,6 +45,11 @@ export interface DocketDocument {
     current_version_id?: string | null;
     /** Max version_number across assistant_edit rows, null if doc is unedited. */
     latest_version_number?: number | null;
+    doc_role?: "brief" | "evidence" | "other";
+    doc_role_confidence?: "high" | "low" | "manual";
+    party_role?: string | null;
+    party_side?: "A" | "B" | null;
+    instance?: string | null;
 }
 
 export interface StructureNode {
@@ -94,6 +99,23 @@ export type AssistantEvent =
           type: "doc_read";
           filename: string;
           document_id?: string;
+          isStreaming?: boolean;
+      }
+    | {
+          type: "doc_summary";
+          filename: string;
+          document_id?: string;
+          completed_batches: number;
+          total_batches: number;
+          coverage?: {
+              pageCount: number;
+              indexedPageRanges: { start: number; end: number }[];
+              indexedChunkCount: number;
+              processedChunkCount: number;
+              batchCount: number;
+              complete: boolean;
+              warnings: { code: string; message: string }[];
+          };
           isStreaming?: boolean;
       }
     | {
@@ -199,6 +221,46 @@ export interface PdfAnnotation {
     source_citation: Record<string, unknown> | null;
     created_at: string;
     updated_at: string;
+}
+
+export type AnnotationColorFamily =
+    "red" | "orange" | "yellow" | "green" | "blue" | "purple" | "pink" | "gray";
+
+export interface ProjectAnnotation {
+    id: string;
+    document_id: string;
+    version_id: string | null;
+    filename: string;
+    folder_path: string | null;
+    page_number: number;
+    annotation_type: "highlight" | "comment";
+    color: string | null;
+    color_family: AnnotationColorFamily | null;
+    quote: string | null;
+    comment: string | null;
+    source: string | null;
+    created_at: string;
+}
+
+export interface ProjectAnnotationsResponse {
+    annotations: ProjectAnnotation[];
+    total: number;
+    returned: number;
+    next_offset: number | null;
+    project_total: number;
+    group_counts: {
+        by_color_family: Array<{
+            color_family: AnnotationColorFamily | null;
+            count: number;
+        }>;
+        by_document: Array<{
+            document_id: string;
+            filename: string;
+            count: number;
+        }>;
+    };
+    applied_filters: Record<string, unknown>;
+    warnings: string[];
 }
 
 /**

@@ -95,6 +95,7 @@ import {
 } from "./pdfFind";
 import { normalizedOcrRegionToPdfRect } from "./ocrRegionGeometry";
 import { buildPdfAnnotationOverlayItems } from "./pdfAnnotationOverlay";
+import { buildCitationNavigationEffectKey } from "./citationNavigation";
 
 interface Props {
     doc: { document_id: string; version_id?: string | null } | null;
@@ -107,6 +108,8 @@ interface Props {
     focusAnnotationId?: string | null;
     /** Bump to re-trigger focusing the same annotation id. */
     focusAnnotationKey?: number | string;
+    /** Bump to re-trigger navigation for the same citation without reloading the PDF. */
+    citationNavigationKey?: string | null;
     /** Reports progressive PDF page rendering: (renderedPages, totalPages). */
     onRenderProgress?: (rendered: number, total: number) => void;
     rounded?: boolean;
@@ -141,6 +144,7 @@ export function DocView({
     fallbackPage,
     focusAnnotationId,
     focusAnnotationKey,
+    citationNavigationKey,
     onRenderProgress,
     rounded = true,
     bordered = true,
@@ -194,10 +198,12 @@ export function DocView({
         return [];
     }, [quotes, quote, fallbackPage]);
 
-    // Stable string key so effects can depend on quote-list identity
-    const quoteKey = quoteList
-        .map((q) => `${q.page ?? ""}:${q.quote}`)
-        .join("|");
+    // Combine stable source-passage identity with the per-click request key so
+    // selecting the same passage again still re-runs highlight-and-scroll.
+    const citationNavigationEffectKey = buildCitationNavigationEffectKey(
+        quoteList,
+        citationNavigationKey,
+    );
 
     const [containerWidth, setContainerWidth] = useState(0);
     const [zoom, setZoom] = useState(1.0);
@@ -1593,13 +1599,10 @@ export function DocView({
             // dimensions are measured only when that page enters the render
             // window, so a citation on page 700 can appear without waiting
             // for pages 2–699 to be fetched first.
-            pageSizesRef.current = Array.from(
-                { length: doc.numPages },
-                () => ({
-                    width: firstViewport.width,
-                    height: firstViewport.height,
-                }),
-            );
+            pageSizesRef.current = Array.from({ length: doc.numPages }, () => ({
+                width: firstViewport.width,
+                height: firstViewport.height,
+            }));
 
             const scale = computePdfScale(container);
 
@@ -2018,7 +2021,7 @@ export function DocView({
         quoteListRef.current = quoteList;
         if (quoteList.length === 0) return;
         void rehighlightQuotes(quoteList);
-    }, [quoteKey, rehighlightQuotes]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [citationNavigationEffectKey, rehighlightQuotes]); // eslint-disable-line react-hooks/exhaustive-deps
 
     function handleZoomIn() {
         const next = Math.min(

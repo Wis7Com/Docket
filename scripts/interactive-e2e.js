@@ -21,11 +21,78 @@ const { _electron } = require("playwright-core");
 
 const ROOT = path.resolve(__dirname, "..");
 const results = [];
+const rendererHttpErrors = [];
 let page = null;
 let shotIndex = 0;
 let frontendProc = null;
 let frontendUrl = "";
 const SHOTS = fs.mkdtempSync(path.join(os.tmpdir(), "docket-e2e-shots-"));
+
+const LIVE_LLM_PROVIDERS = {
+  gemini: {
+    modelId: "gemini-3-flash-preview",
+    label: "Gemini Flash",
+    screenshot: "live-gemini-project-answer",
+    requiredKeys: ["gemini_api_key"],
+  },
+  ollama: {
+    modelId: "ollama:gemma4:12b-mlx",
+    label: "local Gemma 4 12B",
+    screenshot: "live-ollama-gemma4-project-answer",
+    requiredKeys: [],
+  },
+  "free-router": {
+    modelId: "free-router:free-router/best",
+    label: "FreeRouter",
+    screenshot: "live-free-router-project-answer",
+    requiredKeys: [],
+  },
+  openrouter: {
+    modelId: "openrouter:openai/gpt-oss-120b",
+    label: "OpenRouter",
+    screenshot: "live-openrouter-project-answer",
+    requiredKeys: ["openrouter_api_key"],
+  },
+};
+
+function readLiveLlmConfig() {
+  if (process.env.RUN_LIVE_LLM_E2E !== "1") return null;
+  const providerName = process.env.RUN_LIVE_LLM_E2E_PROVIDER || "gemini";
+  const provider = LIVE_LLM_PROVIDERS[providerName];
+  if (!provider) {
+    throw new Error(
+      `Unsupported RUN_LIVE_LLM_E2E_PROVIDER: ${providerName}`,
+    );
+  }
+  if (provider.requiredKeys.length === 0) {
+    return { provider, profilePatch: {} };
+  }
+  const profileDb = process.env.DOCKET_LIVE_PROFILE_DB;
+  if (!profileDb) throw new Error("DOCKET_LIVE_PROFILE_DB is required for live LLM E2E");
+  const Database = require(
+    path.join(ROOT, "backend", "node_modules", "better-sqlite3"),
+  );
+  const db = new Database(profileDb, { readonly: true, fileMustExist: true });
+  try {
+    const row = db
+      .prepare(
+        "SELECT gemini_api_key, openrouter_api_key FROM user_profiles WHERE user_id = ? LIMIT 1",
+      )
+      .get(process.env.DOCKET_LIVE_USER_ID || "local-user");
+    const missing = provider.requiredKeys.filter((key) => !row?.[key]);
+    if (missing.length) {
+      throw new Error(`${provider.label} credentials must be configured`);
+    }
+    return {
+      provider,
+      profilePatch: Object.fromEntries(
+        provider.requiredKeys.map((key) => [key, row[key]]),
+      ),
+    };
+  } finally {
+    db.close();
+  }
+}
 
 function record(step, ok, detail = "") {
   results.push({ step, ok, detail });
@@ -121,6 +188,7 @@ async function dragUntilAnnotation(pg, locator, expectedCount, { editor = false 
 }
 
 async function main() {
+  const liveLlmConfig = readLiveLlmConfig();
   // Seed an isolated project folder with a real PDF + markdown.
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "docket-e2e-project-"));
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "docket-e2e-userdata-"));
@@ -151,7 +219,12 @@ async function main() {
       font,
     });
   }
-  fs.writeFileSync(path.join(projectDir, "e2e-agreement.pdf"), Buffer.from(await pdf.save()));
+  const seededPdf = Buffer.from(await pdf.save());
+  fs.writeFileSync(path.join(projectDir, "e2e-agreement.pdf"), seededPdf);
+  fs.writeFileSync(path.join(projectDir, "원고 준비서면.pdf"), seededPdf);
+  fs.writeFileSync(path.join(projectDir, "갑 제1호증.pdf"), seededPdf);
+  fs.mkdirSync(path.join(projectDir, "Evidence"));
+  fs.writeFileSync(path.join(projectDir, "Evidence", "을 제2호증.pdf"), seededPdf);
   fs.writeFileSync(
     path.join(projectDir, "notes.md"),
     "# E2E Notes\n\n## Indemnity\n\nIndemnity survives termination.\n\n## Liability\n\nLiability is capped.\n",
@@ -179,6 +252,20 @@ async function main() {
       DOCKET_FRONTEND_URL: frontendUrl,
       DOCKET_FRONTEND_PORT: String(frontendPort),
       DOCKET_SKIP_LIBREOFFICE_PROBE: "1",
+      ...(liveLlmConfig
+        ? {
+            ...(liveLlmConfig.profilePatch.gemini_api_key
+              ? { GEMINI_API_KEY: liveLlmConfig.profilePatch.gemini_api_key }
+              : {}),
+            ...(liveLlmConfig.profilePatch.openrouter_api_key
+              ? { OPENROUTER_API_KEY: liveLlmConfig.profilePatch.openrouter_api_key }
+              : {}),
+            ...(liveLlmConfig.provider.modelId.startsWith("ollama:") ||
+            liveLlmConfig.provider.modelId.startsWith("free-router:")
+              ? { OLLAMA_TITLE_MODEL: "ollama:gemma4:12b-mlx" }
+              : {}),
+          }
+        : {}),
     },
   });
 
@@ -186,6 +273,12 @@ async function main() {
     page = await app.firstWindow();
     page.on("console", (msg) => {
       if (msg.type() === "error") console.log(`[renderer-error] ${msg.text().slice(0, 200)}`);
+    });
+    page.on("response", (response) => {
+      if (response.status() >= 400) {
+        rendererHttpErrors.push({ status: response.status(), url: response.url() });
+        console.log(`[renderer-response] ${response.status()} ${response.url()}`);
+      }
     });
 
     // 1. App opens straight to /projects (FR11: no login gate).
@@ -203,7 +296,7 @@ async function main() {
     const projectUrl = page.url();
     await page.waitForSelector('[data-session-check="project-doc-row"]', { timeout: 60_000 });
     const docRows = await page.locator('[data-session-check="project-doc-row"]').count();
-    record("open-folder: creates project and lists scanned files", docRows >= 2, `doc rows=${docRows}`);
+    record("open-folder: creates project and lists scanned files", docRows >= 5, `doc rows=${docRows}`);
     await shot("project-page");
 
     // 3. Manual rescan through the real control (FR8).
@@ -374,7 +467,13 @@ async function main() {
     // clicking one opens the dedicated viewer focused on that annotation.
     await page.goto(projectUrl);
     await page.waitForSelector('[data-session-check="project-doc-row"]', { timeout: 30_000 });
-    await page.locator('[data-session-check="project-annotation-toggle"]').first().click();
+    const annotatedProjectRow = page
+      .locator('[data-session-check="project-doc-row"]')
+      .filter({ hasText: "e2e-agreement.pdf" })
+      .first();
+    await annotatedProjectRow
+      .locator('[data-session-check="project-annotation-toggle"]')
+      .click();
     const docTabRowsListed = await page
       .waitForFunction(
         () =>
@@ -419,12 +518,82 @@ async function main() {
     }
     await annotationViewer.close().catch(() => {});
 
-    // 11. Row actions: Download/Upload-new-version are replaced by
+    // 11. Persist a project color legend through the real editor, reload it,
+    // and verify the saved party binding survives.
+    const legend = page.locator('[data-session-check="project-color-legend"]');
+    await legend.locator("summary").click();
+    const greenLegendRow = legend.locator(
+      '[data-session-check="project-color-legend-row"][data-color-family="green"]',
+    );
+    await greenLegendRow.locator("input").nth(0).fill("undisputed facts");
+    await greenLegendRow.locator("input").nth(1).fill("defendant");
+    await greenLegendRow.locator("select").selectOption("B");
+    await legend.locator('[data-session-check="project-color-legend-save"]').click();
+    await page.waitForSelector(
+      '[data-session-check="project-color-legend-status"]:has-text("Saved")',
+      { timeout: 30_000 },
+    );
+    await page.reload();
+    await page.waitForSelector('[data-session-check="project-doc-row"]', { timeout: 30_000 });
+    const reloadedLegend = page.locator('[data-session-check="project-color-legend"]');
+    await reloadedLegend.locator("summary").click();
+    const reloadedGreenRow = reloadedLegend.locator(
+      '[data-session-check="project-color-legend-row"][data-color-family="green"]',
+    );
+    const legendPersisted =
+      (await reloadedGreenRow.locator("input").nth(0).inputValue()) === "undisputed facts" &&
+      (await reloadedGreenRow.locator("input").nth(1).inputValue()) === "defendant" &&
+      (await reloadedGreenRow.locator("select").inputValue()) === "B";
+    record("color-legend: saves and reloads meaning + party binding", legendPersisted, "green=undisputed facts, defendant/B");
+    await shot("color-legend-persisted");
+    if ((await reloadedLegend.getAttribute("open")) !== null) {
+      await reloadedLegend.locator("summary").click();
+    }
+
+    // 12. The project-wide annotation browser must show both annotations and
+    // filter to the single commented annotation through pointer input.
+    await page.getByRole("button", { name: "All highlights", exact: true }).click();
+    const annotationBrowser = page.locator(
+      '[data-session-check="project-annotation-browser"]',
+    );
+    await annotationBrowser.waitFor({ state: "visible", timeout: 30_000 });
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll(
+          '[data-session-check="project-annotation-browser-row"]',
+        ).length >= 2,
+      undefined,
+      { timeout: 30_000 },
+    );
+    const allHighlightRows = await annotationBrowser
+      .locator('[data-session-check="project-annotation-browser-row"]')
+      .count();
+    await annotationBrowser.getByLabel("With comments").check();
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll(
+          '[data-session-check="project-annotation-browser-row"]',
+        ).length === 1,
+      undefined,
+      { timeout: 30_000 },
+    );
+    record(
+      "all-highlights: lists project annotations and filters comments",
+      allHighlightRows >= 2,
+      `all=${allHighlightRows}, with-comments=1`,
+    );
+    await shot("all-highlights-comments-filter");
+    await page.getByRole("button", { name: "Files", exact: true }).click();
+
+    // 13. Row actions: Download/Upload-new-version are replaced by
     // Export with annotations + Rescan; Rescan runs without error.
-    await page
+    const rowActionTarget = page
       .locator('[data-session-check="project-doc-row"]')
-      .first()
-      .locator("button", { hasText: "···" })
+      .filter({ hasText: "e2e-agreement.pdf" })
+      .first();
+    await rowActionTarget.scrollIntoViewIfNeeded();
+    await rowActionTarget
+      .locator('[data-session-check="row-actions-trigger"]')
       .click();
     await page.waitForSelector('[data-session-check="row-rescan"]', { timeout: 10_000 });
     const hasExportItem = await page
@@ -445,14 +614,115 @@ async function main() {
       "",
     );
 
-    // 12. Project chat explorer: expanding a PDF row lists the annotations
+    // Create a real project subfolder and move an evidence document into it so
+    // the chat explorer's descendant-scope checkbox is exercised end to end.
+    await page.locator('[data-session-check="project-add-subfolder"]').click();
+    const newFolderInput = page.locator(
+      '[data-session-check="project-new-folder-input"]',
+    );
+    await newFolderInput.fill("Evidence Scope");
+    await newFolderInput.press("Enter");
+    const projectFolderRow = page.locator(
+      '[data-session-check="project-folder-row"][data-folder-name="Evidence Scope"]',
+    );
+    await projectFolderRow.waitFor({ state: "visible", timeout: 30_000 });
+    const evidenceProjectRow = page
+      .locator('[data-session-check="project-doc-row"]')
+      .filter({ hasText: "갑 제1호증.pdf" })
+      .first();
+    await evidenceProjectRow.dragTo(projectFolderRow);
+    await page.waitForTimeout(1_000);
+    record(
+      "folders: creates a project folder and moves evidence into it",
+      (await projectFolderRow.count()) === 1,
+      "Evidence Scope",
+    );
+
+    if (liveLlmConfig) {
+      await page.evaluate(async ({ profilePatch, modelId }) => {
+        if (Object.keys(profilePatch).length > 0) {
+          const [port, token] = await Promise.all([
+            window.docket?.getApiPort?.(),
+            window.docket?.getToken?.(),
+          ]);
+          if (!port || !token) throw new Error("desktop session bridge unavailable");
+          const response = await fetch(`http://localhost:${port}/user/profile`, {
+            method: "PATCH",
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(profilePatch),
+          });
+          if (!response.ok) throw new Error(`profile update failed: ${response.status}`);
+        }
+        localStorage.setItem("docket.selectedModel", modelId);
+      }, {
+        profilePatch: liveLlmConfig.profilePatch,
+        modelId: liveLlmConfig.provider.modelId,
+      });
+      await page.reload();
+      await page.waitForSelector('[data-session-check="project-doc-row"]', {
+        timeout: 60_000,
+      });
+    }
+
+    // 14. Project chat explorer: folder selection and the brief-only action
+    // enforce source scope, then annotation controls remain interactive.
     // created in steps 5-6, and right-click can delete one.
     await page.getByRole("button", { name: /^Chat$/ }).first().click();
     await page.waitForURL("**/assistant/chat/**", { timeout: 60_000 });
     await page.waitForSelector('[data-session-check="explorer-annotation-toggle"]', {
       timeout: 30_000,
     });
-    await page.locator('[data-session-check="explorer-annotation-toggle"]').first().click();
+    const explorerFolderRow = page.locator(
+      '[data-session-check="explorer-folder-row"][data-folder-name="Evidence Scope"]',
+    );
+    const folderScope = explorerFolderRow.locator(
+      '[data-session-check="explorer-folder-source-checkbox"]',
+    );
+    const nestedEvidence = page.locator(
+      '[data-session-check="project-explorer-document"][data-filename="갑 제1호증.pdf"]',
+    );
+    await folderScope.uncheck();
+    await explorerFolderRow.getByText("Evidence Scope", { exact: true }).click();
+    await nestedEvidence.waitFor({ state: "visible", timeout: 10_000 });
+    const folderDeselected = !(await nestedEvidence
+      .locator('[data-session-check="explorer-source-checkbox"]')
+      .isChecked());
+    await folderScope.check();
+    const folderSelected = await nestedEvidence
+      .locator('[data-session-check="explorer-source-checkbox"]')
+      .isChecked();
+    record(
+      "explorer: folder checkbox toggles descendant document scope",
+      folderDeselected && folderSelected,
+      "nested evidence toggled off/on",
+    );
+
+    await page.locator('[data-session-check="explorer-select-briefs"]').click();
+    const evidenceSelected = await page
+      .locator(
+        '[data-session-check="project-explorer-document"][data-filename="갑 제1호증.pdf"] [data-session-check="explorer-source-checkbox"]',
+      )
+      .isChecked();
+    const briefSelected = await page
+      .locator(
+        '[data-session-check="project-explorer-document"][data-filename="원고 준비서면.pdf"] [data-session-check="explorer-source-checkbox"]',
+      )
+      .isChecked();
+    record(
+      "explorer: 서면만 excludes classified evidence and keeps briefs",
+      !evidenceSelected && briefSelected,
+      `evidence=${evidenceSelected}, brief=${briefSelected}`,
+    );
+
+    const annotatedExplorerDocument = page.locator(
+      '[data-session-check="project-explorer-document"][data-filename="e2e-agreement.pdf"]',
+    );
+    await annotatedExplorerDocument
+      .locator('[data-session-check="explorer-annotation-toggle"]')
+      .click();
     const annotationsListed = await page
       .waitForFunction(
         () =>
@@ -526,9 +796,167 @@ async function main() {
       `rows=${await page.locator('[data-session-check="explorer-annotation-row"]').count()}`,
     );
     await shot("explorer-annotations-bulk-deleted");
+
+    if (liveLlmConfig) {
+      // Ground the live-provider assertion in one unambiguous selected source.
+      // The other seeded PDFs intentionally duplicate the smoke sentence for
+      // classification tests, so leaving them selected would make an omitted
+      // model citation impossible to recover without guessing a document.
+      await page
+        .getByLabel("Select all chat source documents")
+        .uncheck();
+      await annotatedExplorerDocument
+        .locator('[data-session-check="explorer-source-checkbox"]')
+        .check();
+      const selectedSourceDocumentId = await annotatedExplorerDocument.getAttribute(
+        "data-document-id",
+      );
+      const beforeMessages = await page
+        .locator('[data-session-check="assistant-message"]')
+        .count();
+      const livePrompt = page.locator(
+        '[data-session-check="chat-input-textarea"]',
+      );
+      await livePrompt.fill(
+        "What does the indemnity clause in e2e-agreement.pdf say about termination? Search the selected project document and cite the source.",
+      );
+      // Next's development indicator sits above the bottom-right submit
+      // button in dev builds, so submit through the same Enter-key path a
+      // keyboard user uses instead of bypassing hit testing.
+      await livePrompt.press("Enter");
+      const liveAnswer = page
+        .locator('[data-session-check="assistant-message"]')
+        .nth(beforeMessages);
+      await liveAnswer.waitFor({ state: "visible", timeout: 60_000 });
+      await page.waitForFunction(
+        (index) => {
+          const messages = document.querySelectorAll(
+            '[data-session-check="assistant-message"]',
+          );
+          return /survives termination/i.test(messages[index]?.textContent ?? "");
+        },
+        beforeMessages,
+        { timeout: 180_000 },
+      );
+      // Title generation can briefly refresh the chat route after the first
+      // answer. Wait for both the answer and project explorer to be restored
+      // before recording the visual artifact.
+      await page.waitForTimeout(1_500);
+      await page.waitForFunction(
+        () =>
+          /survives termination/i.test(
+            Array.from(
+              document.querySelectorAll(
+                '[data-session-check="assistant-message"]',
+              ),
+            )
+              .map((element) => element.textContent ?? "")
+              .join(" "),
+          ) &&
+          document.querySelectorAll(
+            '[data-session-check="project-explorer-document"]',
+          ).length >= 3,
+        undefined,
+        { timeout: 60_000 },
+      );
+      // Some providers expose the requested phrase well before their final
+      // citation block. The cleared input leaves this button disabled only
+      // after streaming has finished, so wait for that terminal UI state.
+      await page.waitForFunction(
+        () => {
+          const submit = document.querySelector(
+            '[data-session-check="chat-submit"]',
+          );
+          return submit instanceof HTMLButtonElement && submit.disabled;
+        },
+        undefined,
+        { timeout: 240_000 },
+      );
+      const citationButtons = liveAnswer.locator(
+        '[data-session-check="assistant-citation-button"]',
+      );
+      // The final citations SSE event lands after the visible answer text and
+      // may race the automatic chat-title refresh. Wait for the grounded
+      // marker instead of sampling annotations at the first rendered token.
+      await citationButtons
+        .first()
+        .waitFor({ state: "visible", timeout: 30_000 })
+        .catch(() => {});
+      // Chat-title persistence may remount the assistant pane just after the
+      // stream ends. Capture and assert the fully restored answer, not the
+      // transient skeleton shown during that route refresh.
+      await page.waitForTimeout(2_500);
+      await page.waitForFunction(
+        () =>
+          /survives termination/i.test(
+            Array.from(
+              document.querySelectorAll(
+                '[data-session-check="assistant-message"]',
+              ),
+            )
+              .map((element) => element.textContent ?? "")
+              .join(" "),
+          ) &&
+          document.querySelectorAll(
+            '[data-session-check="assistant-citation-button"]',
+          ).length > 0 &&
+          document.querySelectorAll(
+            '[data-session-check="project-explorer-document"]',
+          ).length >= 3,
+        undefined,
+        { timeout: 60_000 },
+      );
+      const citationCount = await citationButtons.count();
+      const citedDocumentIds = await citationButtons.evaluateAll((buttons) =>
+        buttons.map((button) => button.getAttribute("data-document-id")),
+      );
+      const unresolvedCitationCount = await liveAnswer
+        .getByTitle(/Citation \d+ is unavailable/)
+        .count();
+      record(
+        `live-llm: ${liveLlmConfig.provider.label} answers from indexed project documents`,
+        citationCount > 0 &&
+          unresolvedCitationCount === 0 &&
+          Boolean(selectedSourceDocumentId) &&
+          citedDocumentIds.every((id) => id === selectedSourceDocumentId),
+        `citations=${citationCount}, unresolved=${unresolvedCitationCount}, scoped=${citedDocumentIds.every((id) => id === selectedSourceDocumentId)}`,
+      );
+      await shot(liveLlmConfig.provider.screenshot);
+    }
+
+    record(
+      "network: interactive workflow has no failed HTTP responses",
+      rendererHttpErrors.length === 0,
+      rendererHttpErrors.map(({ status, url }) => `${status} ${url}`).join(", "),
+    );
   } catch (err) {
     record("UNEXPECTED", false, String(err).slice(0, 500));
     if (page) await shot("failure").catch(() => {});
+    try {
+      const logsDir = path.join(userData, ".docket", "logs");
+      const latestLog = fs
+        .readdirSync(logsDir)
+        .filter((name) => name.endsWith(".log"))
+        .map((name) => path.join(logsDir, name))
+        .sort(
+          (a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs,
+        )[0];
+      if (latestLog) {
+        const relevant = fs
+          .readFileSync(latestLog, "utf8")
+          .split(/\r?\n/)
+          .filter((line) =>
+            /project-chat|gemini|ollama|free-router|openrouter|stream.*error/i.test(
+              line,
+            ),
+          )
+          .slice(-30)
+          .join("\n");
+        if (relevant) console.log(`[interactive-e2e backend]\n${relevant}`);
+      }
+    } catch {
+      // Best-effort failure diagnostics; the isolated profile is still removed.
+    }
   } finally {
     fs.writeFileSync(path.join(SHOTS, "results.json"), JSON.stringify(results, null, 2));
     await app.close().catch(() => {});

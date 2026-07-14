@@ -23,8 +23,10 @@ type OpenAIChatMessage = {
 
 type ChatCompletionResponse = {
   choices?: {
+    finish_reason?: string | null;
     message?: {
       content?: string | null;
+      reasoning?: string | null;
       tool_calls?: {
         id?: string;
         type?: string;
@@ -219,14 +221,16 @@ function parseToolArguments(raw: string | undefined): Record<string, unknown> {
 async function postChatCompletion(
   endpoint: EndpointConfig,
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<ChatCompletionResponse> {
-  const { response } = await postChatCompletionResponse(endpoint, body);
+  const { response } = await postChatCompletionResponse(endpoint, body, signal);
   return (await response.json()) as ChatCompletionResponse;
 }
 
 async function postChatCompletionResponse(
   endpoint: EndpointConfig,
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<OpenAICompatibleResponse> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -239,6 +243,7 @@ async function postChatCompletionResponse(
     provider: endpoint.provider,
     model: endpoint.model,
     providerOverrideEnv: OPENAI_COMPATIBLE_RESPONSE_START_TIMEOUT_ENV,
+    signal,
     init: {
       method: "POST",
       headers,
@@ -280,8 +285,50 @@ function toAssistantToolCalls(
   return calls.map((call) => ({
     id: call.id,
     type: "function",
-    function: { name: call.name, arguments: JSON.stringify(call.input ?? {}) },
+    function: {
+      name: call.name,
+      arguments: JSON.stringify(call.input ?? {}),
+    },
   }));
+}
+
+const SAFE_TEXT_TOOL_NAMES = new Set([
+  "find_in_document",
+  "read_index_chunk",
+  "read_document",
+  "summarize_document",
+  "search_project_documents",
+  "list_documents",
+]);
+
+function parseTextToolCalls(
+  content: string,
+  tools: StreamChatParams["tools"],
+): NormalizedToolCall[] {
+  const offered = new Set((tools ?? []).map((tool) => tool.function.name));
+  const calls: NormalizedToolCall[] = [];
+  for (const block of content.matchAll(
+    /<tool_call>([\s\S]*?)<\/tool_call>/gi,
+  )) {
+    const body = block[1];
+    const functionMatch = body.match(/<function=([^>]+)>/i);
+    const name = functionMatch?.[1]?.trim() ?? "";
+    if (!SAFE_TEXT_TOOL_NAMES.has(name) || !offered.has(name)) continue;
+    const input: Record<string, unknown> = {};
+    for (const parameter of body.matchAll(
+      /<parameter=([^>]+)>([\s\S]*?)<\/parameter>/gi,
+    )) {
+      const key = parameter[1].trim();
+      const raw = parameter[2].trim();
+      if (!key) continue;
+      if (/^-?\d+(?:\.\d+)?$/.test(raw)) input[key] = Number(raw);
+      else if (/^(?:true|false)$/i.test(raw))
+        input[key] = raw.toLowerCase() === "true";
+      else input[key] = raw;
+    }
+    calls.push({ id: `text-tool-${calls.length}`, name, input });
+  }
+  return calls;
 }
 
 type ToolCallParts = {
@@ -366,6 +413,7 @@ async function readOpenAIStream(
 export async function streamOpenAICompatible(
   params: StreamChatParams,
 ): Promise<StreamChatResult> {
+  params.signal?.throwIfAborted();
   const { tools = [], callbacks = {}, runTools } = params;
   const endpoint = await resolveEndpoint(params.model, params.apiKeys);
   const messages = toOpenAIMessages(params.systemPrompt, params.messages);
@@ -373,28 +421,64 @@ export async function streamOpenAICompatible(
   let fullText = "";
 
   for (let iter = 0; iter < maxIter; iter++) {
+    // Reserve the final provider turn for a user-visible answer. Without this
+    // guard a tool-happy routed model can spend every allowed iteration on
+    // another search/read call and return no answer at all.
+    const allowTools = tools.length > 0 && iter < maxIter - 1;
+    const requestMessages =
+      allowTools || tools.length === 0
+        ? messages
+        : [
+            ...messages,
+            {
+              role: "user" as const,
+              content:
+                "Using the tool results already provided, write the final answer now. Do not call or describe another tool. Do not emit tool-call markup. Include verified citations in the requested format.",
+            },
+          ];
     const body: Record<string, unknown> = {
       model: endpoint.model,
-      messages,
+      messages: requestMessages,
       stream: true,
       tools: tools.length ? tools : undefined,
-      tool_choice: tools.length ? "auto" : undefined,
-      max_tokens: 16_384,
+      tool_choice: tools.length ? (allowTools ? "auto" : "none") : undefined,
+      // FreeRouter may select a reasoning-heavy free model. A bounded budget
+      // prevents a short desktop answer from spending minutes in hidden
+      // reasoning while preserving the larger budget for explicit providers.
+      max_tokens: endpoint.provider === "free-router" ? 4_096 : 16_384,
     };
     let content = "";
-    const resp = await postChatCompletionResponse(endpoint, body);
-    const toolCalls = await readOpenAIStream(resp, (delta) => {
+    const resp = await postChatCompletionResponse(
+      endpoint,
+      body,
+      params.signal,
+    );
+    const structuredToolCalls = await readOpenAIStream(resp, (delta) => {
       content += delta;
       fullText += delta;
       callbacks.onContentDelta?.(delta);
     });
+    const textToolCalls =
+      allowTools && structuredToolCalls.length === 0
+        ? parseTextToolCalls(content, tools)
+        : [];
+    const toolCalls = structuredToolCalls.length
+      ? structuredToolCalls
+      : textToolCalls;
 
     if (!toolCalls.length || !runTools) break;
+
+    if (textToolCalls.length) {
+      fullText = fullText.slice(
+        0,
+        Math.max(0, fullText.length - content.length),
+      );
+    }
 
     for (const call of toolCalls) callbacks.onToolCallStart?.(call);
     messages.push({
       role: "assistant",
-      content: content || null,
+      content: textToolCalls.length ? null : content || null,
       tool_calls: toAssistantToolCalls(toolCalls),
     });
     const results = await runTools(toolCalls);
@@ -415,21 +499,66 @@ export async function completeOpenAICompatibleText(params: {
   systemPrompt?: string;
   user: string;
   maxTokens?: number;
+  responseJsonSchema?: Record<string, unknown>;
   apiKeys?: StreamChatParams["apiKeys"];
+  signal?: AbortSignal;
 }): Promise<string> {
   const endpoint = await resolveEndpoint(params.model, params.apiKeys);
-  const completion = await postChatCompletion(endpoint, {
+  const messages = [
+    ...(params.systemPrompt
+      ? [{ role: "system", content: params.systemPrompt }]
+      : []),
+    { role: "user", content: params.user },
+  ];
+  const initialBudget = params.maxTokens ?? 512;
+  let completion = await postChatCompletion(endpoint, {
     model: endpoint.model,
-    messages: [
-      ...(params.systemPrompt
-        ? [{ role: "system", content: params.systemPrompt }]
-        : []),
-      { role: "user", content: params.user },
-    ],
+    messages,
     stream: false,
-    max_tokens: params.maxTokens ?? 512,
-  });
-  return completion.choices?.[0]?.message?.content ?? "";
+    max_tokens: initialBudget,
+    response_format: params.responseJsonSchema
+      ? {
+          type: "json_schema",
+          json_schema: {
+            name: "docket_structured_response",
+            strict: true,
+            schema: params.responseJsonSchema,
+          },
+        }
+      : undefined,
+  }, params.signal);
+  let choice = completion.choices?.[0];
+  let content = choice?.message?.content ?? "";
+
+  // Reasoning models may spend the entire small completion budget on hidden
+  // reasoning and return HTTP 200 with no user-visible content. Retry once
+  // only for that precise truncation shape; ordinary empty replies are kept.
+  if (
+    !content.trim() &&
+    choice?.finish_reason === "length" &&
+    Boolean(choice.message?.reasoning)
+  ) {
+    completion = await postChatCompletion(endpoint, {
+      model: endpoint.model,
+      messages,
+      stream: false,
+      max_tokens: Math.max(2_048, initialBudget * 2),
+      response_format: params.responseJsonSchema
+        ? {
+            type: "json_schema",
+            json_schema: {
+              name: "docket_structured_response",
+              strict: true,
+              schema: params.responseJsonSchema,
+            },
+          }
+        : undefined,
+    }, params.signal);
+    choice = completion.choices?.[0];
+    content = choice?.message?.content ?? "";
+  }
+
+  return content;
 }
 
 export type { OpenAIToolSchema };
