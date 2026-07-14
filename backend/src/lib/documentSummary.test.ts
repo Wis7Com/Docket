@@ -220,6 +220,355 @@ test("map prompts send compact source records without server-side offsets", asyn
   );
 });
 
+test("map prompts de-overlap adjacent chunks without changing citation offsets", async () => {
+  const overlap = "DUPLICATED OVERLAP.";
+  const firstContent = `Opening text ${overlap}`;
+  const secondContent = `${overlap} Closing text.`;
+  const chunks: DocumentSummaryChunk[] = [
+    {
+      chunk_id: "chunk-first",
+      chunk_index: 0,
+      page_number: 1,
+      content: firstContent,
+      start_char: 0,
+      end_char: firstContent.length,
+    },
+    {
+      chunk_id: "chunk-second",
+      chunk_index: 1,
+      page_number: 2,
+      content: secondContent,
+      start_char: firstContent.length - overlap.length,
+      end_char: firstContent.length - overlap.length + secondContent.length,
+    },
+  ];
+  let prompt = "";
+  const result = await summarizeDocumentWithCoverage(
+    { ...baseArgs, chunks, pageCount: 2 },
+    {
+      map: async ({ userPrompt }) => {
+        prompt = userPrompt;
+        return JSON.stringify({
+          points: [
+            {
+              text: "The repeated boundary is supported by the second chunk.",
+              evidence: [{ chunk_id: "chunk-second", quote: overlap }],
+            },
+          ],
+        });
+      },
+      reduce: async ({ batchSummaries }) =>
+        JSON.stringify({
+          title: "De-overlapped summary",
+          sections: [
+            {
+              heading: "Boundary",
+              points: [
+                {
+                  text: batchSummaries[0].points[0].text,
+                  evidence_ids: batchSummaries[0].points[0].evidenceIds,
+                },
+              ],
+            },
+          ],
+        }),
+    },
+  );
+
+  assert.equal(prompt.split(overlap).length - 1, 1);
+  assert.match(prompt, /"content":" Closing text\."/);
+  assert.equal(result.citations[0].chunk_id, "chunk-second");
+  assert.equal(result.citations[0].quote_start, 0);
+  assert.equal(result.citations[0].document_start_char, chunks[1].start_char);
+
+  const nonOverlapping = chunksForPages(2);
+  await summarizeDocumentWithCoverage(
+    { ...baseArgs, chunks: nonOverlapping, pageCount: 2 },
+    {
+      map: async ({ userPrompt }) => {
+        assert.match(
+          userPrompt,
+          new RegExp(`"content":"${nonOverlapping[0].content}`),
+        );
+        assert.match(
+          userPrompt,
+          new RegExp(`"content":"${nonOverlapping[1].content}`),
+        );
+        return JSON.stringify({
+          points: [
+            {
+              text: "Non-overlapping source remains whole.",
+              evidence: [
+                {
+                  chunk_id: nonOverlapping[0].chunk_id,
+                  quote: nonOverlapping[0].content.slice(0, 6),
+                },
+              ],
+            },
+          ],
+        });
+      },
+      reduce: async ({ batchSummaries }) =>
+        JSON.stringify({
+          title: "Unchanged source",
+          sections: [
+            {
+              heading: "Source",
+              points: [
+                {
+                  text: batchSummaries[0].points[0].text,
+                  evidence_ids: batchSummaries[0].points[0].evidenceIds,
+                },
+              ],
+            },
+          ],
+        }),
+    },
+  );
+});
+
+test("a small local document uses one single-pass call with source-exact citations", async () => {
+  const oldBudget = process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS;
+  const quote = "requires notice before any assignment";
+  const firstContent = `The agreement ${quote}.`;
+  const secondContent = `${quote}. Assignment remains restricted.`;
+  const chunks: DocumentSummaryChunk[] = [
+    {
+      chunk_id: "single-pass-first",
+      chunk_index: 0,
+      page_number: 1,
+      content: firstContent,
+      start_char: 400,
+      end_char: 400 + firstContent.length,
+    },
+    {
+      chunk_id: "single-pass-second",
+      chunk_index: 1,
+      page_number: 2,
+      content: secondContent,
+      start_char: 400 + firstContent.length - quote.length,
+      end_char: 400 + firstContent.length - quote.length + secondContent.length,
+    },
+  ];
+  let calls = 0;
+  try {
+    process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS = "35000";
+    const result = await summarizeDocumentWithCoverage(
+      {
+        ...baseArgs,
+        model: "ollama:test-model",
+        chunks,
+        pageCount: 2,
+      },
+      {
+        singlePass: async ({ userPrompt, systemPrompt }) => {
+          calls += 1;
+          assert.match(userPrompt, /single-pass-first/);
+          assert.equal(userPrompt.split(quote).length - 1, 1);
+          assert.match(systemPrompt, /exhaustive/i);
+          return JSON.stringify({
+            title: "Assignment notice",
+            sections: [
+              {
+                heading: "Consent",
+                points: [
+                  {
+                    text: "Assignment requires advance notice.",
+                    evidence: [{ chunk_id: "single-pass-second", quote }],
+                  },
+                ],
+              },
+            ],
+          });
+        },
+        map: async () =>
+          assert.fail("map must not run on the single-pass path"),
+        reduce: async () =>
+          assert.fail("reduce must not run on the single-pass path"),
+      },
+    );
+
+    assert.equal(calls, 1);
+    assert.equal(result.coverage.complete, true);
+    assert.equal(result.coverage.processedChunkCount, 2);
+    assert.equal(result.coverage.batchCount, 1);
+    assert.equal(result.citations[0].quote, quote);
+    assert.equal(result.citations[0].quote_start, 0);
+    assert.equal(result.citations[0].document_start_char, chunks[1].start_char);
+    assert.match(result.preparedText, /# Assignment notice/);
+    assert.match(
+      result.preparedText,
+      /- Assignment requires advance notice\. \[1\]/,
+    );
+    assert.match(result.preparedText, /<CITATIONS>\n\[.*\]\n<\/CITATIONS>$/s);
+  } finally {
+    restoreEnv("DOCKET_SUMMARY_SINGLE_PASS_CHARS", oldBudget);
+  }
+});
+
+test("single-pass threshold and zero budget retain map-reduce", async () => {
+  const oldBudget = process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS;
+  const chunks = ["one", "two"].map((label, index) => {
+    const content = `${label} source `.padEnd(18_000, label);
+    const start_char = index * 20_000;
+    return {
+      chunk_id: `threshold-${label}`,
+      chunk_index: index,
+      page_number: index + 1,
+      content,
+      start_char,
+      end_char: start_char + content.length,
+    } satisfies DocumentSummaryChunk;
+  });
+  let mapCalls = 0;
+  let reduceCalls = 0;
+  let singlePassCalls = 0;
+  const dependencies = {
+    singlePass: async () => {
+      singlePassCalls += 1;
+      return "";
+    },
+    map: async ({
+      batch,
+    }: {
+      batch: { chunks: readonly DocumentSummaryChunk[] };
+    }) => {
+      mapCalls += 1;
+      return JSON.stringify({
+        points: batch.chunks.map((chunk) => ({
+          text: `${chunk.chunk_id} mapped`,
+          evidence: [
+            { chunk_id: chunk.chunk_id, quote: chunk.content.slice(0, 10) },
+          ],
+        })),
+      });
+    },
+    reduce: async ({
+      batchSummaries,
+    }: {
+      batchSummaries: readonly {
+        points: readonly { text: string; evidenceIds: string[] }[];
+      }[];
+    }) => {
+      reduceCalls += 1;
+      return JSON.stringify({
+        title: "Map reduce summary",
+        sections: [
+          {
+            heading: "All sources",
+            points: batchSummaries.flatMap((summary) =>
+              summary.points.map((point) => ({
+                text: point.text,
+                evidence_ids: point.evidenceIds,
+              })),
+            ),
+          },
+        ],
+      });
+    },
+  };
+  try {
+    process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS = "35000";
+    await summarizeDocumentWithCoverage(
+      {
+        ...baseArgs,
+        model: "ollama:test-model",
+        chunks,
+        pageCount: 2,
+        maxBatchCharacters: 100_000,
+        maxBatchPages: 2,
+      },
+      dependencies,
+    );
+    assert.equal(singlePassCalls, 0);
+    assert.equal(mapCalls, 1);
+    assert.equal(reduceCalls, 1);
+
+    process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS = "0";
+    await summarizeDocumentWithCoverage(
+      {
+        ...baseArgs,
+        model: "ollama:test-model",
+        chunks: chunks.slice(0, 1),
+        pageCount: 1,
+        maxBatchCharacters: 100_000,
+      },
+      dependencies,
+    );
+    assert.equal(singlePassCalls, 0);
+    assert.equal(mapCalls, 2);
+    assert.equal(reduceCalls, 2);
+  } finally {
+    restoreEnv("DOCKET_SUMMARY_SINGLE_PASS_CHARS", oldBudget);
+  }
+});
+
+test("invalid single-pass output retries then falls back to map-reduce", async () => {
+  const oldBudget = process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS;
+  const chunks = chunksForPages(1);
+  let singlePassCalls = 0;
+  let mapCalls = 0;
+  let reduceCalls = 0;
+  try {
+    process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS = "35000";
+    const result = await summarizeDocumentWithCoverage(
+      {
+        ...baseArgs,
+        model: "ollama:test-model",
+        chunks,
+        pageCount: 1,
+      },
+      {
+        singlePass: async () => {
+          singlePassCalls += 1;
+          return JSON.stringify({ invalid: true });
+        },
+        map: async ({ batch }) => {
+          mapCalls += 1;
+          return JSON.stringify({
+            points: [
+              {
+                text: "Fallback map point",
+                evidence: [
+                  {
+                    chunk_id: batch.chunks[0].chunk_id,
+                    quote: batch.chunks[0].content.slice(0, 6),
+                  },
+                ],
+              },
+            ],
+          });
+        },
+        reduce: async ({ batchSummaries }) => {
+          reduceCalls += 1;
+          return JSON.stringify({
+            title: "Fallback summary",
+            sections: [
+              {
+                heading: "Recovered",
+                points: [
+                  {
+                    text: "Fallback map point",
+                    evidence_ids: batchSummaries[0].points[0].evidenceIds,
+                  },
+                ],
+              },
+            ],
+          });
+        },
+      },
+    );
+
+    assert.equal(singlePassCalls, 3);
+    assert.equal(mapCalls, 1);
+    assert.equal(reduceCalls, 1);
+    assert.match(result.preparedText, /# Fallback summary/);
+    assert.equal(result.coverage.complete, true);
+  } finally {
+    restoreEnv("DOCKET_SUMMARY_SINGLE_PASS_CHARS", oldBudget);
+  }
+});
+
 test("314-page summaries map every ordered chunk exactly once within batch bounds", async () => {
   const chunks = chunksForPages(314);
   const seenChunkIds: string[] = [];
@@ -1095,10 +1444,12 @@ test("production entrypoint delegates map and reduce to injected completeText", 
 
 test("Ollama reduce thinking leaves map thinking off and accepts fenced JSON", async () => {
   const oldReduceThinking = process.env.DOCKET_SUMMARY_REDUCE_THINKING;
+  const oldSinglePassBudget = process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS;
   const chunks = chunksForPages(1);
   const calls: { think?: boolean; hasSchema: boolean }[] = [];
   try {
     process.env.DOCKET_SUMMARY_REDUCE_THINKING = "true";
+    process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS = "0";
     const result = await summarizeDocumentWithCoverage(
       {
         ...baseArgs,
@@ -1154,6 +1505,7 @@ test("Ollama reduce thinking leaves map thinking off and accepts fenced JSON", a
     assert.match(result.preparedText, /Fenced reduce output/);
   } finally {
     restoreEnv("DOCKET_SUMMARY_REDUCE_THINKING", oldReduceThinking);
+    restoreEnv("DOCKET_SUMMARY_SINGLE_PASS_CHARS", oldSinglePassBudget);
   }
 });
 

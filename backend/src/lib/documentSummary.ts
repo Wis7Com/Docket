@@ -21,6 +21,7 @@ const LOCAL_CONTEXT_SAFETY_OVERHEAD = 768;
 // 300-page synthesis needs headroom well past the map budget. 4096 truncated
 // real Gemma-12B reduces mid-JSON (measured), which then failed schema parsing.
 const LOCAL_REDUCE_MAX_TOKENS = 8_192;
+const LOCAL_SINGLE_PASS_CHARACTERS = 35_000;
 const DEFAULT_STAGE_ATTEMPTS = 2;
 const DEFAULT_REDUCE_GROUP_SIZE = 8;
 const MAP_MAX_TOKENS = 3_072;
@@ -95,6 +96,38 @@ const REDUCE_RESPONSE_JSON_SCHEMA = {
   additionalProperties: false,
 } satisfies Record<string, unknown>;
 
+const SINGLE_PASS_RESPONSE_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    sections: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          heading: { type: "string" },
+          points: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                text: { type: "string" },
+                evidence: { type: "array", items: EVIDENCE_JSON_SCHEMA },
+              },
+              required: ["text", "evidence"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["heading", "points"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["title", "sections"],
+  additionalProperties: false,
+} satisfies Record<string, unknown>;
+
 const MAP_SYSTEM_PROMPT = `You summarize one ordered slice of a document. Return JSON only.
 Preserve every distinct section, chapter, case, party, tribunal, issue, holding, rule, material line of reasoning, remedy, methodology, exception, caveat, and dissent that appears in this slice. Keep the points in source order and do not collapse distinct cases or sections into one generic theme. Prefer 3 to 6 evidence-rich points per slice, combining adjacent details only when they share the same conclusion.
 Every factual point must have at least one verbatim source quote of at most 25 words. Copy the quote exactly and name its chunk_id. Never cite text outside the supplied chunks. The server derives offsets; do not estimate them.`;
@@ -102,6 +135,10 @@ Every factual point must have at least one verbatim source quote of at most 25 w
 const REDUCE_SYSTEM_PROMPT = `You synthesize a document summary from validated batch summaries. Return JSON only.
 Use only the supplied evidence IDs. Every final point must cite at least one evidence ID. Do not add facts that are absent from the batch summaries.
 Produce an executive synthesis followed by an ordered section/chapter/case-level account and cross-cutting conclusions. Preserve distinct holdings, reasoning, exceptions, and disagreements. Every evidence-bearing batch must contribute at least one cited final point; do not silently omit a source interval.`;
+
+const SINGLE_PASS_SYSTEM_PROMPT = `You produce an exhaustive final summary of one complete document. Return JSON only.
+Summarize the document in source order, preserving every distinct section, chapter, case, party, tribunal, issue, holding, rule, material line of reasoning, remedy, methodology, exception, caveat, and dissent. Produce an executive synthesis followed by an ordered section/chapter/case-level account and cross-cutting conclusions.
+Every final point must include at least one verbatim source quote of at most 25 words and its chunk_id. Copy quotes exactly from the supplied chunks. Never cite text outside the supplied chunks. The server derives offsets; do not estimate them.`;
 
 export type DocumentSummaryChunk = {
   chunk_id: string;
@@ -195,10 +232,20 @@ export type DocumentSummaryReduceRequest = {
   userPrompt: string;
 };
 
+export type DocumentSummarySinglePassRequest = {
+  filename: string;
+  language: string;
+  focus?: string;
+  batch: DocumentSummaryBatch;
+  systemPrompt: string;
+  userPrompt: string;
+};
+
 export type DocumentSummaryDependencies = {
   complete?: typeof completeText;
   map?: (request: DocumentSummaryMapRequest) => Promise<string>;
   reduce?: (request: DocumentSummaryReduceRequest) => Promise<string>;
+  singlePass?: (request: DocumentSummarySinglePassRequest) => Promise<string>;
   batchCache?: DocumentSummaryBatchCache;
   /** Test hook; production caching is enabled only for the real adapters. */
   cacheResults?: boolean;
@@ -208,10 +255,7 @@ export type DocumentSummaryBatchCache = {
   get(
     key: string,
   ): ValidatedBatchSummary | null | Promise<ValidatedBatchSummary | null>;
-  set(
-    key: string,
-    value: ValidatedBatchSummary,
-  ): void | Promise<void>;
+  set(key: string, value: ValidatedBatchSummary): void | Promise<void>;
 };
 
 export type DocumentSummaryProgress = {
@@ -291,6 +335,32 @@ const reduceResponseSchema = z.object({
     .min(1),
 });
 
+const singlePassResponseSchema = z.object({
+  title: z.string().trim().min(1),
+  sections: z
+    .array(
+      z.object({
+        heading: z.string().trim().min(1),
+        points: z
+          .array(
+            z.object({
+              text: z.string().trim().min(1),
+              evidence: z
+                .array(
+                  z.object({
+                    chunk_id: z.string().trim().min(1),
+                    quote: z.string().trim().min(1),
+                  }),
+                )
+                .min(1),
+            }),
+          )
+          .min(1),
+      }),
+    )
+    .min(1),
+});
+
 export type ValidatedEvidence = {
   id: string;
   sourceBatchId: string;
@@ -306,6 +376,7 @@ export type ValidatedBatchSummary = {
   points: {
     text: string;
     evidenceIds: string[];
+    sourcePointIndex?: number;
   }[];
   evidence: ValidatedEvidence[];
 };
@@ -442,7 +513,9 @@ function stripJsonCodeFence(raw: string): string {
   // opening fence and a closing fence independently so a truncated response
   // that lost its closing fence is still recoverable, and a non-fenced
   // response is returned unchanged.
-  const withoutOpen = raw.trim().replace(/^```[ \t]*[A-Za-z0-9_-]*[ \t]*\r?\n?/, "");
+  const withoutOpen = raw
+    .trim()
+    .replace(/^```[ \t]*[A-Za-z0-9_-]*[ \t]*\r?\n?/, "");
   return withoutOpen.replace(/\r?\n?[ \t]*```[ \t]*$/, "").trim();
 }
 
@@ -564,12 +637,33 @@ function pageRangeForChunks(
 }
 
 function sourceRecords(chunks: readonly DocumentSummaryChunk[]) {
-  return chunks.map((chunk) => ({
-    chunk_id: chunk.chunk_id,
-    page_start: chunk.page_number,
-    page_end: chunk.page_end ?? chunk.page_number,
-    content: chunk.content,
-  }));
+  let previous: DocumentSummaryChunk | undefined;
+  return chunks.map((chunk) => {
+    const overlap = previous ? previous.end_char - chunk.start_char : 0;
+    const content =
+      previous &&
+      Number.isSafeInteger(overlap) &&
+      overlap > 0 &&
+      overlap <= chunk.content.length
+        ? chunk.content.slice(overlap)
+        : chunk.content;
+    previous = chunk;
+    return {
+      chunk_id: chunk.chunk_id,
+      page_start: chunk.page_number,
+      page_end: chunk.page_end ?? chunk.page_number,
+      content,
+    };
+  });
+}
+
+function displayedSourceCharacters(
+  chunks: readonly DocumentSummaryChunk[],
+): number {
+  return sourceRecords(chunks).reduce(
+    (total, record) => total + record.content.length,
+    0,
+  );
 }
 
 function buildMapUserPrompt(args: {
@@ -585,6 +679,24 @@ function buildMapUserPrompt(args: {
     `Focus: ${args.focus?.trim() || "Summarize all material content"}`,
     `Batch: ${args.batchId}`,
     'Return {"points":[{"text":"...","evidence":[{"chunk_id":"...","quote":"exact verbatim quote, at most 25 words"}]}]}.',
+    "Ordered source chunks (one JSON object per line):",
+    sourceRecords(args.chunks)
+      .map((record) => JSON.stringify(record))
+      .join("\n"),
+  ].join("\n");
+}
+
+function buildSinglePassUserPrompt(args: {
+  filename: string;
+  language: string;
+  focus?: string;
+  chunks: readonly DocumentSummaryChunk[];
+}): string {
+  return [
+    `Filename: ${args.filename}`,
+    `Output language: ${args.language}`,
+    `Focus: ${args.focus?.trim() || "Summarize all material content"}`,
+    'Return {"title":"...","sections":[{"heading":"...","points":[{"text":"...","evidence":[{"chunk_id":"...","quote":"exact verbatim quote, at most 25 words"}]}]}]}.',
     "Ordered source chunks (one JSON object per line):",
     sourceRecords(args.chunks)
       .map((record) => JSON.stringify(record))
@@ -780,7 +892,9 @@ function validateMapResponse(
         return [id];
       },
     );
-    return evidenceIds.length > 0 ? [{ text: point.text, evidenceIds }] : [];
+    return evidenceIds.length > 0
+      ? [{ text: point.text, evidenceIds, sourcePointIndex: pointIndex }]
+      : [];
   });
   if (points.length < minimumPoints) {
     const detail = rejectedEvidence[0]
@@ -791,6 +905,56 @@ function validateMapResponse(
     );
   }
   return { batchId: batch.id, points, evidence };
+}
+
+type ValidatedReduceResponse = z.infer<typeof reduceResponseSchema>;
+
+type ValidatedSinglePassResponse = {
+  reduced: ValidatedReduceResponse;
+  summary: ValidatedBatchSummary;
+};
+
+function validateSinglePassResponse(
+  raw: string,
+  batch: DocumentSummaryBatch,
+): ValidatedSinglePassResponse {
+  const parsed = singlePassResponseSchema.safeParse(
+    parseJsonResponse(raw, "reduce"),
+  );
+  if (!parsed.success) {
+    throw new DocumentSummaryValidationError(
+      `single-pass response did not match the required evidence schema: ${z.prettifyError(parsed.error)}`,
+    );
+  }
+  const flattened = parsed.data.sections.flatMap((section) => section.points);
+  const summary = validateMapResponse(
+    JSON.stringify({ points: flattened }),
+    batch,
+  );
+  const validatedPoints = new Map(
+    summary.points.flatMap((point) =>
+      point.sourcePointIndex === undefined
+        ? []
+        : [[point.sourcePointIndex, point] as const],
+    ),
+  );
+  let pointIndex = 0;
+  const sections = parsed.data.sections.flatMap((section) => {
+    const points = section.points.flatMap(() => {
+      const point = validatedPoints.get(pointIndex);
+      pointIndex += 1;
+      return point
+        ? [{ text: point.text, evidence_ids: point.evidenceIds }]
+        : [];
+    });
+    return points.length ? [{ heading: section.heading, points }] : [];
+  });
+  if (!sections.length) {
+    throw new DocumentSummaryValidationError(
+      "single-pass response had no source-supported final points",
+    );
+  }
+  return { reduced: { title: parsed.data.title, sections }, summary };
 }
 
 function buildReduceUserPrompt(args: {
@@ -845,6 +1009,14 @@ function resolveReduceGroupSize(): number {
   return Number.isFinite(configured)
     ? Math.max(2, configured)
     : DEFAULT_REDUCE_GROUP_SIZE;
+}
+
+function resolveLocalSinglePassCharacters(): number {
+  const raw = process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS?.trim();
+  if (!raw) return LOCAL_SINGLE_PASS_CHARACTERS;
+  const configured = Number(raw);
+  if (!Number.isFinite(configured)) return LOCAL_SINGLE_PASS_CHARACTERS;
+  return Math.max(0, Math.floor(configured));
 }
 
 function enabledByEnvironment(value: string | undefined): boolean {
@@ -1016,8 +1188,6 @@ function validateReduceResponse(
   return reduced.data;
 }
 
-type ValidatedReduceResponse = z.infer<typeof reduceResponseSchema>;
-
 function intermediateReduceSummary(args: {
   id: string;
   reduced: ValidatedReduceResponse;
@@ -1153,6 +1323,58 @@ function citationPage(chunk: DocumentSummaryChunk): number | string {
   return end !== null && end !== start ? `${start}-${end}` : start;
 }
 
+function buildDocumentSummaryResult(args: {
+  request: SummarizeDocumentWithCoverageArgs;
+  reduced: ValidatedReduceResponse;
+  evidenceById: ReadonlyMap<string, ValidatedEvidence>;
+  coverage: DocumentSummaryCoverage;
+}): DocumentSummaryResult {
+  const citations: DocumentSummaryCitation[] = [];
+  const markdown: string[] = [
+    `> Index coverage: indexed pages ${formatPageRanges(args.coverage.indexedPageRanges)}; processed ${args.coverage.processedChunkCount}/${args.coverage.indexedChunkCount} chunks; ${args.coverage.batchCount} source intervals; ${args.coverage.complete ? "complete" : "partial"}.`,
+    ...args.coverage.warnings.map((warning) => `> Warning: ${warning.message}`),
+    `# ${args.reduced.title}`,
+  ];
+  for (const section of args.reduced.sections) {
+    markdown.push(`## ${section.heading}`);
+    for (const point of section.points) {
+      const refs = point.evidence_ids.map((evidenceId) => {
+        const evidence = args.evidenceById.get(evidenceId);
+        if (!evidence) {
+          throw new DocumentSummaryValidationError(
+            `reduce response referenced unknown evidence: ${evidenceId}`,
+          );
+        }
+        const ref = citations.length + 1;
+        citations.push({
+          ref,
+          doc_id: args.request.docId,
+          page: citationPage(evidence.chunk),
+          quote: evidence.quote,
+          chunk_id: evidence.chunk.chunk_id,
+          chunk_index: evidence.chunk.chunk_index,
+          quote_start: evidence.quoteStart,
+          quote_end: evidence.quoteEnd,
+          chunk_quote_start: evidence.quoteStart,
+          chunk_quote_end: evidence.quoteEnd,
+          document_start_char: evidence.chunk.start_char + evidence.quoteStart,
+          document_end_char: evidence.chunk.start_char + evidence.quoteEnd,
+          document_id: args.request.documentId,
+          version_id: args.request.versionId,
+        });
+        return `[${ref}]`;
+      });
+      markdown.push(`- ${point.text} ${refs.join("")}`);
+    }
+  }
+  const citationsBlock = `<CITATIONS>\n${JSON.stringify(citations)}\n</CITATIONS>`;
+  return {
+    preparedText: `${markdown.join("\n\n")}\n\n${citationsBlock}`,
+    citations,
+    coverage: args.coverage,
+  };
+}
+
 function documentSummaryCacheKey(args: {
   request: SummarizeDocumentWithCoverageArgs;
   language: string;
@@ -1160,6 +1382,8 @@ function documentSummaryCacheKey(args: {
   maxBatchPages: number;
   reduceGroupSize: number;
   reduceThinking: boolean;
+  singlePass: boolean;
+  singlePassCharacters: number;
 }): string {
   const hash = createHash("sha256");
   hash.update(
@@ -1177,6 +1401,8 @@ function documentSummaryCacheKey(args: {
       maxBatchPages: args.maxBatchPages,
       reduceGroupSize: args.reduceGroupSize,
       reduceThinking: args.reduceThinking,
+      singlePass: args.singlePass,
+      singlePassCharacters: args.singlePassCharacters,
     }),
   );
   for (const chunk of args.request.chunks) {
@@ -1214,6 +1440,7 @@ function documentSummaryBatchCacheKey(args: {
       maxBatchCharacters: args.maxBatchCharacters,
       maxBatchPages: args.maxBatchPages,
       mapSystemPrompt: MAP_SYSTEM_PROMPT,
+      sourceRecordFormat: "deoverlap-leading-v1",
       batchId: args.batch.id,
       chunks: args.batch.chunks.map((chunk) => ({
         chunkId: chunk.chunk_id,
@@ -1257,6 +1484,7 @@ export async function summarizeDocumentWithCoverage(
       "pageCount must be a positive integer",
     );
   }
+  validateChunks(args.chunks);
   const language = args.language?.trim() || "Korean";
   const stageAttempts = Math.max(
     1,
@@ -1272,24 +1500,49 @@ export async function summarizeDocumentWithCoverage(
   const maxBatchCharacters =
     args.maxBatchCharacters ?? batchBounds.maxBatchCharacters;
   const maxBatchPages = args.maxBatchPages ?? batchBounds.maxBatchPages;
-  const batches = packDocumentSummaryBatches({
-    filename: args.filename,
-    chunks: args.chunks,
-    language,
-    focus: args.focus,
-    maxBatchCharacters,
-    maxBatchPages,
-  });
+  const singlePassCharacters = resolveLocalSinglePassCharacters();
+  const useSinglePass =
+    isLocalSummaryModel(args.model) &&
+    singlePassCharacters > 0 &&
+    displayedSourceCharacters(args.chunks) <= singlePassCharacters;
+  const mapReduceBatches = () =>
+    packDocumentSummaryBatches({
+      filename: args.filename,
+      chunks: args.chunks,
+      language,
+      focus: args.focus,
+      maxBatchCharacters,
+      maxBatchPages,
+    });
+  let batches: DocumentSummaryBatch[] = useSinglePass
+    ? [
+        {
+          id: "single-pass",
+          chunks: args.chunks,
+          pageRange: pageRangeForChunks(args.chunks),
+          inputCharacters:
+            SINGLE_PASS_SYSTEM_PROMPT.length +
+            buildSinglePassUserPrompt({
+              filename: args.filename,
+              language,
+              focus: args.focus,
+              chunks: args.chunks,
+            }).length,
+        },
+      ]
+    : mapReduceBatches();
   const reduceGroupSize = resolveReduceGroupSize();
   const reduceThinking =
     isOllamaSummaryModel(args.model) &&
     enabledByEnvironment(process.env.DOCKET_SUMMARY_REDUCE_THINKING);
   const failHard =
-    args.failHard ??
-    enabledByEnvironment(process.env.DOCKET_SUMMARY_FAIL_HARD);
+    args.failHard ?? enabledByEnvironment(process.env.DOCKET_SUMMARY_FAIL_HARD);
   const shouldCache =
     dependencies.cacheResults ??
-    (!dependencies.complete && !dependencies.map && !dependencies.reduce);
+    (!dependencies.complete &&
+      !dependencies.map &&
+      !dependencies.reduce &&
+      !dependencies.singlePass);
   const cacheKey = shouldCache
     ? documentSummaryCacheKey({
         request: args,
@@ -1298,6 +1551,8 @@ export async function summarizeDocumentWithCoverage(
         maxBatchPages,
         reduceGroupSize,
         reduceThinking,
+        singlePass: useSinglePass,
+        singlePassCharacters,
       })
     : null;
   if (cacheKey) {
@@ -1348,6 +1603,74 @@ export async function summarizeDocumentWithCoverage(
         systemPrompt: request.systemPrompt,
         user: request.userPrompt,
       }));
+  const singlePass =
+    dependencies.singlePass ??
+    (async (request: DocumentSummarySinglePassRequest) =>
+      complete({
+        model: args.model,
+        apiKeys: args.apiKeys,
+        maxTokens: LOCAL_REDUCE_MAX_TOKENS,
+        responseJsonSchema: SINGLE_PASS_RESPONSE_JSON_SCHEMA,
+        think: false,
+        signal: args.signal,
+        systemPrompt: request.systemPrompt,
+        user: request.userPrompt,
+      }));
+
+  if (useSinglePass) {
+    const batch = batches[0];
+    const userPrompt = buildSinglePassUserPrompt({
+      filename: args.filename,
+      language,
+      focus: args.focus,
+      chunks: batch.chunks,
+    });
+    try {
+      const validated = await runValidatedStage({
+        attempts: stageAttempts,
+        basePrompt: userPrompt,
+        invoke: (candidatePrompt) => {
+          args.signal?.throwIfAborted();
+          return singlePass({
+            filename: args.filename,
+            language,
+            focus: args.focus,
+            batch,
+            systemPrompt: SINGLE_PASS_SYSTEM_PROMPT,
+            userPrompt: candidatePrompt,
+          });
+        },
+        validate: (raw) => validateSinglePassResponse(raw, batch),
+      });
+      const coverage = buildCoverage(args, batches);
+      const result = buildDocumentSummaryResult({
+        request: args,
+        reduced: validated.reduced,
+        evidenceById: new Map(
+          validated.summary.evidence.map((evidence) => [evidence.id, evidence]),
+        ),
+        coverage,
+      });
+      await args.onProgress?.({
+        completedBatches: 1,
+        totalBatches: 1,
+        pageRange: batch.pageRange,
+        etaMs: 0,
+      });
+      if (cacheKey) cacheDocumentSummary(cacheKey, result);
+      return result;
+    } catch (error) {
+      args.signal?.throwIfAborted();
+      if (!(error instanceof DocumentSummaryValidationError)) throw error;
+      console.warn(
+        "[document-summary/single-pass] validation failed; falling back",
+        {
+          error: error.message,
+        },
+      );
+      batches = mapReduceBatches();
+    }
+  }
 
   const batchSummaries = new Array<ValidatedBatchSummary | undefined>(
     batches.length,
@@ -1617,50 +1940,12 @@ export async function summarizeDocumentWithCoverage(
       .map((item) => [item.id, item]),
   );
   const coverage = buildCoverage(args, batches, failedBatches);
-  const citations: DocumentSummaryCitation[] = [];
-  const markdown: string[] = [
-    `> Index coverage: indexed pages ${formatPageRanges(coverage.indexedPageRanges)}; processed ${coverage.processedChunkCount}/${coverage.indexedChunkCount} chunks; ${coverage.batchCount} source intervals; ${coverage.complete ? "complete" : "partial"}.`,
-    ...coverage.warnings.map((warning) => `> Warning: ${warning.message}`),
-    `# ${reduced.title}`,
-  ];
-  for (const section of reduced.sections) {
-    markdown.push(`## ${section.heading}`);
-    for (const point of section.points) {
-      const refs = point.evidence_ids.map((evidenceId) => {
-        const evidence = evidenceById.get(evidenceId);
-        if (!evidence) {
-          throw new DocumentSummaryValidationError(
-            `reduce response referenced unknown evidence: ${evidenceId}`,
-          );
-        }
-        const ref = citations.length + 1;
-        citations.push({
-          ref,
-          doc_id: args.docId,
-          page: citationPage(evidence.chunk),
-          quote: evidence.quote,
-          chunk_id: evidence.chunk.chunk_id,
-          chunk_index: evidence.chunk.chunk_index,
-          quote_start: evidence.quoteStart,
-          quote_end: evidence.quoteEnd,
-          chunk_quote_start: evidence.quoteStart,
-          chunk_quote_end: evidence.quoteEnd,
-          document_start_char: evidence.chunk.start_char + evidence.quoteStart,
-          document_end_char: evidence.chunk.start_char + evidence.quoteEnd,
-          document_id: args.documentId,
-          version_id: args.versionId,
-        });
-        return `[${ref}]`;
-      });
-      markdown.push(`- ${point.text} ${refs.join("")}`);
-    }
-  }
-  const citationsBlock = `<CITATIONS>\n${JSON.stringify(citations)}\n</CITATIONS>`;
-  const result = {
-    preparedText: `${markdown.join("\n\n")}\n\n${citationsBlock}`,
-    citations,
+  const result = buildDocumentSummaryResult({
+    request: args,
+    reduced,
+    evidenceById,
     coverage,
-  };
+  });
   if (cacheKey && failedBatches.length === 0) {
     cacheDocumentSummary(cacheKey, result);
   }
