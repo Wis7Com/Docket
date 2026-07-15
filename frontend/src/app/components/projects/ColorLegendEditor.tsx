@@ -41,7 +41,7 @@ const PLACEHOLDERS: Partial<Record<AnnotationColorFamily, string>> = {
   blue: "e.g. important defendant argument",
 };
 
-const PARTY_ROLES = "원고,피고,항소인,피항소인,상고인,피상고인,참가인,제3자,plaintiff,defendant,appellant,appellee,petitioner,respondent,cross-appellant,cross-appellee,intervenor,amicus,third-party,neutral".split(",");
+const PARTY_ROLES = "plaintiff,defendant,appellant,appellee,petitioner,respondent,cross-appellant,cross-appellee,intervenor,amicus,third-party,neutral,원고,피고,항소인,피항소인,상고인,피상고인,참가인,제3자".split(",");
 
 function emptyEntries(): ColorLegendEntry[] {
   return FAMILIES.map((color_family) => ({
@@ -170,7 +170,7 @@ export function ColorLegendEditor({ projectId }: { projectId: string }) {
                   {entry.color_family}
                 </div>
                 <input value={entry.label} onChange={(event) => updateEntry(entry.color_family, { label: event.target.value })} placeholder={PLACEHOLDERS[entry.color_family] ?? "Meaning for this color"} maxLength={120} className="h-8 rounded border border-gray-200 px-2 text-xs outline-none focus:border-gray-400" />
-                <input list="color-legend-party-roles" value={entry.party_role ?? ""} onChange={(event) => updateEntry(entry.color_family, { party_role: event.target.value || null })} placeholder="e.g. 피고" className="h-8 rounded border border-gray-200 px-2 text-xs outline-none focus:border-gray-400" />
+                <input list="color-legend-party-roles" value={entry.party_role ?? ""} onChange={(event) => updateEntry(entry.color_family, { party_role: event.target.value || null })} placeholder="e.g. defendant" className="h-8 rounded border border-gray-200 px-2 text-xs outline-none focus:border-gray-400" />
                 <select value={entry.party_side ?? ""} onChange={(event) => updateEntry(entry.color_family, { party_side: event.target.value === "A" || event.target.value === "B" ? event.target.value : null })} aria-label={`${entry.color_family} party side`} className="h-8 rounded border border-gray-200 bg-white px-2 text-xs outline-none focus:border-gray-400">
                   <option value="">—</option><option value="A">A</option><option value="B">B</option>
                 </select>

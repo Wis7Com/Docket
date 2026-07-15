@@ -3133,7 +3133,7 @@ export function ProjectPage({ projectId }: Props) {
                       className="rounded bg-amber-50 px-2 py-0.5 text-amber-700"
                       title={`${indexStatus.ocr_truncated_documents} scanned documents are only partially OCR-indexed`}
                     >
-                      부분 OCR · {indexStatus.ocr_truncated_documents}건
+                      Partial OCR · {indexStatus.ocr_truncated_documents}
                     </span>
                   ) : null}
                   {(indexStatus.ocr_truncated_documents ?? 0) > 0 &&
@@ -3144,7 +3144,7 @@ export function ProjectPage({ projectId }: Props) {
                       onClick={() => void handleFullOcrForSelectedDocument()}
                       className="rounded border border-amber-200 px-2 py-0.5 text-amber-700 hover:bg-amber-50 disabled:opacity-50"
                     >
-                      선택 문서 전체 OCR
+                      Full OCR for selected
                     </button>
                   ) : null}
                   {indexStatus.status_counts.ready ? (

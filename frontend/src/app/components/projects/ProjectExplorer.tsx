@@ -88,7 +88,7 @@ export function ProjectSourceSelector({
                 }}
                 className="rounded border border-gray-200 px-1.5 py-0.5 text-gray-600 hover:bg-gray-50"
             >
-                서면만
+                Briefs only
             </button>
             {selectedCount !== documents.length && (
                 <span className="ml-auto">
