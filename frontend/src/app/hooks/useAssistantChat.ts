@@ -882,6 +882,24 @@ export function useAssistantChat({
                             continue;
                         }
 
+                        if (data.type === "citation_summary") {
+                            const verifiedCount =
+                                typeof data.verified_count === "number" &&
+                                Number.isFinite(data.verified_count)
+                                    ? Math.max(
+                                          0,
+                                          Math.floor(data.verified_count),
+                                      )
+                                    : 0;
+                            pushEvent({
+                                type: "citation_summary",
+                                verified_count: verifiedCount,
+                                used_document_tools:
+                                    data.used_document_tools === true,
+                            });
+                            continue;
+                        }
+
                         if (data.type === "citations") {
                             // End-of-stream signal — scrub any lingering
                             // placeholders so they don't persist into the

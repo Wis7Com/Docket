@@ -20,3 +20,20 @@ test("available document prompt is capped without changing document handles", ()
   assert.match(system, /…외 50개 문서/);
   assert.doesNotMatch(system, /doc-201: file-201\.pdf/);
 });
+
+test("available document prompt exposes brief sequence metadata", () => {
+  const messages = buildMessages([], [
+    {
+      doc_id: "doc-1",
+      filename: "reply.pdf",
+      doc_role: "brief",
+      party_side: "A",
+      brief_sequence: 3,
+    },
+  ]) as { role: string; content: string }[];
+
+  assert.match(
+    messages[0].content,
+    /doc-1: reply\.pdf  \[role=brief, side=A, brief_sequence=3\]/,
+  );
+});

@@ -31,9 +31,26 @@ export const partyRoleSchema = z.enum(PARTY_ROLES);
 export const partyRoleNullableSchema = partyRoleSchema.nullable();
 export const partySideSchema = z.enum(["A", "B"]);
 export const partySideNullableSchema = partySideSchema.nullable();
+export const briefSequenceNullableSchema = z
+  .number()
+  .int()
+  .positive()
+  .nullable();
 
 export type RoleConfidence = "high" | "low";
 export type DocRoleGuess = { role: DocRole; confidence: RoleConfidence };
+
+export type BriefSequenceHint = Readonly<{
+  id: string;
+  partySide: "A" | "B" | null;
+  docRole: DocRole;
+  sequenceHint: number | null;
+}>;
+
+export type NormalizedBriefSequence = Readonly<{
+  id: string;
+  briefSequence: number | null;
+}>;
 
 export const LARGE_DOC_PAGE_THRESHOLD = 50;
 
@@ -97,6 +114,88 @@ export function inferDocRole(input: {
     return { role: "evidence", confidence: "low" };
   }
   return { role: "other", confidence: "low" };
+}
+
+function uniquePositiveSequence(
+  filename: string,
+  patterns: readonly RegExp[],
+): { found: boolean; value: number | null } {
+  const values = new Set<number>();
+  for (const pattern of patterns) {
+    for (const match of filename.matchAll(pattern)) {
+      const value = Number.parseInt(match[1], 10);
+      if (Number.isSafeInteger(value) && value > 0) values.add(value);
+    }
+  }
+  if (values.size === 0) return { found: false, value: null };
+  if (values.size !== 1) return { found: true, value: null };
+  return { found: true, value: [...values][0] };
+}
+
+/**
+ * Infer only an explicit ordering signal. ECF numbers are retained as monotonic
+ * hints; callers that have a complete party-side group can normalize them to
+ * dense 1..N values with `normalizeBriefSequences`.
+ */
+export function inferBriefSequence(input: {
+  filename: string;
+  docRole: DocRole;
+}): number | null {
+  if (input.docRole !== "brief") return null;
+
+  const explicit = uniquePositiveSequence(input.filename, [
+    /제\s*(\d+)\s*차/gu,
+    /\b(\d+)(?:st|nd|rd|th)[\s._-]+(?:brief|reply|opposition|memorandum|motion|pleading)\b/giu,
+    /\b(?:brief|reply|opposition|memorandum|motion|pleading)[\s._-]+(\d+)(?:st|nd|rd|th)\b/giu,
+  ]);
+  if (explicit.found) return explicit.value;
+
+  return uniquePositiveSequence(input.filename, [/\bECF[-_ ]?(\d+)\b/giu])
+    .value;
+}
+
+/**
+ * Normalize complete, unambiguous party-side groups without mutating input.
+ * Missing party sides and duplicate sequence hints fail closed to null.
+ */
+export function normalizeBriefSequences(
+  items: readonly BriefSequenceHint[],
+): NormalizedBriefSequence[] {
+  const groups = new Map<string, BriefSequenceHint[]>();
+  for (const item of items) {
+    if (
+      item.docRole !== "brief" ||
+      item.partySide === null ||
+      item.sequenceHint === null ||
+      !Number.isSafeInteger(item.sequenceHint) ||
+      item.sequenceHint <= 0
+    ) {
+      continue;
+    }
+    const key = `${item.partySide}\u0000${item.docRole}`;
+    groups.set(key, [...(groups.get(key) ?? []), item]);
+  }
+
+  const normalizedById = new Map<string, number>();
+  for (const group of groups.values()) {
+    const counts = new Map<number, number>();
+    for (const item of group) {
+      counts.set(item.sequenceHint!, (counts.get(item.sequenceHint!) ?? 0) + 1);
+    }
+    const orderedHints = [...counts.keys()].sort((a, b) => a - b);
+    const rankByHint = new Map(
+      orderedHints.map((hint, index) => [hint, index + 1]),
+    );
+    for (const item of group) {
+      if ((counts.get(item.sequenceHint!) ?? 0) !== 1) continue;
+      normalizedById.set(item.id, rankByHint.get(item.sequenceHint!)!);
+    }
+  }
+
+  return items.map((item) => ({
+    id: item.id,
+    briefSequence: normalizedById.get(item.id) ?? null,
+  }));
 }
 
 export function refineDocRoleFromFirstPage(

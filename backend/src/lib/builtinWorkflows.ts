@@ -30,8 +30,22 @@ export const BUILTIN_WORKFLOWS: { id: string; title: string; prompt_md: string }
             "2. Discover the issue list with one or two broad search_project_documents calls using doc_roles:['brief'] unless the user explicitly includes evidence, or by skimming opening sections with read_index_chunk.\n" +
             "3. For every issue, run the same search_project_documents query once per document or side using doc_ids scoping.\n" +
             "4. Verify every quotation and page reference with read_index_chunk before citing it.\n" +
-            "5. Produce a table whose rows are issues and whose columns are the compared documents or sides. Each cell must give the document's position or key point plus page citations; say when a document is silent on an issue rather than inventing a position.\n\n" +
+            "5. Produce a table whose rows are issues and whose columns are the compared documents or sides. Each cell must give the document's position or key point; say when a document is silent on an issue rather than inventing a position. Attach a [N] marker to every supported claim in every table cell and include a matching entry for every marker in the final <CITATIONS> block. Place each marker at the end of the relevant cell text; plain-text document names or page references are not verified and do not count as citations.\n\n" +
             "Return an inline Markdown table by default. If the user asks for a file, use generate_docx with landscape: true.",
+    },
+    {
+        id: "builtin-brief-sequence-diff",
+        title: "New Arguments Across Brief Sequence",
+        prompt_md:
+            "## New Arguments Across Brief Sequence\n\n" +
+            "Identify which arguments in a later brief are new, elaborated, or repeated relative to the same party's earlier briefs. Use AVAILABLE DOCUMENTS metadata or list_documents to identify the target brief, its party_side, and its brief_sequence.\n\n" +
+            "Follow this sequence:\n" +
+            "1. Call summarize_document on the target (latest) brief to obtain a citation-backed inventory of its claims. Do not substitute a generic search for this whole-document pass.\n" +
+            "2. Identify briefs with doc_role='brief', the same party_side, and a lower brief_sequence. For every claim from Step 1, call search_project_documents with doc_ids scoped to those earlier briefs and the same claim point.\n" +
+            "3. Classify each claim as NEW only when it is substantively absent from the earlier briefs, ELABORATED when an earlier claim gains a new ground, authority, or legal theory, or REPEATED when only its wording changes. A wording change alone is never NEW. Never assert novelty without evidence; when the earlier record cannot be verified, flag the classification as unverified instead of guessing.\n" +
+            "4. When the user requests opposing-party context, search briefs from the opposing party_side for its response to each claim.\n" +
+            "5. Return a table with one row per claim and these columns: Latest brief + citation | Earlier brief status + citation | Classification. Every supported statement in every cell must carry a [N] marker backed by a matching entry in the final <CITATIONS> block. Plain-text document names or page references do not count as citations.\n\n" +
+            "Return the table inline unless the user explicitly requests a file.",
     },
     {
         id: "builtin-credit-summary",

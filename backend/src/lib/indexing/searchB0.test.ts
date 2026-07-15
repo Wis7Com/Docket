@@ -180,6 +180,24 @@ test("generic title words alone cannot create a title candidate", async () => {
   assert.deepEqual(korean, []);
 });
 
+test("reserved FTS operators in model-authored queries do not abort search", async () => {
+  const projectId = "b0-reserved-operator-project";
+  insertProject(projectId);
+  insertIndexedDocument({
+    projectId,
+    documentId: "b0-reserved-operator",
+    filename: "mail-voting.pdf",
+    content: "Project 1599 discussed voting by mail and absentee ballots.",
+    populateFts: true,
+  });
+
+  const results = await searchProjectIndex({
+    projectId,
+    query: '"Project 1599" OR "mail" AND "absentee"',
+  });
+  assert.equal(results[0]?.document_id, "b0-reserved-operator");
+});
+
 test("title candidates obey file, folder, and explicit document filters", async () => {
   const db = getDb();
   const projectId = "b0-title-filter-project";

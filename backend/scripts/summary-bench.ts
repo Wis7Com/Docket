@@ -44,6 +44,7 @@ type CallTelemetry = {
 
 type BenchResult = {
   config: BenchConfig;
+  mapConcurrency: number;
   wallMs: number;
   mapCalls: number;
   halfSplits: number;
@@ -51,12 +52,31 @@ type BenchResult = {
   promptEval: CallTelemetry[];
   coverageComplete: boolean;
   finalPoints: number;
+  citations: number;
   reduceMs: number;
 };
 
 function option(name: string): string | undefined {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+function positiveIntegerOption(name: string): number | undefined {
+  const raw = option(name);
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function booleanOption(name: string): boolean | undefined {
+  const raw = option(name);
+  if (raw === undefined) return undefined;
+  if (raw === "on" || raw === "true") return true;
+  if (raw === "off" || raw === "false") return false;
+  throw new Error(`${name} must be on/true or off/false`);
 }
 
 function restoreEnv(name: string, value: string | undefined): void {
@@ -141,7 +161,7 @@ async function runConfig(
   input: BenchInput,
   config: BenchConfig,
   completion: Completion,
-  summaryOverrides: { maxBatchPages?: number } = {},
+  summaryOverrides: { maxBatchPages?: number; mapConcurrency?: number } = {},
 ): Promise<BenchResult> {
   const oldNumCtx = process.env.OLLAMA_MAX_NUM_CTX;
   const oldThinking = process.env.DOCKET_SUMMARY_REDUCE_THINKING;
@@ -201,13 +221,14 @@ async function runConfig(
         pageCount: input.pageCount,
         language: option("--language") || "English",
         focus: option("--focus"),
-        mapConcurrency: 1,
+        mapConcurrency: summaryOverrides.mapConcurrency ?? 1,
         ...summaryOverrides,
       },
       { complete: instrumented, cacheResults: false },
     );
     return {
       config,
+      mapConcurrency: summaryOverrides.mapConcurrency ?? 1,
       wallMs: Date.now() - startedAt,
       mapCalls: mapBatchIds.length,
       halfSplits: new Set(
@@ -221,6 +242,7 @@ async function runConfig(
       finalPoints: result.preparedText
         .split("\n")
         .filter((line) => line.startsWith("- ")).length,
+      citations: result.citations.length,
       reduceMs,
     };
   } finally {
@@ -237,6 +259,7 @@ function printResults(results: BenchResult[]): void {
       num_ctx: result.config.numCtx,
       thinking: result.config.reduceThinking ? "on" : "off",
       chars_token: result.config.charsPerToken,
+      map_concurrency: result.mapConcurrency,
       wall_ms: result.wallMs,
       maps: result.mapCalls,
       splits: result.halfSplits,
@@ -256,6 +279,7 @@ function printResults(results: BenchResult[]): void {
         : "fake",
       complete: result.coverageComplete,
       points: result.finalPoints,
+      citations: result.citations,
       reduce_ms: result.reduceMs,
     })),
   );
@@ -307,6 +331,8 @@ function fakeCompletion(): Completion {
 }
 
 async function selfTest(): Promise<void> {
+  const oldSinglePassCharacters = process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS;
+  process.env.DOCKET_SUMMARY_SINGLE_PASS_CHARS = "0";
   const chunks: DocumentSummaryChunk[] = [1, 2].map((page, index) => ({
     chunk_id: `chunk-${page}`,
     chunk_index: index,
@@ -315,23 +341,28 @@ async function selfTest(): Promise<void> {
     start_char: index * 50,
     end_char: index * 50 + 44,
   }));
-  const result = await runConfig(
-    {
-      filename: "self-test.pdf",
-      documentId: "self-test-document",
-      versionId: "self-test-version",
-      pageCount: 2,
-      chunks,
-    },
-    { numCtx: 8_192, reduceThinking: false, charsPerToken: 2.5 },
-    fakeCompletion(),
-    { maxBatchPages: 1 },
-  );
-  assert.equal(result.mapCalls, 2);
-  assert.equal(result.coverageComplete, true);
-  assert.equal(result.finalPoints, 2);
-  printResults([result]);
-  console.log("summary benchmark self-test passed (live Ollama not used)");
+  try {
+    const result = await runConfig(
+      {
+        filename: "self-test.pdf",
+        documentId: "self-test-document",
+        versionId: "self-test-version",
+        pageCount: 2,
+        chunks,
+      },
+      { numCtx: 8_192, reduceThinking: false, charsPerToken: 2.5 },
+      fakeCompletion(),
+      { maxBatchPages: 1 },
+    );
+    assert.equal(result.mapCalls, 2);
+    assert.equal(result.coverageComplete, true);
+    assert.equal(result.finalPoints, 2);
+    assert.equal(result.citations, 2);
+    printResults([result]);
+    console.log("summary benchmark self-test passed (live Ollama not used)");
+  } finally {
+    restoreEnv("DOCKET_SUMMARY_SINGLE_PASS_CHARS", oldSinglePassCharacters);
+  }
 }
 
 async function main(): Promise<void> {
@@ -362,9 +393,33 @@ async function main(): Promise<void> {
       })),
     ),
   );
+  const requestedNumCtx = positiveIntegerOption("--num-ctx");
+  if (
+    requestedNumCtx !== undefined &&
+    ![8_192, 16_384].includes(requestedNumCtx)
+  ) {
+    throw new Error("--num-ctx must be 8192 or 16384");
+  }
+  const requestedThinking = booleanOption("--reduce-thinking");
+  const requestedCharsRaw = option("--chars-per-token");
+  const requestedChars =
+    requestedCharsRaw === undefined ? undefined : Number(requestedCharsRaw);
+  if (requestedChars !== undefined && ![2, 2.5].includes(requestedChars)) {
+    throw new Error("--chars-per-token must be 2 or 2.5");
+  }
+  const selectedConfigs = configs.filter(
+    (config) =>
+      (requestedNumCtx === undefined || config.numCtx === requestedNumCtx) &&
+      (requestedThinking === undefined ||
+        config.reduceThinking === requestedThinking) &&
+      (requestedChars === undefined || config.charsPerToken === requestedChars),
+  );
+  const mapConcurrency = positiveIntegerOption("--map-concurrency") ?? 1;
   const results: BenchResult[] = [];
-  for (const config of configs) {
-    results.push(await runConfig(input, config, completeText));
+  for (const config of selectedConfigs) {
+    results.push(
+      await runConfig(input, config, completeText, { mapConcurrency }),
+    );
   }
   printResults(results);
 }

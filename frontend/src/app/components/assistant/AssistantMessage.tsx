@@ -18,7 +18,7 @@ import { EditCard, applyOptimisticResolution } from "./EditCard";
 import { PreResponseWrapper } from "../shared/PreResponseWrapper";
 import { supabase } from "@/lib/supabase";
 import { getApiBase } from "@/app/lib/docketApi";
-import { preprocessCitations } from "./citations";
+import { citationSummaryChip, preprocessCitations } from "./citations";
 import {
     shouldActivateCitationOnClick,
     shouldActivateCitationOnPointerDown,
@@ -1227,6 +1227,24 @@ export function AssistantMessage({
             : content
         ).trim() ||
         (isError ? (errorMessage ?? "Sorry, something went wrong.") : "");
+    const citationSummary = events
+        ? [...events]
+              .reverse()
+              .find(
+                  (
+                      event,
+                  ): event is Extract<
+                      AssistantEvent,
+                      { type: "citation_summary" }
+                  > => event.type === "citation_summary",
+              )
+        : undefined;
+    const citationChip = citationSummaryChip(
+        citationSummary,
+        typeof document === "undefined"
+            ? "en"
+            : document.documentElement.lang || "en",
+    );
 
     const handleCopy = async () => {
         if (!copyableResponseText) return;
@@ -1255,6 +1273,7 @@ export function AssistantMessage({
     if (events) {
         let current: Extract<EventGroup, { kind: "pre" }> | null = null;
         events.forEach((e, i) => {
+            if (e.type === "citation_summary") return;
             if (e.type === "content") {
                 if (current) {
                     groups.push(current);
@@ -1690,6 +1709,19 @@ export function AssistantMessage({
                             })}
                         </div>
                     )}
+
+                {!isStreaming && citationChip && (
+                    <div
+                        data-citation-summary={citationChip.kind}
+                        className={`mt-3 inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${
+                            citationChip.kind === "verified"
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                : "border-amber-200 bg-amber-50 text-amber-800"
+                        }`}
+                    >
+                        {citationChip.text}
+                    </div>
+                )}
 
                 {/* Copy button */}
                 <div className="flex items-center gap-2 pt-2 pb-4 md:pb-8 font-sans justify-start">

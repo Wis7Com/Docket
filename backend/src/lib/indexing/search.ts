@@ -24,12 +24,14 @@ function toFtsQuery(query: string): string {
 }
 
 function queryTerms(query: string): string[] {
+  const ftsOperators = new Set(["and", "or", "not", "near"]);
   const terms = normalizeQuery(query)
     .replace(/([\p{L}\p{N}_])['’]s\b/giu, "$1")
     .replace(/[^\p{L}\p{N}_]+/gu, " ")
     .split(" ")
     .map((term) => term.trim())
     .filter((term) => term.length > 0)
+    .filter((term) => !ftsOperators.has(term.toLocaleLowerCase()))
     .filter((term) => !/^[A-Za-z]$/.test(term));
   return Array.from(new Set(terms));
 }
@@ -311,14 +313,18 @@ export async function searchProjectIndex(args: {
     .map((role) => role.trim())
     .filter((role) => validPartyRoles.has(role));
   if (partyRoles.length > 0) {
-    filterSql.push(`AND d.party_role IN (${partyRoles.map(() => "?").join(", ")})`);
+    filterSql.push(
+      `AND d.party_role IN (${partyRoles.map(() => "?").join(", ")})`,
+    );
     filterValues.push(...partyRoles);
   }
   const partySides = (args.partySides ?? [])
     .map((side) => side.trim().toUpperCase())
     .filter((side) => side === "A" || side === "B");
   if (partySides.length > 0) {
-    filterSql.push(`AND d.party_side IN (${partySides.map(() => "?").join(", ")})`);
+    filterSql.push(
+      `AND d.party_side IN (${partySides.map(() => "?").join(", ")})`,
+    );
     filterValues.push(...partySides);
   }
   const filters = filterSql.length

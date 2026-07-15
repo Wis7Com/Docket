@@ -62,6 +62,7 @@ import {
 } from "../lib/documentTypes";
 import { findMatchingOcrRegions } from "../lib/ocr/ocrRegions";
 import {
+  inferBriefSequence,
   inferDocRole,
   inferPartyRole,
 } from "../lib/documentClassification";
@@ -2274,6 +2275,10 @@ async function handleDocumentUpload(
   const content = file.buffer;
   const roleGuess = inferDocRole({ filename });
   const partyGuess = inferPartyRole({ filename });
+  const briefSequence = inferBriefSequence({
+    filename,
+    docRole: roleGuess.role,
+  });
   const { data: doc, error: insertErr } = await db
     .from("documents")
     .insert({
@@ -2285,6 +2290,7 @@ async function handleDocumentUpload(
       status: "processing",
       doc_role: roleGuess.role,
       doc_role_confidence: roleGuess.confidence,
+      brief_sequence: briefSequence,
       ...(partyGuess ? { party_role: partyGuess.role } : {}),
     })
     .select("*")
@@ -2322,6 +2328,10 @@ async function handleDocumentUpload(
       roleGuess.confidence === "low"
         ? inferDocRole({ filename, pageCount })
         : roleGuess;
+    const pageAwareBriefSequence = inferBriefSequence({
+      filename,
+      docRole: pageAwareRoleGuess.role,
+    });
 
     // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;
@@ -2377,6 +2387,7 @@ async function handleDocumentUpload(
         page_count: pageCount,
         doc_role: pageAwareRoleGuess.role,
         doc_role_confidence: pageAwareRoleGuess.confidence,
+        brief_sequence: pageAwareBriefSequence,
         structure_tree: tree ?? null,
         status: "ready",
         updated_at: new Date().toISOString(),

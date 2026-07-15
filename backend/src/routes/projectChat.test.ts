@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
     PROJECT_SYSTEM_PROMPT_EXTRA,
+    PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT,
     PROJECT_ANNOTATION_TOOL_PROMPT,
     buildProjectColorLegendPrompt,
     buildSourceScopePrompt,
@@ -10,12 +11,95 @@ import {
     requestedAnnotationColorFamilies,
     resolveSelectedDocumentScope,
     requestsAnnotationContext,
+    requestsBriefSequenceDiff,
+    buildProjectSystemPromptExtra,
 } from "./projectChat";
 
 test("project prompt includes the issue-by-issue comparison workflow", () => {
     assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /DOCUMENT COMPARISON REQUESTS/);
     assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /doc_ids scoping/);
     assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /one row per issue/);
+    assert.match(
+        PROJECT_SYSTEM_PROMPT_EXTRA,
+        /\[N\] marker to every supported claim in each table cell/,
+    );
+    assert.match(PROJECT_SYSTEM_PROMPT_EXTRA, /final <CITATIONS> block/);
+    assert.match(
+        PROJECT_SYSTEM_PROMPT_EXTRA,
+        /Plain-text document names or page references are not verified and do not count as citations/,
+    );
+});
+
+test("project prompt routes Korean and English brief sequence diff requests", () => {
+    assert.doesNotMatch(
+        PROJECT_SYSTEM_PROMPT_EXTRA,
+        /BRIEF SEQUENCE DIFF REQUESTS/,
+    );
+    assert.match(
+        PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT,
+        /BRIEF SEQUENCE DIFF REQUESTS/,
+    );
+    assert.match(PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT, /what's new in the reply/);
+    assert.match(PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT, /준비서면/);
+    assert.match(PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT, /N차 서면/);
+    assert.match(PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT, /새로 주장/);
+    assert.match(PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT, /이전 서면과 비교/);
+    assert.match(
+        PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT,
+        /same party_side, and a lower brief_sequence/,
+    );
+    assert.match(
+        PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT,
+        /NEW only if substantively absent, ELABORATED.*REPEATED/s,
+    );
+    assert.match(
+        PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT,
+        /wording changes alone are never NEW/,
+    );
+    assert.match(
+        PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT,
+        /Every supported statement in every cell must carry a \[N\] marker/,
+    );
+});
+
+test("brief sequence diff recipe is injected only for matching turns or workflow", () => {
+    const yes = [
+        "ECF 245 재반박서가 ECF 213과 비교해 새로 제시한 주장을 정리해 줘",
+        "What's new in the reply compared with the earlier brief?",
+        "N차 서면에서 구체화한 주장과 이전 서면의 차이를 보여줘",
+    ];
+    for (const content of yes) {
+        assert.equal(requestsBriefSequenceDiff({ content }), true);
+        assert.match(
+            buildProjectSystemPromptExtra([{ role: "user", content }]),
+            /BRIEF SEQUENCE DIFF REQUESTS/,
+        );
+    }
+
+    const no = [
+        '답변서에서 "Project 1599"를 인정한 사실을 찾아줘',
+        "우편투표 대신 직접 투표하도록 속이는 것이 권리 박탈이 아니라는 피고 논리를 찾아줘",
+        "준비서면을 요약해줘",
+        "두 계약서를 비교해줘",
+    ];
+    for (const content of no) {
+        assert.equal(requestsBriefSequenceDiff({ content }), false);
+        assert.doesNotMatch(
+            buildProjectSystemPromptExtra([{ role: "user", content }]),
+            /BRIEF SEQUENCE DIFF REQUESTS/,
+        );
+    }
+
+    assert.equal(
+        requestsBriefSequenceDiff({
+            content: "이 요청을 실행해줘",
+            workflow: {
+                id: "builtin-brief-sequence-diff",
+                title: "New Arguments Across Brief Sequence",
+            },
+        }),
+        true,
+    );
 });
 
 test("project prompt requires exhaustive summarization instead of one generic search", () => {
@@ -62,6 +146,33 @@ test("annotation prompt requires the dedicated tool instead of document search",
     assert.match(
         PROJECT_ANNOTATION_TOOL_PROMPT,
         /user notes.*not document facts/,
+    );
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /every opponent-response item must include a \[N\] marker/,
+    );
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /final <CITATIONS> block/);
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /EXHAUSTIVE COLOR REVIEW CONTRACT/,
+    );
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /get_annotation_digest summary\.total and the number of numbered answer sections must match/,
+    );
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /N개 중 N개를 다룬다/);
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /exactly one numbered section for each annotation/,
+    );
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /highlight's original text followed by the opposing party's response/,
+    );
+    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /반박 미발견/);
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /하이라이트는 사용자의 읽기 우선순위이고, 사실 판단은 원문 검증 인용에 근거한다/,
     );
 });
 

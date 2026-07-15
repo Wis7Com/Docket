@@ -34,19 +34,26 @@ Whenever the user asks to summarize, review, outline, or explain an entire selec
 A document may currently be displayed in the user's side panel; when provided, treat it as context for the user's likely focus, but do NOT assume it is the only or definitive document the user is asking about. If the request could apply to other files in the project, identify and read those as well. Prefer coverage across the relevant project documents over an over-narrow reading of only the displayed one.
 
 DOCUMENT COMPARISON REQUESTS:
-When the user asks to compare two or more documents, or two sides' briefs, issue-by-issue: (1) identify the documents or sides from AVAILABLE DOCUMENTS, using list_documents if needed; unless the user explicitly asks to include evidence, restrict discovery and comparison searches with doc_roles:['brief'] so exhibits are excluded; (2) discover the issue list with one or two broad search_project_documents calls or a scoped skim of opening sections with read_index_chunk; (3) for EACH issue, run search_project_documents once per document or side with doc_ids scoping and the same issue query; (4) verify quotes with read_index_chunk before citing; and (5) output a comparison table with one row per issue and one column per document or side, citing page numbers. Use an inline Markdown table by default, or generate_docx with landscape: true when the user asks for a file.
+When the user asks to compare two or more documents, or two sides' briefs, issue-by-issue: (1) identify the documents or sides from AVAILABLE DOCUMENTS, using list_documents if needed; unless the user explicitly asks to include evidence, restrict discovery and comparison searches with doc_roles:['brief'] so exhibits are excluded; (2) discover the issue list with one or two broad search_project_documents calls or a scoped skim of opening sections with read_index_chunk; (3) for EACH issue, run search_project_documents once per document or side with doc_ids scoping and the same issue query; (4) verify quotes with read_index_chunk before citing; and (5) output a comparison table with one row per issue and one column per document or side. Attach a [N] marker to every supported claim in each table cell and include a matching entry for every marker in the final <CITATIONS> block. Markdown tables do not relax this citation contract: place each marker at the end of the relevant cell text. Plain-text document names or page references are not verified and do not count as citations. Use an inline Markdown table by default, or generate_docx with landscape: true when the user asks for a file.
 
 REPLICATING A DOCUMENT:
 When the user wants to use an existing project document as a starting point for a new file (e.g. "use this NDA as a template", "make me a copy of the SOW so I can edit it", "duplicate this and adapt it for company X"), call the replicate_document tool with the source doc_id. This creates a byte-for-byte copy as a new project document, returns a fresh doc_id slug, and shows a download/open card in the UI. Then call edit_document on the returned slug to make the user's requested changes — do NOT call generate_docx for cases where the user clearly wants the existing document's structure and formatting preserved.`;
+
+export const PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT = `BRIEF SEQUENCE DIFF REQUESTS:
+When the user asks "what's new in the reply", what is new in a later brief, asks about "new arguments in the Nth brief" or comparison with earlier briefs, or uses requests such as 준비서면, N차 서면, 새로 주장, or 이전 서면과 비교, follow this recipe even when no workflow is selected: (1) identify the target brief and its party_side and brief_sequence from AVAILABLE DOCUMENTS or list_documents, then call summarize_document on it for a citation-backed claim inventory; (2) identify briefs with doc_role='brief', the same party_side, and a lower brief_sequence, then search each target claim across those earlier documents with doc_ids scoping; (3) classify each claim as NEW only if substantively absent, ELABORATED if it adds a new ground, authority, or legal theory, or REPEATED if only wording changed—wording changes alone are never NEW, and unverifiable novelty must be flagged rather than guessed; (4) when requested, search the opposing party_side's briefs for responses; and (5) output a table with columns Latest brief + citation | Earlier brief status + citation | Classification. Every supported statement in every cell must carry a [N] marker with a matching entry in the final <CITATIONS> block.
+`;
 
 export const PROJECT_ANNOTATION_TOOL_PROMPT = `USER PDF ANNOTATIONS:
 You MUST call get_user_pdf_annotations before answering whenever the user asks what they annotated, highlighted, hilighted, marked, commented on, or noted; assigns meaning to annotation colors; implicitly references their highlights, comments, flags, or markings; or asks for an answer based on or reflecting those markings. This includes 하이라이트, 형광펜, 주석, 메모, 코멘트, 표시한 내용, and 색상별 지시. Use document_query for a named document. Never substitute search_project_documents, find_in_document, or regex matching because those retrieve document text, not the user's saved annotations.
 
 For a potentially large annotation set, first call get_user_pdf_annotations without color or document filters to inspect its summary. Then make filtered calls by color_family or document as needed. The returned summary is computed over the complete filtered result set even when the annotations page is truncated, so use summary.total, summary.by_document, and summary.by_color for complete counts and document-level distribution. For summaries, themes, and other synthesis requests, inspect a bounded representative page and do not accumulate every raw annotation merely to reproduce counts already present in summary. When the user asks for an exhaustive item-by-item list, export, or audit, call get_annotation_digest once instead of manually following next_offset; use its next_cursor only when the 400-item server hard cap is reached. Never claim an exhaustive item list before retrieving the relevant digest cursor window.
 
+EXHAUSTIVE COLOR REVIEW CONTRACT:
+When the user asks to cover every highlight of a specific color, the get_annotation_digest summary.total and the number of numbered answer sections must match. Retrieve every required digest cursor window before answering. Start the answer by declaring "N개 중 N개를 다룬다", with both values replaced by the actual total. Then provide exactly one numbered section for each annotation, containing the highlight's original text followed by the opposing party's response; if no response is found after searching, state "반박 미발견" explicitly. Do not merge or omit annotations. Include this distinction once: "하이라이트는 사용자의 읽기 우선순위이고, 사실 판단은 원문 검증 인용에 근거한다."
+
 Color meanings may be defined by a persisted PROJECT COLOR LEGEND (injected separately when present) and/or by the user's current message; when both apply, the user's current message overrides the legend for that turn. Match unqualified color words to the returned color_family (red, orange, yellow, green, blue, purple, pink, or gray). If the applicable legend entry binds a party_role or party_side, pass that binding as party_roles or party_sides to get_annotation_digest so the server enforces the party scope. When the user qualifies a color as light, pale, dark, or a particular shade, inspect summary.by_color and use the colors exact-hex filter for the best matching bucket instead of silently broadening to the whole family. A clearly dominant exact bucket matching that shade may be selected without asking; state the chosen hex and count. Ask for clarification only when multiple plausible buckets would materially change the answer.
 
-For every annotation that the answer substantively quotes, cites, or interprets, ground it in indexed source text. get_annotation_digest already returns indexed_quote and chunk_id for grounded items; use those directly without repeating read_annotation_context. For ordinary annotation-list results that lack grounded fields, call read_annotation_context first. Never cite the annotation's own quote text when grounded text is available. Plain listing and counting do not require context reads. Annotation comments are user notes and reading priorities, not document facts; verify factual, legal, or citation-bearing claims against the surrounding document text.`;
+For every annotation that the answer substantively quotes, cites, or interprets, ground it in indexed source text. get_annotation_digest already returns indexed_quote and chunk_id for grounded items; use those directly without repeating read_annotation_context. For ordinary annotation-list results that lack grounded fields, call read_annotation_context first. Never cite the annotation's own quote text when grounded text is available. Plain listing and counting do not require context reads. When pairing annotations with an opposing party's response, every opponent-response item must include a [N] marker backed by a matching entry in the final <CITATIONS> block. Annotation comments are user notes and reading priorities, not document facts; verify factual, legal, or citation-bearing claims against the surrounding document text.`;
 
 export const projectChatRouter = Router({ mergeParams: true });
 
@@ -85,6 +92,33 @@ function latestUserText(messages: ChatMessage[]): string {
     return (
         [...messages].reverse().find((m) => m.role === "user")?.content ?? ""
     );
+}
+
+export function requestsBriefSequenceDiff(
+    message: Pick<ChatMessage, "content" | "workflow">,
+): boolean {
+    if (message.workflow?.id === "builtin-brief-sequence-diff") return true;
+    const text = message.content ?? "";
+    const diffIntent =
+        /(새로(?:운|이)?|새\s*주장|구체화|반복|비교|차이|재반박|what(?:'|’)s\s+new|new\s+arguments?|compar(?:e|ison)|differences?|elaborat|repeat)/i.test(
+            text,
+        );
+    if (!diffIntent) return false;
+    const ecfCount = text.match(/\bECF\s*[-#]?\s*\d+\b/gi)?.length ?? 0;
+    const sequenceClue =
+        /(준비서면|(?:\d+|N)\s*차\s*서면|이전\s*서면|후속\s*서면|최초\s*(?:서면|summary)|재반박서|\brepl(?:y|ies)\b|\b(?:later|earlier|prior|subsequent|nth|third)\s+brief\b|brief_sequence)/i.test(
+            text,
+        ) || ecfCount >= 2;
+    return sequenceClue;
+}
+
+export function buildProjectSystemPromptExtra(messages: ChatMessage[]): string {
+    const latestUser = [...messages]
+        .reverse()
+        .find((message) => message.role === "user");
+    return latestUser && requestsBriefSequenceDiff(latestUser)
+        ? `${PROJECT_SYSTEM_PROMPT_EXTRA}\n\n${PROJECT_BRIEF_SEQUENCE_DIFF_PROMPT}`
+        : PROJECT_SYSTEM_PROMPT_EXTRA;
 }
 
 export function requestsAnnotationContext(text: string): boolean {
@@ -476,6 +510,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
                 doc_role: info.doc_role,
                 party_role: info.party_role,
                 party_side: info.party_side,
+                brief_sequence: info.brief_sequence,
             }),
         );
 
@@ -501,7 +536,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
         // the system prompt with the current-turn doc_id slugs so the model
         // knows which docs the user is highlighting *now*, distinct from
         // the broader project doc list.
-        let systemPromptExtra = PROJECT_SYSTEM_PROMPT_EXTRA;
+        let systemPromptExtra = buildProjectSystemPromptExtra(messages);
         if (smallIndexedCorpus) {
             systemPromptExtra += `\n\nSMALL PROJECT CORPUS:\nThis project is small enough to preserve full-context behavior (${indexStats.total_documents} documents, ${indexStats.text_bytes} indexed bytes; current budget ${retrievalSettings.chat_full_read_max_docs} documents / ${fullReadMaxTextBytes ?? retrievalSettings.chat_full_read_max_text_bytes} bytes). Prefer list_documents plus read_document/fetch_documents directly instead of search_project_documents. For comparison requests, read each document fully and build the issue table from the full text.`;
         } else {

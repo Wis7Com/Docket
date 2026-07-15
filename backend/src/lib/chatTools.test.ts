@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BUILTIN_WORKFLOWS } from "./builtinWorkflows";
 import {
-    PROJECT_EXTRA_TOOLS,
+  PROJECT_EXTRA_TOOLS,
+  SYSTEM_PROMPT,
     automaticWholeDocumentSummaryTarget,
     boundDocumentToolResult,
     documentToolResultMaxCharsForModel,
@@ -107,6 +108,14 @@ test("local Ollama models receive a final citation-format reminder", () => {
         /FINAL RESPONSE CITATION CHECK/,
     );
     assert.equal(systemPromptForModel(base, "gemini-3-flash-preview"), base);
+});
+
+test("document citation instructions require markers inside Markdown tables", () => {
+  assert.match(
+    SYSTEM_PROMPT,
+    /In Markdown tables, place each \[N\] marker at the end of the supported claim inside the relevant cell/,
+  );
+  assert.match(SYSTEM_PROMPT, /A table does not waive or replace/);
 });
 
 test("local citation recovery requires an exact quote in the named document", () => {
@@ -252,6 +261,7 @@ test("local citation recovery requires an exact quote in the named document", ()
 const EXPECTED_BACKEND_BUILTIN_WORKFLOW_IDS = [
     "builtin-cp-checklist",
     "builtin-issue-comparison",
+    "builtin-brief-sequence-diff",
     "builtin-credit-summary",
     "builtin-sha-summary",
 ];
@@ -1183,4 +1193,53 @@ test("backend assistant built-in workflows keep the upstream Mike catalog", () =
             `${workflow.id} should keep a structured prompt`,
         );
     }
+});
+
+test("issue comparison workflow requires verified citations in table cells", () => {
+    const workflow = BUILTIN_WORKFLOWS.find(
+        (candidate) => candidate.id === "builtin-issue-comparison",
+    );
+
+    assert.ok(workflow);
+    assert.match(
+        workflow.prompt_md,
+        /\[N\] marker to every supported claim in every table cell/,
+    );
+    assert.match(workflow.prompt_md, /final <CITATIONS> block/);
+    assert.match(
+        workflow.prompt_md,
+        /plain-text document names or page references are not verified and do not count as citations/,
+    );
+});
+
+test("brief sequence workflow uses the evidence-backed novelty recipe", () => {
+    const workflow = BUILTIN_WORKFLOWS.find(
+        (candidate) => candidate.id === "builtin-brief-sequence-diff",
+    );
+
+    assert.equal(workflow?.title, "New Arguments Across Brief Sequence");
+    assert.match(workflow?.prompt_md ?? "", /Call summarize_document/);
+    assert.match(
+        workflow?.prompt_md ?? "",
+        /same party_side, and a lower brief_sequence/,
+    );
+    assert.match(
+        workflow?.prompt_md ?? "",
+        /NEW.*ELABORATED.*REPEATED/s,
+    );
+    assert.match(workflow?.prompt_md ?? "", /wording change alone is never NEW/);
+    assert.match(
+        workflow?.prompt_md ?? "",
+        /Never assert novelty without evidence/,
+    );
+    assert.match(workflow?.prompt_md ?? "", /opposing party_side/);
+    assert.match(
+        workflow?.prompt_md ?? "",
+        /Latest brief \+ citation \| Earlier brief status \+ citation \| Classification/,
+    );
+    assert.match(
+        workflow?.prompt_md ?? "",
+        /Every supported statement in every cell must carry a \[N\] marker/,
+    );
+    assert.match(workflow?.prompt_md ?? "", /final <CITATIONS> block/);
 });

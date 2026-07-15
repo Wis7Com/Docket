@@ -52,7 +52,9 @@ import {
   mimeTypeForDocumentType,
 } from "../lib/documentTypes";
 import {
+  briefSequenceNullableSchema,
   docRoleSchema,
+  inferBriefSequence,
   inferDocRole,
   inferPartyRole,
   partyRoleNullableSchema,
@@ -75,6 +77,13 @@ const ALLOWED_TYPES = new Set([
   "md",
   ...IMAGE_DOCUMENT_TYPES,
 ]);
+
+export function parseBriefSequenceClassificationOverride(
+  value: unknown,
+): number | null | undefined {
+  const parsed = briefSequenceNullableSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
 
 function serializeSourceFolder<T extends Record<string, unknown>>(row: T): T {
   const rootPath = typeof row.root_path === "string" ? row.root_path : "";
@@ -1119,6 +1128,14 @@ projectsRouter.patch(
         return void res.status(400).json({ detail: "Invalid party_side" });
       update.party_side = parsed.data;
     }
+    if ("brief_sequence" in req.body) {
+      const briefSequence = parseBriefSequenceClassificationOverride(
+        req.body.brief_sequence,
+      );
+      if (briefSequence === undefined)
+        return void res.status(400).json({ detail: "Invalid brief_sequence" });
+      update.brief_sequence = briefSequence;
+    }
     if ("instance" in req.body) {
       const value = req.body.instance;
       if (
@@ -1250,6 +1267,10 @@ export async function handleDocumentUpload(
 
   const roleGuess = inferDocRole({ filename });
   const partyGuess = inferPartyRole({ filename });
+  const briefSequence = inferBriefSequence({
+    filename,
+    docRole: roleGuess.role,
+  });
   const { data: doc, error: insertErr } = await db
     .from("documents")
     .insert({
@@ -1261,6 +1282,7 @@ export async function handleDocumentUpload(
       status: "processing",
       doc_role: roleGuess.role,
       doc_role_confidence: roleGuess.confidence,
+      brief_sequence: briefSequence,
       ...(partyGuess ? { party_role: partyGuess.role } : {}),
     })
     .select("*")
@@ -1299,6 +1321,10 @@ export async function handleDocumentUpload(
       roleGuess.confidence === "low"
         ? inferDocRole({ filename, pageCount })
         : roleGuess;
+    const pageAwareBriefSequence = inferBriefSequence({
+      filename,
+      docRole: pageAwareRoleGuess.role,
+    });
 
     // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;
@@ -1353,6 +1379,7 @@ export async function handleDocumentUpload(
         page_count: pageCount,
         doc_role: pageAwareRoleGuess.role,
         doc_role_confidence: pageAwareRoleGuess.confidence,
+        brief_sequence: pageAwareBriefSequence,
         structure_tree: tree ?? null,
         status: "ready",
         updated_at: new Date().toISOString(),

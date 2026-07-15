@@ -164,6 +164,11 @@ export type AssistantEvent =
           error?: string;
           isStreaming?: boolean;
       }
+    | {
+          type: "citation_summary";
+          verified_count: number;
+          used_document_tools: boolean;
+      }
     | { type: "content"; text: string; isStreaming?: boolean };
 
 export interface DocketMessage {

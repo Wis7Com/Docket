@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { preprocessCitations } from "./citations";
+import { citationSummaryChip, preprocessCitations } from "./citations";
 import type { DocketCitationAnnotation } from "../shared/types";
 
 const citation: DocketCitationAnnotation = {
@@ -46,4 +46,40 @@ test("preprocessCitations keeps other refs resolvable when one citation is missi
     assert.match(result, /§unresolved:2§/);
     assert.match(result, /§1§/);
     assert.deepEqual(citations, [citation, thirdCitation]);
+});
+
+test("citationSummaryChip shows the verified citation count", () => {
+    assert.deepEqual(
+        citationSummaryChip(
+            { verified_count: 3, used_document_tools: true },
+            "ko-KR",
+        ),
+        {
+            kind: "verified",
+            text: "원문 대조 인용 3개 ✓",
+        },
+    );
+});
+
+test("citationSummaryChip warns when document tools produced no verified citations", () => {
+    assert.deepEqual(
+        citationSummaryChip(
+            { verified_count: 0, used_document_tools: true },
+            "ko",
+        ),
+        {
+            kind: "warning",
+            text: "⚠︎ 이 답변의 참조는 원문과 대조되지 않았습니다",
+        },
+    );
+});
+
+test("citationSummaryChip stays hidden when no document tools were used", () => {
+    assert.equal(
+        citationSummaryChip({
+            verified_count: 0,
+            used_document_tools: false,
+        }),
+        null,
+    );
 });
