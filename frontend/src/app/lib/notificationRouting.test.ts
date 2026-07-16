@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { notificationDelivery } from "./notificationRouting";
+import {
+  notificationDelivery,
+  systemNotificationFallback,
+} from "./notificationRouting";
 
 test("notification routing suppresses the page already showing the result", () => {
   assert.equal(notificationDelivery({ focused: true, hidden: false, pathname: "/assistant/chat/a" }, "/assistant/chat/a"), "suppress");
@@ -23,4 +26,11 @@ test("embedding notifications suppress every page inside the project", () => {
 
 test("notification routing prefers the operating-system channel while hidden", () => {
   assert.equal(notificationDelivery({ focused: false, hidden: true, pathname: "/projects" }, "/assistant/chat/a"), "system");
+});
+
+test("an unavailable OS channel queues the notification for the next focus", () => {
+  assert.equal(systemNotificationFallback("granted"), "show");
+  assert.equal(systemNotificationFallback("default"), "request");
+  assert.equal(systemNotificationFallback("denied"), "queue");
+  assert.equal(systemNotificationFallback("unsupported"), "queue");
 });

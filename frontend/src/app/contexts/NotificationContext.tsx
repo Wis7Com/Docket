@@ -12,7 +12,10 @@ import {
 } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { X } from "lucide-react";
-import { notificationDelivery } from "@/app/lib/notificationRouting";
+import {
+  notificationDelivery,
+  systemNotificationFallback,
+} from "@/app/lib/notificationRouting";
 
 export type NotificationKind =
   | "chat-complete"
@@ -63,6 +66,40 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
     if (href) routerRef.current.push(href);
   }, []);
 
+  const showToast = useCallback((notification: AppNotification) => {
+    const id = ++nextId.current;
+    setToasts((current) => [...current, { ...notification, id }]);
+    const timer = window.setTimeout(() => {
+      setToasts((current) => current.filter((toast) => toast.id !== id));
+      dismissTimers.current.delete(timer);
+    }, 7000);
+    dismissTimers.current.add(timer);
+  }, []);
+
+  // Notifications that could not reach a hidden/unfocused user (OS channel
+  // denied or unsupported) wait here until the window regains focus.
+  const pendingToasts = useRef<AppNotification[]>([]);
+
+  useEffect(() => {
+    const flushPending = () => {
+      if (pendingToasts.current.length === 0) return;
+      const queued = pendingToasts.current;
+      pendingToasts.current = [];
+      for (const notification of queued) {
+        // Re-evaluate suppression at flush time: the user may have returned
+        // straight to the page the notification points at.
+        const delivery = notificationDelivery(
+          { focused: true, hidden: false, pathname: pathnameRef.current },
+          notification.href,
+          notification.suppressPathPrefix,
+        );
+        if (delivery !== "suppress") showToast(notification);
+      }
+    };
+    window.addEventListener("focus", flushPending);
+    return () => window.removeEventListener("focus", flushPending);
+  }, [showToast]);
+
   const notify = useCallback(
     (notification: AppNotification) => {
       // The current page already presents the completed result, so another
@@ -77,7 +114,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
         notification.suppressPathPrefix,
       );
       if (delivery === "suppress") return;
-      if (delivery === "system" && "Notification" in window) {
+      if (delivery === "system") {
         const show = () => {
           const systemNotification = new Notification(notification.title, {
             body: notification.body,
@@ -87,27 +124,25 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
             navigate(notification.href);
           };
         };
-        if (Notification.permission === "granted") {
+        const fallback = systemNotificationFallback(
+          "Notification" in window ? Notification.permission : "unsupported",
+        );
+        if (fallback === "show") {
           show();
-          return;
-        }
-        if (Notification.permission === "default") {
+        } else if (fallback === "request") {
           void Notification.requestPermission().then((permission) => {
             if (permission === "granted") show();
+            else pendingToasts.current.push(notification);
           });
-          return;
+        } else {
+          pendingToasts.current.push(notification);
         }
+        return;
       }
 
-      const id = ++nextId.current;
-      setToasts((current) => [...current, { ...notification, id }]);
-      const timer = window.setTimeout(() => {
-        setToasts((current) => current.filter((toast) => toast.id !== id));
-        dismissTimers.current.delete(timer);
-      }, 7000);
-      dismissTimers.current.add(timer);
+      showToast(notification);
     },
-    [],
+    [navigate, showToast],
   );
 
   const value = useMemo(() => ({ notify }), [notify]);
