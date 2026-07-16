@@ -36,6 +36,13 @@ test("project chat dropdown supports creator-only bulk deletion", () => {
     assert.match(menuSource, /onDeleteChats\(chatIds\)/);
 });
 
+test("project chat dropdown marks streams in progress", () => {
+    assert.match(menuSource, /useSyncExternalStore/);
+    assert.match(menuSource, /streamingChatKeys/);
+    assert.match(menuSource, /chatSessionKey\(chat\.id, projectId\)/);
+    assert.match(menuSource, /Answer in progress/);
+});
+
 test("project chat header actions have visible English tooltips", () => {
     assert.match(projectChatPageSource, /role="tooltip"/);
     assert.match(projectChatPageSource, /text="Start a new chat"/);

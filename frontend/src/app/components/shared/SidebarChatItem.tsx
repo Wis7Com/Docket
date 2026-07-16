@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { MoreHorizontal, Pencil, Trash2, Check, X } from "lucide-react";
+import { MoreHorizontal, Pencil, Trash2, Check, Loader2, X } from "lucide-react";
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -21,6 +21,7 @@ interface Props {
     selectionMode?: boolean;
     isSelected?: boolean;
     onToggleSelected?: () => void;
+    isStreaming?: boolean;
 }
 
 export function SidebarChatItem({
@@ -31,6 +32,7 @@ export function SidebarChatItem({
     selectionMode = false,
     isSelected = false,
     onToggleSelected,
+    isStreaming = false,
 }: Props) {
     const { renameChat, deleteChat } = useChatHistoryContext();
     const { user } = useAuth();
@@ -130,6 +132,20 @@ export function SidebarChatItem({
                         )}
                         {chat.title ?? "Untitled chat"}
                     </button>
+
+                    {isStreaming && (
+                        <span
+                            role="status"
+                            aria-label="Answer in progress"
+                            title="Answer in progress"
+                            className="shrink-0 text-gray-400"
+                        >
+                            <Loader2
+                                aria-hidden="true"
+                                className="h-3.5 w-3.5 animate-spin"
+                            />
+                        </span>
+                    )}
 
                     {!selectionMode && <DropdownMenu>
                         <DropdownMenuTrigger asChild>

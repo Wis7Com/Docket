@@ -30,3 +30,10 @@ test("assistant history selection remains creator-only", () => {
   assert.match(chatItemSource, /disabled=\{!isChatOwner\}/);
   assert.match(chatItemSource, /selectionMode \? onToggleSelected : onSelect/);
 });
+
+test("assistant history marks streams in progress", () => {
+  assert.match(sidebarSource, /useSyncExternalStore/);
+  assert.match(sidebarSource, /streamingChatKeys/);
+  assert.match(sidebarSource, /chatSessionKey\(chat\.id, chat\.project_id\)/);
+  assert.match(chatItemSource, /Answer in progress/);
+});

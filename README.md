@@ -182,6 +182,32 @@ Edit it under **Color legend** on a project's Documents tab. Entries
 live in that project's `.docket/project.db`, alongside the annotations
 they describe.
 
+### Background answers and embedding notifications
+
+Local models take their time, so Docket doesn't make you watch them
+work. An in-progress chat answer keeps generating when you navigate to
+another page — the stream survives the route change, and returning to
+the chat mid-answer reattaches to the live response. Semantic embedding
+has always run in the background; both now report back when they
+finish.
+
+- **Completion notifications** — when an answer or an embedding run
+  finishes (or fails) while you're elsewhere, Docket shows an in-app
+  toast if the window is focused, or a system notification if the app
+  is in the background. Clicking either focuses the app and jumps to
+  the finished chat or project.
+- **Nothing fires when you're already looking** — notifications are
+  suppressed for the page that shows the result, including any page
+  inside the project whose embedding completed.
+- **Stop still means stop** — the Stop button cancels generation
+  exactly as before, silently; only navigation no longer does.
+- **One answer at a time** — local inference slows down when shared,
+  so starting a question in another chat while one is generating is
+  blocked with a "go to running chat" shortcut instead of degrading
+  both.
+- Manually pausing an embedding run stays silent — failure
+  notifications are reserved for runs that actually stopped on errors.
+
 ### More Docket changes
 
 - **Self-contained project folders** — the workspace picker and
@@ -293,6 +319,9 @@ registry/profile/session state, delete Electron's `userData` directory.
   per-project chats and folder hierarchies.
 - **Tabular review**: bulk-extract structured fields from many documents
   at once into a spreadsheet-like view.
+- **Background completion**: chat answers keep generating while you work
+  elsewhere in the app, with in-app and OS notifications when an answer
+  or embedding run finishes — click through to the result.
 - **Built-in legal workflows**: prebuilt prompt templates for common
   document-review tasks (contract review, NDA triage, etc.).
 - **DOCX conversion** via bundled LibreOffice, so Word files render as

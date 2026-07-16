@@ -65,6 +65,7 @@ export default function AssistantChatPage() {
             isResponseLoading={isResponseLoading}
             handleChat={handleChat}
             cancel={cancel}
+            chatId={id}
         />
     );
 }

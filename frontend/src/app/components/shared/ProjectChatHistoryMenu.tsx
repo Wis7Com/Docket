@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
     Check,
     ChevronDown,
@@ -16,10 +16,17 @@ import {
     DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import type { DocketChat } from "@/app/components/shared/types";
+import {
+    EMPTY_SESSIONS,
+    getChatSessionsSnapshot,
+    subscribeToChatSession,
+} from "@/app/contexts/ChatSessionContext";
+import { chatSessionKey, streamingChatKeys } from "@/app/lib/chatSession.logic";
 
 interface ProjectChatHistoryMenuProps {
     chats: DocketChat[];
     currentChatId: string;
+    projectId: string;
     currentTitle: string;
     currentUserId?: string;
     creatingChat: boolean;
@@ -32,6 +39,7 @@ interface ProjectChatHistoryMenuProps {
 export function ProjectChatHistoryMenu({
     chats,
     currentChatId,
+    projectId,
     currentTitle,
     currentUserId,
     creatingChat,
@@ -40,6 +48,12 @@ export function ProjectChatHistoryMenu({
     onRenameChat,
     onDeleteChats,
 }: ProjectChatHistoryMenuProps) {
+    const sessions = useSyncExternalStore(
+        subscribeToChatSession,
+        getChatSessionsSnapshot,
+        () => EMPTY_SESSIONS,
+    );
+    const activeChatKeys = streamingChatKeys(sessions);
     const [open, setOpen] = useState(false);
     const [selectionMode, setSelectionMode] = useState(false);
     const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
@@ -221,6 +235,9 @@ export function ProjectChatHistoryMenu({
                             const isOwner = !!currentUserId && chat.user_id === currentUserId;
                             const isBusy = busyChatIds.has(chat.id);
                             const isCurrent = chat.id === currentChatId;
+                            const isStreaming = activeChatKeys.has(
+                                chatSessionKey(chat.id, projectId),
+                            );
 
                             return (
                                 <div
@@ -303,6 +320,19 @@ export function ProjectChatHistoryMenu({
                                             >
                                                 {title}
                                             </button>
+                                            {isStreaming && (
+                                                <span
+                                                    role="status"
+                                                    aria-label="Answer in progress"
+                                                    title="Answer in progress"
+                                                    className="shrink-0 text-gray-400"
+                                                >
+                                                    <Loader2
+                                                        aria-hidden="true"
+                                                        className="h-3.5 w-3.5 animate-spin"
+                                                    />
+                                                </span>
+                                            )}
                                             {!selectionMode && isOwner && (
                                                 <div className="flex shrink-0 items-center opacity-70 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
                                                     <button

@@ -9,6 +9,7 @@ export type ModelProvider =
   | "gemini";
 
 export function getModelProvider(modelId: string): ModelProvider | null {
+  if (modelId.startsWith("openai-compatible:")) return "openai-compatible";
   const model = MODELS.find((m) => m.id === modelId);
   if (!model) return null;
   if (model.group === "Local") return "local";
@@ -16,6 +17,32 @@ export function getModelProvider(modelId: string): ModelProvider | null {
   if (model.group === "OpenAI") return "openai";
   if (model.group === "OpenAI-compatible") return "openai-compatible";
   return model.group === "Anthropic" ? "claude" : "gemini";
+}
+
+export function isLocalhostUrl(url: string | null | undefined): boolean {
+  const value = url?.trim();
+  if (!value) return false;
+  try {
+    const hasProtocol = /^[a-z][a-z\d+.-]*:\/\//i.test(value);
+    const candidate = hasProtocol
+      ? value
+      : value.startsWith("::1")
+        ? `http://[::1]${value.slice("::1".length)}`
+        : `http://${value}`;
+    const parsed = new URL(candidate);
+    return ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+export function isGpuBoundModel(
+  modelId: string,
+  opts: { openaiCompatibleBaseUrl?: string | null },
+): boolean {
+  const provider = getModelProvider(modelId);
+  if (provider === "local") return true;
+  return provider === "openai-compatible" && isLocalhostUrl(opts.openaiCompatibleBaseUrl);
 }
 
 export function isModelAvailable(

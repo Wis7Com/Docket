@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useSyncExternalStore } from "react";
 import {
   PanelLeft,
   MessageSquare,
@@ -17,6 +17,12 @@ import Link from "next/link";
 import { DocketIcon } from "@/components/chat/docket-icon";
 import { SidebarChatItem } from "@/app/components/shared/SidebarChatItem";
 import { listProjects } from "@/app/lib/docketApi";
+import {
+  EMPTY_SESSIONS,
+  getChatSessionsSnapshot,
+  subscribeToChatSession,
+} from "@/app/contexts/ChatSessionContext";
+import { chatSessionKey, streamingChatKeys } from "@/app/lib/chatSession.logic";
 
 const NAV_ITEMS = [
   { href: "/assistant", label: "Assistant", icon: MessageSquare },
@@ -44,6 +50,12 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
     () => new Set(),
   );
   const [deletingSelectedChats, setDeletingSelectedChats] = useState(false);
+  const sessions = useSyncExternalStore(
+    subscribeToChatSession,
+    getChatSessionsSnapshot,
+    () => EMPTY_SESSIONS,
+  );
+  const activeChatKeys = streamingChatKeys(sessions);
 
   const selectableChats = (chats ?? []).filter(
     (chat) => !!user?.id && chat.user_id === user.id,
@@ -333,6 +345,9 @@ export function AppSidebar({ isOpen, onToggle }: AppSidebarProps) {
                     selectionMode={historySelectionMode}
                     isSelected={selectedChatIds.has(chat.id)}
                     onToggleSelected={() => toggleChatSelected(chat.id)}
+                    isStreaming={activeChatKeys.has(
+                      chatSessionKey(chat.id, chat.project_id),
+                    )}
                   />
                 ))}
               </div>

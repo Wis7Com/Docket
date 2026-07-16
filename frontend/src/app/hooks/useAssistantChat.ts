@@ -12,22 +12,27 @@ import { getChat, streamChat, streamProjectChat } from "@/app/lib/docketApi";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
 import { useGenerateChatTitle } from "./useGenerateChatTitle";
 import { useNotifications } from "@/app/contexts/NotificationContext";
+import { useUserProfile } from "@/contexts/UserProfileContext";
 import {
-    isDifferentRunningChat,
+    evaluateChatAdmission,
     runningChatHref,
-    shouldAttachChatSession,
+    selectAttachedSession,
     controllerForChatCancel,
+    shouldRouteWriteToSession,
 } from "@/app/lib/chatSession.logic";
 import {
+    EMPTY_SESSIONS,
     beginChatSession,
     finishActiveChatSession,
-    flushActiveChatSession,
+    flushChatSession,
     getActiveChatSession,
-    getAnyActiveChatSession,
-    getChatSessionSnapshot,
+    getChatSessionsSnapshot,
+    getGpuBusySession,
+    getSessionByToken,
     subscribeToChatSession,
     updateActiveChatSession,
 } from "@/app/contexts/ChatSessionContext";
+import { isGpuBoundModel } from "@/app/lib/modelAvailability";
 import type {
     AssistantEvent,
     DocketCitationAnnotation,
@@ -62,6 +67,7 @@ export function useAssistantChat({
     } = useChatHistoryContext();
     const { generate: generateTitle } = useGenerateChatTitle();
     const { notify } = useNotifications();
+    const { profile } = useUserProfile();
 
     // A stream token must outlive a retained route component, while the route
     // attachment token is reset whenever its dynamic chat id changes.
@@ -69,36 +75,27 @@ export function useAssistantChat({
     const ownerTokenRef = useRef<symbol | null>(null);
     const lastFlushedTokenRef = useRef<symbol | null>(null);
     const seenSessionTokenRef = useRef<symbol | null>(null);
+    const syncedTerminalTokenRef = useRef<symbol | null>(null);
     const routeChatIdRef = useRef(initialChatId);
     if (routeChatIdRef.current !== initialChatId) {
         routeChatIdRef.current = initialChatId;
         seenSessionTokenRef.current = null;
         ownerTokenRef.current = null;
         lastFlushedTokenRef.current = null;
+        syncedTerminalTokenRef.current = null;
     }
-    const sessionSnapshot = useSyncExternalStore(
+    const sessions = useSyncExternalStore(
         subscribeToChatSession,
-        getChatSessionSnapshot,
-        () => null,
+        getChatSessionsSnapshot,
+        () => EMPTY_SESSIONS,
     );
     const matchingSession = getActiveChatSession(initialChatId, projectId);
-    const sessionMatchesRoute =
-        !!sessionSnapshot &&
-        sessionSnapshot.projectId === projectId &&
-        sessionSnapshot.chatId === initialChatId;
-    const ownsSession = sessionSnapshot?.token === ownerTokenRef.current;
-    const hasSeenSession =
-        sessionSnapshot?.token === seenSessionTokenRef.current;
-    const attachedSession =
-        sessionSnapshot &&
-        shouldAttachChatSession(
-            sessionSnapshot.status,
-            sessionMatchesRoute,
-            ownsSession,
-            hasSeenSession,
-        )
-            ? sessionSnapshot
-            : null;
+    const attachedSession = selectAttachedSession(
+        sessions,
+        { chatId: initialChatId, projectId },
+        ownerTokenRef.current,
+        seenSessionTokenRef.current,
+    );
     if (attachedSession?.status === "streaming") {
         seenSessionTokenRef.current = attachedSession.token;
     }
@@ -118,48 +115,59 @@ export function useAssistantChat({
     const isLoadingCitations =
         attachedSession?.isLoadingCitations ?? localIsLoadingCitations;
 
-    const abortControllerRef = useRef<AbortController | null>(null);
-
-    // The SSE closure owns the active session. It writes to the external store
-    // directly, so React unmounting a route cannot drop stream progress.
-    const ownsActiveSession = () => {
-        const active = getAnyActiveChatSession();
-        return active?.token === streamTokenRef.current;
+    // Route interactions write to a live session only when this hook owns it.
+    // Fresh mounts keep their hydration writes local so they cannot overwrite
+    // the rendered streaming snapshot.
+    const getRouteStreamingSession = () => {
+        const active = getActiveChatSession(initialChatId, projectId);
+        return active?.status === "streaming" ? active : null;
     };
     const setMessages = (update: SetStateAction<DocketMessage[]>) => {
-        const active = getAnyActiveChatSession();
-        if (active && ownsActiveSession()) {
+        const active = getRouteStreamingSession();
+        if (active && shouldRouteWriteToSession(
+            active,
+            { chatId: initialChatId, projectId },
+            streamTokenRef.current,
+        )) {
             const next = typeof update === "function"
                 ? (update as (value: DocketMessage[]) => DocketMessage[])(active.messages)
                 : update;
-            updateActiveChatSession({ messages: next }, streamTokenRef.current);
+            updateActiveChatSession({ messages: next }, active.token);
             return;
         }
         setLocalMessages(update);
     };
     const setIsResponseLoading = (update: SetStateAction<boolean>) => {
-        const active = getAnyActiveChatSession();
-        if (active && ownsActiveSession()) {
+        const active = getRouteStreamingSession();
+        if (active && shouldRouteWriteToSession(
+            active,
+            { chatId: initialChatId, projectId },
+            streamTokenRef.current,
+        )) {
             const next = typeof update === "function"
                 ? (update as (value: boolean) => boolean)(active.isResponseLoading)
                 : update;
             updateActiveChatSession(
                 { isResponseLoading: next },
-                streamTokenRef.current,
+                active.token,
             );
             return;
         }
         setLocalIsResponseLoading(update);
     };
     const setIsLoadingCitations = (update: SetStateAction<boolean>) => {
-        const active = getAnyActiveChatSession();
-        if (active && ownsActiveSession()) {
+        const active = getRouteStreamingSession();
+        if (active && shouldRouteWriteToSession(
+            active,
+            { chatId: initialChatId, projectId },
+            streamTokenRef.current,
+        )) {
             const next = typeof update === "function"
                 ? (update as (value: boolean) => boolean)(active.isLoadingCitations)
                 : update;
             updateActiveChatSession(
                 { isLoadingCitations: next },
-                streamTokenRef.current,
+                active.token,
             );
             return;
         }
@@ -173,19 +181,6 @@ export function useAssistantChat({
     useEffect(() => {
         setChatId(initialChatId);
     }, [initialChatId]);
-
-    const dripIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-    const dripTargetRef = useRef<string>("");
-    const dripDisplayLenRef = useRef<number>(0);
-    const eventsRef = useRef<AssistantEvent[]>([]);
-    const DRIP_CHARS_PER_TICK = 8;
-
-    const stopDrip = () => {
-        if (dripIntervalRef.current !== null) {
-            clearInterval(dripIntervalRef.current);
-            dripIntervalRef.current = null;
-        }
-    };
 
     const updateLastContentEvent = (
         prev: DocketMessage[],
@@ -206,114 +201,15 @@ export function useAssistantChat({
         return updated;
     };
 
-    const flushDrip = () => {
-        stopDrip();
-        const target = dripTargetRef.current;
-        dripDisplayLenRef.current = target.length;
-        setMessages((prev) => updateLastContentEvent(prev, target));
-    };
-
-    /**
-     * Finalize any in-flight streaming content event and reset the drip
-     * counters so the next content_delta starts a fresh block. Called
-     * before any non-content event is appended, so interleaved content /
-     * reasoning / tool events stay in chronological order — without the
-     * later content block inheriting the earlier block's accumulated text.
-     */
-    const finalizeStreamingContent = () => {
-        stopDrip();
-        const events = eventsRef.current;
-        const last = events[events.length - 1];
-        if (last?.type === "content" && last.isStreaming) {
-            const finalText = dripTargetRef.current;
-            eventsRef.current = [
-                ...events.slice(0, -1),
-                { type: "content", text: finalText },
-            ];
-            const snapshot = [...eventsRef.current];
-            setMessages((prev) => {
-                const updated = [...prev];
-                const lastMsg = updated[updated.length - 1];
-                if (lastMsg?.role === "assistant") {
-                    updated[updated.length - 1] = {
-                        ...lastMsg,
-                        events: snapshot,
-                    };
-                }
-                return updated;
-            });
-        }
-        dripTargetRef.current = "";
-        dripDisplayLenRef.current = 0;
-    };
-
-    // If the model transitions from reasoning into content/tool without a
-    // reasoning_block_end (or the events arrive out of order), the prior
-    // reasoning event would otherwise stay flagged isStreaming forever.
-    const finalizeStreamingReasoning = () => {
-        const events = eventsRef.current;
-        const last = events[events.length - 1];
-        if (last?.type !== "reasoning" || !last.isStreaming) return;
-        eventsRef.current = [
-            ...events.slice(0, -1),
-            { type: "reasoning", text: last.text },
-        ];
-        const snapshot = [...eventsRef.current];
-        setMessages((prev) => {
-            const updated = [...prev];
-            const lastMsg = updated[updated.length - 1];
-            if (lastMsg?.role === "assistant") {
-                updated[updated.length - 1] = {
-                    ...lastMsg,
-                    events: snapshot,
-                };
-            }
-            return updated;
-        });
-    };
-
-    const startDrip = () => {
-        if (dripIntervalRef.current !== null) return;
-        dripIntervalRef.current = setInterval(() => {
-            const target = dripTargetRef.current;
-            const displayLen = dripDisplayLenRef.current;
-            if (displayLen >= target.length) return;
-
-            const newLen = Math.min(
-                displayLen + DRIP_CHARS_PER_TICK,
-                target.length,
-            );
-            dripDisplayLenRef.current = newLen;
-            const visibleText = target.slice(0, newLen);
-            const events = eventsRef.current;
-            const lastIdx = events.length - 1;
-            const last = events[lastIdx];
-            if (last?.type === "content" && last.isStreaming) {
-                const next = events.slice();
-                next[lastIdx] = {
-                    type: "content",
-                    text: visibleText,
-                    isStreaming: true,
-                };
-                eventsRef.current = next;
-            }
-
-            setMessages((prev) =>
-                updateLastContentEvent(prev, visibleText, true),
-            );
-        }, 16);
-    };
-
     const cancel = () => {
         const controller = controllerForChatCancel(
-            abortControllerRef.current,
-            getAnyActiveChatSession(),
+            null,
+            getActiveChatSession(chatId, projectId),
             chatId,
             projectId,
         );
         if (controller) {
             controller.abort();
-            abortControllerRef.current = null;
             setIsResponseLoading(false);
             setIsLoadingCitations(false);
         }
@@ -331,95 +227,25 @@ export function useAssistantChat({
         lastFlushedTokenRef.current = attachedSession.token;
         // Fast-forward only a new attachment; the stream owner never listens
         // to or flushes its own writes.
-        flushActiveChatSession();
+        flushChatSession(attachedSession.token);
     }, [attachedSession]);
 
-    // Transient placeholder events (tool_call_start, thinking) fill the
-    // latency gap between real SSE events so the wrapper doesn't look stuck.
-    // Anytime a real event arrives, drop any streaming placeholder first.
-    const isStreamingPlaceholder = (e: AssistantEvent) =>
-        (e.type === "tool_call_start" || e.type === "thinking") &&
-        !!e.isStreaming;
-
-    const clearStreamingPlaceholders = () => {
-        const before = eventsRef.current;
-        const after = before.filter((e) => !isStreamingPlaceholder(e));
-        if (after.length === before.length) return;
-        eventsRef.current = after;
-        const snapshot = [...after];
-        setMessages((prev) => {
-            const updated = [...prev];
-            const last = updated[updated.length - 1];
-            if (last?.role === "assistant") {
-                updated[updated.length - 1] = { ...last, events: snapshot };
-            }
-            return updated;
-        });
-    };
-
-    const pushThinkingPlaceholder = () => {
-        const events = eventsRef.current;
-        const last = events[events.length - 1];
-        // Don't stack placeholders back-to-back; one "Thinking…" line is plenty.
-        if (last && isStreamingPlaceholder(last)) return;
-        eventsRef.current = [
-            ...events,
-            { type: "thinking" as const, isStreaming: true },
-        ];
-        const snapshot = [...eventsRef.current];
-        setMessages((prev) => {
-            const updated = [...prev];
-            const lastMsg = updated[updated.length - 1];
-            if (lastMsg?.role === "assistant") {
-                updated[updated.length - 1] = { ...lastMsg, events: snapshot };
-            }
-            return updated;
-        });
-    };
-
-    const pushEvent = (event: AssistantEvent) => {
-        finalizeStreamingContent();
-        finalizeStreamingReasoning();
-        // Drop any in-flight placeholder unless we're pushing one ourselves.
-        let next = eventsRef.current;
-        if (event.type !== "tool_call_start" && event.type !== "thinking") {
-            next = next.filter((e) => !isStreamingPlaceholder(e));
+    // Preserve a completed response after the bounded terminal-session cache
+    // evicts it. A terminal snapshot is attached only to a route that saw its
+    // stream, so copying it once cannot shadow a freshly hydrated route.
+    useEffect(() => {
+        if (
+            !attachedSession ||
+            attachedSession.status === "streaming" ||
+            syncedTerminalTokenRef.current === attachedSession.token
+        ) {
+            return;
         }
-        eventsRef.current = [...next, event];
-        const snapshot = [...eventsRef.current];
-        setMessages((prev) => {
-            const updated = [...prev];
-            const last = updated[updated.length - 1];
-            if (last?.role === "assistant") {
-                updated[updated.length - 1] = { ...last, events: snapshot };
-            }
-            return updated;
-        });
-    };
-
-    const updateMatchingEvent = (
-        predicate: (e: AssistantEvent) => boolean,
-        updater: (e: AssistantEvent) => AssistantEvent,
-    ) => {
-        const events = eventsRef.current;
-        const idx = [...events]
-            .map((_, i) => i)
-            .reverse()
-            .find((i) => predicate(events[i]));
-        if (idx === undefined) return;
-        const newEvents = [...events];
-        newEvents[idx] = updater(events[idx]);
-        eventsRef.current = newEvents;
-        const snapshot = [...newEvents];
-        setMessages((prev) => {
-            const updated = [...prev];
-            const last = updated[updated.length - 1];
-            if (last?.role === "assistant") {
-                updated[updated.length - 1] = { ...last, events: snapshot };
-            }
-            return updated;
-        });
-    };
+        syncedTerminalTokenRef.current = attachedSession.token;
+        setLocalMessages(attachedSession.messages);
+        setLocalIsResponseLoading(false);
+        setLocalIsLoadingCitations(false);
+    }, [attachedSession]);
 
     const handleChat = async (
         message: DocketMessage,
@@ -430,12 +256,19 @@ export function useAssistantChat({
     ): Promise<string | null> => {
         if (!message.content.trim()) return null;
 
-        const running = getAnyActiveChatSession();
-        if (running && isDifferentRunningChat(running, { chatId, projectId })) {
-            const href = runningChatHref(running);
+        const gpuBound = isGpuBoundModel(message.model ?? "", {
+            openaiCompatibleBaseUrl: profile?.openaiCompatibleBaseUrl ?? null,
+        });
+        const admission = evaluateChatAdmission({
+            gpuBound,
+            gpuBusySession: getGpuBusySession(),
+            current: { chatId, projectId },
+        });
+        if (admission.kind === "blocked-local-busy") {
+            const href = runningChatHref(admission.conflict);
             notify({
-                title: "An answer is still being generated",
-                body: "Finish or stop the current answer before starting another one.",
+                title: "Local model is busy",
+                body: "The local model can generate one answer at a time. Finish or stop the current answer, or switch this chat to an API model.",
                 href,
                 kind: "chat-error",
                 actionLabel: href ? "Go to chat" : undefined,
@@ -444,9 +277,9 @@ export function useAssistantChat({
         }
         // A same-chat retry supersedes the existing request instead of leaving
         // two writers racing for the same persisted conversation.
-        running?.controller?.abort();
-
-        setIsResponseLoading(true);
+        if (chatId != null) {
+            getActiveChatSession(chatId, projectId)?.controller?.abort();
+        }
 
         const lastMessage = messages[messages.length - 1];
         const isMessageAlreadyAdded =
@@ -462,27 +295,157 @@ export function useAssistantChat({
             ...newMessages,
             { role: "assistant", content: "", annotations: [], events: [] },
         ];
-        setMessages(sessionMessages);
-
         let streamedChatId: string | null = null;
 
-        stopDrip();
-        dripTargetRef.current = "";
-        dripDisplayLenRef.current = 0;
-        eventsRef.current = [];
+        const stream = {
+            token: null as symbol | null,
+            controller: new AbortController(),
+            events: [] as AssistantEvent[],
+            dripTarget: "",
+            dripDisplayLen: 0,
+            dripInterval: null as ReturnType<typeof setInterval> | null,
+        };
+        let streamToken: symbol | null = null;
+        const updateStreamMessages = (update: SetStateAction<DocketMessage[]>) => {
+            const active = getSessionByToken(stream.token);
+            if (!active || active.status !== "streaming") return;
+            const next = typeof update === "function"
+                ? (update as (value: DocketMessage[]) => DocketMessage[])(active.messages)
+                : update;
+            updateActiveChatSession({ messages: next }, stream.token);
+        };
+        const updateStreamLoading = (update: SetStateAction<boolean>) => {
+            const active = getSessionByToken(stream.token);
+            if (!active || active.status !== "streaming") return;
+            const next = typeof update === "function"
+                ? (update as (value: boolean) => boolean)(active.isResponseLoading)
+                : update;
+            updateActiveChatSession({ isResponseLoading: next }, stream.token);
+        };
+        const updateStreamCitationsLoading = (update: SetStateAction<boolean>) => {
+            const active = getSessionByToken(stream.token);
+            if (!active || active.status !== "streaming") return;
+            const next = typeof update === "function"
+                ? (update as (value: boolean) => boolean)(active.isLoadingCitations)
+                : update;
+            updateActiveChatSession({ isLoadingCitations: next }, stream.token);
+        };
+        const setMessages = updateStreamMessages;
+        const setIsResponseLoading = updateStreamLoading;
+        const setIsLoadingCitations = updateStreamCitationsLoading;
+        const stopDrip = () => {
+            if (stream.dripInterval !== null) {
+                clearInterval(stream.dripInterval);
+                stream.dripInterval = null;
+            }
+        };
+        const flushDrip = () => {
+            stopDrip();
+            stream.dripDisplayLen = stream.dripTarget.length;
+            setMessages((prev) => updateLastContentEvent(prev, stream.dripTarget));
+        };
+        const writeEvents = (events: AssistantEvent[]) => {
+            stream.events = events;
+            const snapshot = [...events];
+            setMessages((prev) => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last?.role === "assistant") {
+                    updated[updated.length - 1] = { ...last, events: snapshot };
+                }
+                return updated;
+            });
+        };
+        const finalizeStreamingContent = () => {
+            stopDrip();
+            const last = stream.events[stream.events.length - 1];
+            if (last?.type === "content" && last.isStreaming) {
+                writeEvents([
+                    ...stream.events.slice(0, -1),
+                    { type: "content", text: stream.dripTarget },
+                ]);
+            }
+            stream.dripTarget = "";
+            stream.dripDisplayLen = 0;
+        };
+        const finalizeStreamingReasoning = () => {
+            const last = stream.events[stream.events.length - 1];
+            if (last?.type !== "reasoning" || !last.isStreaming) return;
+            writeEvents([
+                ...stream.events.slice(0, -1),
+                { type: "reasoning", text: last.text },
+            ]);
+        };
+        const startDrip = () => {
+            if (stream.dripInterval !== null) return;
+            stream.dripInterval = setInterval(() => {
+                if (stream.dripDisplayLen >= stream.dripTarget.length) return;
+                stream.dripDisplayLen = Math.min(
+                    stream.dripDisplayLen + 8,
+                    stream.dripTarget.length,
+                );
+                const text = stream.dripTarget.slice(0, stream.dripDisplayLen);
+                const lastIndex = stream.events.length - 1;
+                const last = stream.events[lastIndex];
+                if (last?.type === "content" && last.isStreaming) {
+                    const events = [...stream.events];
+                    events[lastIndex] = { type: "content", text, isStreaming: true };
+                    stream.events = events;
+                }
+                setMessages((prev) => updateLastContentEvent(prev, text, true));
+            }, 16);
+        };
+        const isStreamingPlaceholder = (event: AssistantEvent) =>
+            (event.type === "tool_call_start" || event.type === "thinking") &&
+            !!event.isStreaming;
+        const clearStreamingPlaceholders = () => {
+            const events = stream.events.filter((event) => !isStreamingPlaceholder(event));
+            if (events.length !== stream.events.length) writeEvents(events);
+        };
+        const pushThinkingPlaceholder = () => {
+            const last = stream.events[stream.events.length - 1];
+            if (!last || !isStreamingPlaceholder(last)) {
+                writeEvents([
+                    ...stream.events,
+                    { type: "thinking" as const, isStreaming: true },
+                ]);
+            }
+        };
+        const pushEvent = (event: AssistantEvent) => {
+            finalizeStreamingContent();
+            finalizeStreamingReasoning();
+            const events = event.type === "tool_call_start" || event.type === "thinking"
+                ? stream.events
+                : stream.events.filter((current) => !isStreamingPlaceholder(current));
+            writeEvents([...events, event]);
+        };
+        const updateMatchingEvent = (
+            predicate: (event: AssistantEvent) => boolean,
+            updater: (event: AssistantEvent) => AssistantEvent,
+        ) => {
+            const index = [...stream.events]
+                .map((_, i) => i)
+                .reverse()
+                .find((i) => predicate(stream.events[i]));
+            if (index === undefined) return;
+            const events = [...stream.events];
+            events[index] = updater(events[index]);
+            writeEvents(events);
+        };
 
         try {
-            const controller = new AbortController();
-            abortControllerRef.current = controller;
-            const streamToken = beginChatSession({
+            streamToken = beginChatSession({
                 chatId,
                 projectId,
                 messages: sessionMessages,
                 isResponseLoading: true,
                 isLoadingCitations: false,
-                controller,
+                model: message.model,
+                gpuBound,
+                controller: stream.controller,
                 flush: flushDrip,
             });
+            stream.token = streamToken;
             streamTokenRef.current = streamToken;
             ownerTokenRef.current = streamToken;
 
@@ -525,14 +488,14 @@ export function useAssistantChat({
                           attachedDocs.length > 0 ? attachedDocs : undefined,
                       selected_document_ids: opts?.selectedDocumentIds,
                       disabled_tools: message.disabled_tools,
-                      signal: controller.signal,
+                      signal: stream.controller.signal,
                   })
                 : streamChat({
                       messages: apiMessages,
                       chat_id: chatId,
                       model,
                       disabled_tools: message.disabled_tools,
-                      signal: controller.signal,
+                      signal: stream.controller.signal,
                   }));
 
             if (!response.ok) {
@@ -580,12 +543,14 @@ export function useAssistantChat({
 
                         if (data.type === "chat_id") {
                             streamedChatId = data.chatId;
-                            setChatId(data.chatId);
                             updateActiveChatSession(
                                 { chatId: data.chatId },
-                                streamTokenRef.current,
+                                streamToken,
                             );
-                            setCurrentChatId(data.chatId);
+                            if (streamTokenRef.current === streamToken) {
+                                setChatId(data.chatId);
+                                setCurrentChatId(data.chatId);
+                            }
                             continue;
                         }
 
@@ -609,15 +574,15 @@ export function useAssistantChat({
                             // content block, start a fresh one — and reset
                             // the drip so we don't inherit a previous
                             // block's accumulated text.
-                            const events = eventsRef.current;
+                            const events = stream.events;
                             const lastEvent = events[events.length - 1];
                             if (
                                 lastEvent?.type !== "content" ||
                                 !lastEvent.isStreaming
                             ) {
-                                dripTargetRef.current = text;
-                                dripDisplayLenRef.current = 0;
-                                eventsRef.current = [
+                                stream.dripTarget = text;
+                                stream.dripDisplayLen = 0;
+                                stream.events = [
                                     ...events,
                                     {
                                         type: "content" as const,
@@ -625,7 +590,7 @@ export function useAssistantChat({
                                         isStreaming: true,
                                     },
                                 ];
-                                const snapshot = [...eventsRef.current];
+                                const snapshot = [...stream.events];
                                 setMessages((prev) => {
                                     const updated = [...prev];
                                     const last = updated[updated.length - 1];
@@ -638,7 +603,7 @@ export function useAssistantChat({
                                     return updated;
                                 });
                             } else {
-                                dripTargetRef.current += text;
+                                stream.dripTarget += text;
                             }
 
                             startDrip();
@@ -648,12 +613,12 @@ export function useAssistantChat({
                         if (data.type === "content_replace") {
                             const text = (data.text as string) ?? "";
                             stopDrip();
-                            dripTargetRef.current = "";
-                            dripDisplayLenRef.current = 0;
+                            stream.dripTarget = "";
+                            stream.dripDisplayLen = 0;
                             clearStreamingPlaceholders();
                             finalizeStreamingReasoning();
-                            eventsRef.current = [
-                                ...eventsRef.current.filter(
+                            stream.events = [
+                                ...stream.events.filter(
                                     (event) => event.type !== "content",
                                 ),
                                 { type: "content" as const, text },
@@ -662,7 +627,7 @@ export function useAssistantChat({
                                     event.type !== "content" ||
                                     event.text.length > 0,
                             );
-                            const snapshot = [...eventsRef.current];
+                            const snapshot = [...stream.events];
                             setMessages((prev) => {
                                 const updated = [...prev];
                                 const last = updated[updated.length - 1];
@@ -679,13 +644,13 @@ export function useAssistantChat({
 
                         if (data.type === "reasoning_delta") {
                             const text = data.text as string;
-                            let events = eventsRef.current;
+                            let events = stream.events;
                             const last = events[events.length - 1];
                             if (
                                 last?.type === "reasoning" &&
                                 last.isStreaming
                             ) {
-                                eventsRef.current = [
+                                stream.events = [
                                     ...events.slice(0, -1),
                                     {
                                         type: "reasoning" as const,
@@ -699,8 +664,8 @@ export function useAssistantChat({
                                 // starts a fresh block at the correct position.
                                 finalizeStreamingContent();
                                 clearStreamingPlaceholders();
-                                events = eventsRef.current;
-                                eventsRef.current = [
+                                events = stream.events;
+                                stream.events = [
                                     ...events,
                                     {
                                         type: "reasoning" as const,
@@ -709,7 +674,7 @@ export function useAssistantChat({
                                     },
                                 ];
                             }
-                            const snapshot = [...eventsRef.current];
+                            const snapshot = [...stream.events];
                             setMessages((prev) => {
                                 const updated = [...prev];
                                 const last = updated[updated.length - 1];
@@ -725,13 +690,13 @@ export function useAssistantChat({
                         }
 
                         if (data.type === "reasoning_block_end") {
-                            const events = eventsRef.current;
+                            const events = stream.events;
                             const last = events[events.length - 1];
                             if (
                                 last?.type === "reasoning" &&
                                 last.isStreaming
                             ) {
-                                eventsRef.current = [
+                                stream.events = [
                                     ...events.slice(0, -1),
                                     {
                                         type: "reasoning" as const,
@@ -739,7 +704,7 @@ export function useAssistantChat({
                                     },
                                 ];
                             }
-                            const snapshot = [...eventsRef.current];
+                            const snapshot = [...stream.events];
                             setMessages((prev) => {
                                 const updated = [...prev];
                                 const last = updated[updated.length - 1];
@@ -1141,7 +1106,9 @@ export function useAssistantChat({
                         message.content.trim().slice(0, 120) || "New Chat",
                     );
                 }
-                setCurrentChatId(finalChatId);
+                if (streamTokenRef.current === streamToken) {
+                    setCurrentChatId(finalChatId);
+                }
                 // Never yank a user back from a page they intentionally
                 // visited while the answer was streaming. This also retains
                 // the dynamic-route stale-id guard for project chat tabs.
@@ -1166,7 +1133,7 @@ export function useAssistantChat({
                 void generateTitle(finalChatIdForTitle, titleParts.join("\n"));
             }
 
-            finishActiveChatSession(streamTokenRef.current, "completed");
+            finishActiveChatSession(streamToken, "completed");
             if (
                 finalChatHref &&
                 !wasViewingFinishingChat
@@ -1284,14 +1251,14 @@ export function useAssistantChat({
                 }
             }
             finishActiveChatSession(
-                streamTokenRef.current,
+                streamToken,
                 error instanceof Error && error.name === "AbortError"
                     ? "cancelled"
                     : "failed",
             );
             return null;
         } finally {
-            abortControllerRef.current = null;
+            stopDrip();
         }
     };
 

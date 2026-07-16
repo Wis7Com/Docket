@@ -23,7 +23,10 @@ import { ApiKeyMissingModal } from "../shared/ApiKeyMissingModal";
 import { ChatToolsMenu } from "./ChatToolsMenu";
 import { ModelToggle } from "./ModelToggle";
 import { BUILT_IN_WORKFLOWS } from "../workflows/builtinWorkflows";
-import { useSelectedModel } from "@/app/hooks/useSelectedModel";
+import {
+  persistSelectedModelForChat,
+  useSelectedModel,
+} from "@/app/hooks/useSelectedModel";
 import { useUserProfile } from "@/contexts/UserProfileContext";
 import { listWorkflows } from "@/app/lib/docketApi";
 import {
@@ -54,6 +57,7 @@ interface Props {
   hideWorkflowButton?: boolean;
   onProjectsClick?: () => void;
   projectMode?: boolean;
+  chatId?: string;
   projectId?: string;
   /**
    * True when the project has documents but the user has unchecked every
@@ -72,6 +76,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     hideWorkflowButton,
     onProjectsClick,
     projectMode = false,
+    chatId,
     projectId,
     noSourcesSelected = false,
   }: Props,
@@ -92,7 +97,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
   const [disabledTools, setDisabledTools] = useState<Set<string>>(
     () => new Set(),
   );
-  const [model, setModel] = useSelectedModel();
+  const [model, setModel] = useSelectedModel(chatId, projectId);
   const { profile } = useUserProfile();
   const apiKeys = {
     claudeApiKey: profile?.claudeApiKey ?? null,
@@ -205,6 +210,10 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     setWorkflowMention(null);
     const wf = selectedWorkflow;
     setSelectedWorkflow(null);
+
+    // A submit also establishes the chat's model preference when the selector
+    // has not been changed explicitly in this mount.
+    if (chatId) persistSelectedModelForChat(chatId, projectId, model);
 
     onSubmit?.({
       role: "user",

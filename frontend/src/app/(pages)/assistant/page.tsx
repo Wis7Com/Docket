@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useAssistantChat } from "@/app/hooks/useAssistantChat";
+import { persistSelectedModelForChat } from "@/app/hooks/useSelectedModel";
 import { InitialView } from "@/app/components/assistant/InitialView";
 import { ChatView } from "@/app/components/assistant/ChatView";
 import type { DocketMessage } from "@/app/components/shared/types";
@@ -13,7 +14,10 @@ export default function AssistantPage() {
 
     async function handleInitialSubmit(message: DocketMessage) {
         const chatId = await handleNewChat(message);
-        if (chatId) router.push(`/assistant/chat/${chatId}`);
+        if (chatId) {
+            persistSelectedModelForChat(chatId, undefined, message.model);
+            router.push(`/assistant/chat/${chatId}`);
+        }
     }
 
     if (messages.length === 0) {

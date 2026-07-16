@@ -2135,6 +2135,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                         <ProjectChatHistoryMenu
                             chats={projectChats}
                             currentChatId={chatId}
+                            projectId={projectId}
                             currentTitle={chatTitle ?? "Untitled chat"}
                             currentUserId={user?.id}
                             creatingChat={creatingChat}
@@ -2247,6 +2248,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                             onCancel={cancel}
                             isLoading={isResponseLoading}
                             projectMode
+                            chatId={chatId}
                             projectId={projectId}
                             noSourcesSelected={noSourcesSelected}
                         />
