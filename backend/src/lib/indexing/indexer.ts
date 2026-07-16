@@ -14,6 +14,8 @@ import {
   embedDocumentText,
   embedDocumentTexts,
   expectedDimensionsForSettings,
+  readProjectEmbeddingModelOverride,
+  resolveProjectEmbeddingSettings,
   readUserEmbeddingSettings,
   vectorToBlob,
   type EmbeddingSettings,
@@ -914,9 +916,12 @@ function queuedEmbeddingCountForProject(projectId: string): number {
 
 export function enqueueChunkEmbeddings(args: {
   userId?: string | null;
+  projectId?: string;
   chunkIds: string[];
 }): number {
-  const settings = readUserEmbeddingSettings(args.userId);
+  const settings = args.projectId
+    ? resolveProjectEmbeddingSettings(args.userId, args.projectId)
+    : readUserEmbeddingSettings(args.userId);
   if (!settings.enabled || args.chunkIds.length === 0) return 0;
 
   const db = getDb();
@@ -1011,7 +1016,7 @@ export function ensureProjectSemanticIndexQueued(
   projectId: string,
   userId?: string | null,
 ): number {
-  const settings = readUserEmbeddingSettings(userId);
+  const settings = resolveProjectEmbeddingSettings(userId, projectId);
   if (!settings.enabled) return 0;
   const rows = getDb()
     .prepare(
@@ -1031,6 +1036,7 @@ export function ensureProjectSemanticIndexQueued(
     .all(projectId) as { id: string }[];
   return enqueueChunkEmbeddings({
     userId,
+    projectId,
     chunkIds: rows.map((row) => row.id),
   });
 }
@@ -1302,6 +1308,14 @@ export function getProjectSemanticIndexStatus(
   enabled: boolean;
   provider: string;
   model_id: string;
+  active_model: string;
+  override: string | null;
+  models: {
+    model: string;
+    dimensions: number;
+    ready: number;
+    total: number;
+  }[];
   dimensions_policy: string;
   memory_profile: string;
   paused: boolean;
@@ -1311,7 +1325,8 @@ export function getProjectSemanticIndexStatus(
   total_vectors: number;
   last_error: string | null;
 } {
-  const settings = readUserEmbeddingSettings(userId);
+  const settings = resolveProjectEmbeddingSettings(userId, projectId);
+  const dimensions = expectedDimensionsForSettings(settings);
   const eligibleRow = getDb()
     .prepare(
       `
@@ -1342,13 +1357,45 @@ export function getProjectSemanticIndexStatus(
         AND d.current_version_id = c.version_id
         AND v.provider = ?
         AND v.model_id = ?
+        AND (? = 0 OR v.dimensions = ?)
       GROUP BY v.status
     `,
     )
-    .all(projectId, settings.provider, settings.model) as {
-    status: string;
-    count: number;
-    last_error: string | null;
+    .all(
+      projectId,
+      settings.provider,
+      settings.model,
+      dimensions,
+      dimensions,
+    ) as {
+      status: string;
+      count: number;
+      last_error: string | null;
+    }[];
+
+  const modelRows = getDb()
+    .prepare(
+      `
+      SELECT v.model_id AS model, v.dimensions,
+             SUM(CASE WHEN v.status = 'ready' THEN 1 ELSE 0 END) AS ready
+      FROM document_index_vectors v
+      JOIN document_index_chunks c ON c.id = v.chunk_id
+      JOIN documents d ON d.id = c.document_id
+      JOIN document_index_files f
+        ON f.document_id = c.document_id
+       AND f.version_id = c.version_id
+       AND f.status = 'ready'
+      WHERE d.project_id = ?
+        AND d.current_version_id = c.version_id
+        AND v.provider = ?
+      GROUP BY v.model_id, v.dimensions
+      ORDER BY v.model_id ASC, v.dimensions ASC
+    `,
+    )
+    .all(projectId, settings.provider) as {
+    model: string;
+    dimensions: number;
+    ready: number;
   }[];
 
   const statusCounts: Record<string, number> = {};
@@ -1361,6 +1408,12 @@ export function getProjectSemanticIndexStatus(
     enabled: settings.enabled,
     provider: settings.provider,
     model_id: settings.model,
+    active_model: settings.model,
+    override: readProjectEmbeddingModelOverride(projectId),
+    models: modelRows.map((row) => ({
+      ...row,
+      total: eligibleRow.count,
+    })),
     dimensions_policy: settings.dimensionsPolicy,
     memory_profile: settings.memoryProfile,
     paused: pausedSemanticProjectIds.has(projectId),

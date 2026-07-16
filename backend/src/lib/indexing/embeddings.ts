@@ -1,5 +1,9 @@
 import crypto from "crypto";
-import { getAppDb } from "../../db/sqlite";
+import {
+  getAppDb,
+  getCurrentDatabaseContext,
+  getDb,
+} from "../../db/sqlite";
 
 export const DEFAULT_EMBEDDING_PROVIDER = "ollama";
 export const DEFAULT_EMBEDDING_MODEL = "batiai/qwen3-embedding:0.6b";
@@ -135,6 +139,72 @@ export function readUserEmbeddingSettings(userId?: string | null): EmbeddingSett
     memoryProfile: memoryProfileFrom(
       process.env.DOCKET_EMBEDDING_MEMORY_PROFILE ?? row?.embedding_memory_profile,
     ),
+  };
+}
+
+/**
+ * Project settings intentionally live in the project's SQLite database so a
+ * project folder retains its embedding choice when it moves between machines.
+ */
+export function readProjectEmbeddingModelOverride(
+  projectId: string,
+): string | null {
+  const context = getCurrentDatabaseContext();
+  if (context.kind !== "project" || context.projectId !== projectId) return null;
+  try {
+    const row = getDb()
+      .prepare(
+        "SELECT value FROM project_settings WHERE key = 'embedding_model_override'",
+      )
+      .get() as { value: string } | undefined;
+    return row?.value.trim() || null;
+  } catch {
+    // Old project databases are migrated before request handling. Keep this
+    // fallback for callers that inspect a project while it is being migrated.
+    return null;
+  }
+}
+
+export function setProjectEmbeddingModelOverride(
+  projectId: string,
+  model: string | null,
+): void {
+  const context = getCurrentDatabaseContext();
+  if (context.kind !== "project" || context.projectId !== projectId) {
+    throw new Error("Project embedding settings require the project database context");
+  }
+  const normalized = model?.trim() || null;
+  if (normalized) {
+    getDb()
+      .prepare(
+        `
+          INSERT INTO project_settings (key, value)
+          VALUES ('embedding_model_override', ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        `,
+      )
+      .run(normalized);
+    return;
+  }
+  getDb()
+    .prepare("DELETE FROM project_settings WHERE key = 'embedding_model_override'")
+    .run();
+}
+
+/**
+ * The model is project-selectable; provider, credentials, URL, dimensions,
+ * and memory profile remain the user's global configuration.
+ */
+export function resolveProjectEmbeddingSettings(
+  userId: string | null | undefined,
+  projectId: string,
+): EmbeddingSettings {
+  const userSettings = readUserEmbeddingSettings(userId);
+  const environmentModel = process.env.DOCKET_EMBEDDING_MODEL?.trim();
+  const override = readProjectEmbeddingModelOverride(projectId);
+  return {
+    ...userSettings,
+    model: environmentModel || override || userSettings.model,
   };
 }
 

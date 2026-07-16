@@ -1665,6 +1665,83 @@ async function samplePdfBytes(
   ) as ArrayBuffer;
 }
 
+test("project embedding model PATCH accepts overrides and rejects invalid or missing projects", async () => {
+  const { signLocalJwt } = await import("../auth/local");
+  const { projectsRouter } = await import("../routes/projects");
+  const { ensureProjectRowInProjectDb, registerProjectFolder } =
+    await import("./projectRegistry");
+  const { readProjectEmbeddingModelOverride } = await import("./indexing/embeddings");
+  const { runWithDatabaseContext } = await import("../db/sqlite");
+  const userId = "project-embedding-patch-user";
+  const userEmail = "project-embedding-patch@example.com";
+  const projectId = "project-embedding-patch";
+  const projectRoot = fs.mkdtempSync(
+    path.join(testRoot, "project-embedding-patch-"),
+  );
+  const project = registerProjectFolder({
+    folderPath: projectRoot,
+    userId,
+    projectId,
+    name: "Embedding patch project",
+  });
+  const context = ensureProjectRowInProjectDb(project);
+  const app = express();
+  app.use(express.json());
+  app.use("/projects", projectsRouter);
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => server.once("listening", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const base = `http://127.0.0.1:${address.port}`;
+    const headers = {
+      Authorization: `Bearer ${signLocalJwt(userId, userEmail)}`,
+      "Content-Type": "application/json",
+    };
+    const setResponse = await fetch(
+      `${base}/projects/${projectId}/embedding-model`,
+      { method: "PATCH", headers, body: JSON.stringify({ model: "project-embed" }) },
+    );
+    assert.equal(setResponse.status, 200);
+    assert.equal(
+      (await setResponse.json() as { semantic: { override: string | null } }).semantic.override,
+      "project-embed",
+    );
+    assert.equal(
+      runWithDatabaseContext(context, () =>
+        readProjectEmbeddingModelOverride(projectId),
+      ),
+      "project-embed",
+    );
+
+    const clearResponse = await fetch(
+      `${base}/projects/${projectId}/embedding-model`,
+      { method: "PATCH", headers, body: JSON.stringify({ model: null }) },
+    );
+    assert.equal(clearResponse.status, 200);
+    assert.equal(
+      (await clearResponse.json() as { semantic: { override: string | null } }).semantic.override,
+      null,
+    );
+    const invalidResponse = await fetch(
+      `${base}/projects/${projectId}/embedding-model`,
+      { method: "PATCH", headers, body: JSON.stringify({ model: "" }) },
+    );
+    assert.equal(invalidResponse.status, 400);
+    const missingResponse = await fetch(
+      `${base}/projects/missing-project/embedding-model`,
+      { method: "PATCH", headers, body: JSON.stringify({ model: "project-embed" }) },
+    );
+    assert.equal(missingResponse.status, 404);
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
+  }
+});
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   if (!response.ok) {

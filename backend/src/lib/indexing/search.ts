@@ -9,7 +9,7 @@ import {
   dotProductFromBlob,
   embedQueryText,
   expectedDimensionsForSettings,
-  readUserEmbeddingSettings,
+  resolveProjectEmbeddingSettings,
 } from "./embeddings";
 import { DOC_ROLES, PARTY_ROLES } from "../documentClassification";
 
@@ -688,7 +688,7 @@ async function semanticSearchCandidates(args: {
   filters: string;
   filterValues: unknown[];
 }): Promise<Candidate[]> {
-  const settings = readUserEmbeddingSettings(args.userId);
+  const settings = resolveProjectEmbeddingSettings(args.userId, args.projectId);
   if (!settings.enabled) return [];
   const db = getDb();
   const preferredDimensions = expectedDimensionsForSettings(settings);

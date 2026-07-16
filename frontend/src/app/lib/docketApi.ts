@@ -203,6 +203,14 @@ export interface ProjectIndexStatus {
     enabled: boolean;
     provider: string;
     model_id: string;
+    active_model: string;
+    override: string | null;
+    models: {
+      model: string;
+      dimensions: number;
+      ready: number;
+      total: number;
+    }[];
     dimensions_policy: string;
     memory_profile: string;
     paused: boolean;
@@ -257,6 +265,20 @@ export async function getProjectIndexStatus(
   projectId: string,
 ): Promise<ProjectIndexStatus> {
   return apiRequest<ProjectIndexStatus>(`/projects/${projectId}/index-status`);
+}
+
+export async function setProjectEmbeddingModel(
+  projectId: string,
+  model: string | null,
+): Promise<{
+  project_id: string;
+  semantic: NonNullable<ProjectIndexStatus["semantic"]>;
+}> {
+  return apiRequest(`/projects/${projectId}/embedding-model`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  });
 }
 
 export async function ensureProjectIndexCurrent(

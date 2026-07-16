@@ -156,6 +156,32 @@ in the viewer:
 
 ![Project assistant answering a contract question with numbered citations, running on a local Ollama model with no cloud API](docs/media/chat-answer.png)
 
+### Project color legend
+
+Highlight colors carry meaning that only the person marking up the
+documents knows — green for undisputed facts, red for contested points.
+The color legend makes that mapping persistent per project, so it
+doesn't have to be restated every chat turn.
+
+Each of the eight color families (red, orange, yellow, green, blue,
+purple, pink, gray) takes a free-text meaning of up to 120 characters
+and, optionally, binds to a party role (plaintiff, defendant,
+appellant, …) or a side (A/B). Saved entries are injected into that
+project's chat as a standing instruction, so "summarize the undisputed
+facts" resolves to the green family without naming the color. When an
+entry carries a party binding, the assistant passes it through to the
+annotation tools and the server enforces that party scope.
+
+The legend is declarative, not inferred: Docket never reads highlight
+content to guess what a color means, and colors left blank stay
+unmapped. A meaning stated in a chat message overrides the legend for
+that turn only, so reusing a color ad hoc doesn't corrupt the saved
+mapping.
+
+Edit it under **Color legend** on a project's Documents tab. Entries
+live in that project's `.docket/project.db`, alongside the annotations
+they describe.
+
 ### More Docket changes
 
 - **Self-contained project folders** — the workspace picker and

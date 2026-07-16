@@ -37,6 +37,7 @@ import {
   startProjectSemanticIndexing,
 } from "../lib/indexing/indexer";
 import { searchProjectIndex } from "../lib/indexing/search";
+import { setProjectEmbeddingModelOverride } from "../lib/indexing/embeddings";
 import {
   ensureProjectRowInProjectDb,
   getRegisteredProject,
@@ -69,6 +70,9 @@ import { parseColorLegendEntries } from "../lib/colorLegend";
 
 export const projectsRouter = Router();
 const ocrOverrideSchema = z.union([z.number().int().min(0), z.null()]);
+const embeddingModelOverrideSchema = z.object({
+  model: z.string().trim().min(1).nullable(),
+});
 const ALLOWED_TYPES = new Set([
   "pdf",
   "docx",
@@ -325,6 +329,36 @@ projectsRouter.get(
       .order("color_family", { ascending: true });
     if (error) return void res.status(500).json({ detail: error.message });
     res.json({ entries: data ?? [] });
+  },
+);
+
+// PATCH /projects/:projectId/embedding-model
+projectsRouter.patch(
+  "/:projectId/embedding-model",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { projectId } = req.params;
+    const db = createServerSupabase();
+    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Project not found" });
+    if (!access.isOwner) {
+      return void res.status(403).json({
+        detail: "Only the project owner can change the embedding model",
+      });
+    }
+
+    const parsed = embeddingModelOverrideSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return void res.status(400).json({ detail: "model must be a non-empty string or null" });
+    }
+    setProjectEmbeddingModelOverride(projectId, parsed.data.model);
+    res.json({
+      project_id: projectId,
+      semantic: getProjectSemanticIndexStatus(projectId, userId),
+    });
   },
 );
 

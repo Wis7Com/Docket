@@ -18,6 +18,10 @@ import {
   isModelAvailable,
   modelGroupToProvider,
 } from "@/app/lib/modelAvailability";
+import {
+  OLLAMA_EMBEDDING_MODEL_OPTIONS,
+  isOllamaEmbeddingPreset,
+} from "@/app/lib/embeddingModels";
 
 export default function ModelsAndApiKeysPage() {
   const {
@@ -224,10 +228,50 @@ function SemanticSearchSettings({
             <option value="openai-compatible">OpenAI-compatible</option>
           </select>
         </label>
-        <label className="text-sm text-gray-600">
-          <span className="mb-1 block">Model</span>
-          <Input value={model} onChange={(event) => setModel(event.target.value)} />
-        </label>
+        {provider === "ollama" ? (
+          <div className="space-y-1">
+            <label className="block text-sm text-gray-600">
+              <span className="mb-1 block">Model</span>
+              <select
+                value={isOllamaEmbeddingPreset(model) ? model : "custom"}
+                onChange={(event) =>
+                  setModel(
+                    event.target.value === "custom" ? "" : event.target.value,
+                  )
+                }
+                className="h-9 w-full rounded-md border border-gray-300 bg-white px-3 text-sm"
+              >
+                {OLLAMA_EMBEDDING_MODEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+                <option value="custom">Custom…</option>
+              </select>
+            </label>
+            {!isOllamaEmbeddingPreset(model) && (
+              <Input
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                placeholder="Ollama model name"
+              />
+            )}
+            <p className="text-xs text-gray-500">
+              Changing the model rebuilds the semantic index with the new model.
+              Existing indexes are preserved, so switching back restores them
+              immediately; rebuilding may take several minutes for large document
+              sets.
+            </p>
+          </div>
+        ) : (
+          <label className="text-sm text-gray-600">
+            <span className="mb-1 block">Model</span>
+            <Input
+              value={model}
+              onChange={(event) => setModel(event.target.value)}
+            />
+          </label>
+        )}
         <label className="text-sm text-gray-600">
           <span className="mb-1 block">Base URL</span>
           <Input

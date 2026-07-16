@@ -553,6 +553,115 @@ test("semantic indexing status is passive until manually started", async () => {
   }
 });
 
+test("switching embedding models reports missing active vectors and preserves old ones", async () => {
+  const db = getDb();
+  const projectId = "project-semantic-model-switch";
+  const userId = "semantic-model-switch-user";
+  const docId = "doc-semantic-model-switch";
+  const versionId = "version-semantic-model-switch";
+  const chunkId = "chunk-semantic-model-switch";
+  const content = "A semantic model switch must backfill the current model only.";
+
+  db.prepare(
+    "INSERT INTO user_profiles (id, user_id, embedding_provider, embedding_model, embedding_dimensions_policy) VALUES (?, ?, ?, ?, ?)",
+  ).run(
+    "profile-semantic-model-switch",
+    userId,
+    "ollama",
+    "batiai/qwen3-embedding:0.6b",
+    "truncate-to-256",
+  );
+  db.prepare(
+    "INSERT INTO projects (id, user_id, name, shared_with) VALUES (?, ?, ?, ?)",
+  ).run(projectId, userId, "Semantic Model Switch Project", "[]");
+  db.prepare(
+    "INSERT INTO documents (id, project_id, user_id, filename, file_type, status, current_version_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).run(docId, projectId, userId, "switch.pdf", "pdf", "ready", versionId);
+  db.prepare(
+    "INSERT INTO document_versions (id, document_id, storage_path, source, version_number) VALUES (?, ?, ?, ?, ?)",
+  ).run(versionId, docId, "switch.pdf", "upload", 1);
+  db.prepare(
+    "INSERT INTO document_index_files (id, document_id, version_id, status, chunk_count, text_bytes) VALUES (?, ?, ?, ?, ?, ?)",
+  ).run("index-semantic-model-switch", docId, versionId, "ready", 1, content.length);
+  db.prepare(
+    "INSERT INTO document_index_chunks (id, document_id, version_id, chunk_index, content, start_char, end_char, token_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(chunkId, docId, versionId, 0, content, 0, content.length, 10);
+
+  const insertVector = db.prepare(
+    `
+      INSERT INTO document_index_vectors (
+        id, chunk_id, chunk_content_hash, provider, model_id, model, dimensions,
+        normalized, embedding_blob, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+  );
+  const hash = crypto.createHash("sha256").update(content).digest("hex");
+  insertVector.run(
+    "vector-semantic-model-switch-0.6b",
+    chunkId,
+    hash,
+    "ollama",
+    "batiai/qwen3-embedding:0.6b",
+    "batiai/qwen3-embedding:0.6b",
+    256,
+    1,
+    vectorToBlob([1, 0, 0]),
+    "ready",
+  );
+  insertVector.run(
+    "vector-semantic-model-switch-4b-wrong-dimensions",
+    chunkId,
+    hash,
+    "ollama",
+    "batiai/qwen3-embedding:4b",
+    "batiai/qwen3-embedding:4b",
+    512,
+    1,
+    vectorToBlob([1, 0, 0]),
+    "ready",
+  );
+
+  db.prepare("UPDATE user_profiles SET embedding_model = ? WHERE user_id = ?").run(
+    "batiai/qwen3-embedding:4b",
+    userId,
+  );
+
+  const passive = getProjectSemanticIndexStatus(projectId, userId);
+  assert.equal(passive.total_vectors, 1);
+  assert.equal(passive.ready_vectors, 0);
+  assert.equal(passive.status_counts.ready ?? 0, 0);
+
+  const activeDimensionsVector = Array.from(
+    { length: 256 },
+    (_, index) => (index === 0 ? 1 : 0),
+  );
+  setEmbeddingAdapterOverrideForTests({
+    embedDocument: async () => activeDimensionsVector,
+    embedQuery: async () => activeDimensionsVector,
+  });
+  try {
+    await withSemanticIndexingPaused(async () => {
+      assert.equal(startProjectSemanticIndexing(projectId, userId), 1);
+      const started = getProjectSemanticIndexStatus(projectId, userId);
+      assert.equal(started.status_counts.pending, 1);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } finally {
+    setEmbeddingAdapterOverrideForTests(null);
+  }
+
+  const vectors = db
+    .prepare(
+      "SELECT model_id, dimensions FROM document_index_vectors WHERE chunk_id = ? ORDER BY dimensions, model_id",
+    )
+    .all(chunkId) as { model_id: string; dimensions: number }[];
+  assert.deepEqual(vectors, [
+    { model_id: "batiai/qwen3-embedding:0.6b", dimensions: 256 },
+    { model_id: "batiai/qwen3-embedding:4b", dimensions: 256 },
+    { model_id: "batiai/qwen3-embedding:4b", dimensions: 512 },
+  ]);
+});
+
 test("rebuild removes every project embedding model and cancels queued work", async () => {
   const db = getDb();
   const projectId = "project-embedding-clear";

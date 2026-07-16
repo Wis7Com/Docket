@@ -67,6 +67,7 @@ import {
   cancelProjectIndex,
   startProjectEmbedding,
   pauseProjectEmbedding,
+  setProjectEmbeddingModel,
   searchProjectDocuments,
   requestFullDocumentOcr,
   type DocketDocumentVersion,
@@ -75,6 +76,10 @@ import {
   type DocketSourceFolder,
   type DocketSourceFolderScanResult,
 } from "@/app/lib/docketApi";
+import {
+  projectEmbeddingSelections,
+  shouldShowProjectEmbeddingWarning,
+} from "@/app/lib/projectEmbeddingSelection";
 import { clearLocalSessionCache } from "@/lib/supabase";
 import type {
   DocketDocument,
@@ -1323,6 +1328,19 @@ export function ProjectPage({ projectId }: Props) {
     }
   }
 
+  async function handleProjectEmbeddingModelChange(model: string | null) {
+    setEmbeddingBusy(true);
+    try {
+      const result = await setProjectEmbeddingModel(projectId, model);
+      setIndexStatus((previous) =>
+        previous ? { ...previous, semantic: result.semantic } : previous,
+      );
+      await refreshIndexStatus();
+    } finally {
+      setEmbeddingBusy(false);
+    }
+  }
+
   async function handlePauseEmbedding() {
     setEmbeddingBusy(true);
     try {
@@ -1502,6 +1520,12 @@ export function ProjectPage({ projectId }: Props) {
     currentSemanticProgress.total > 0;
   const semanticEmbeddingPaused = indexStatus?.semantic?.paused === true;
   const semanticEmbeddingActive = currentSemanticProgress?.active === true;
+  const projectEmbeddingWarning = indexStatus?.semantic
+    ? shouldShowProjectEmbeddingWarning(indexStatus.semantic)
+    : false;
+  const embeddingSelections = projectEmbeddingSelections(
+    indexStatus?.semantic?.models ?? [],
+  );
 
   function handleTabChange(newTab: Tab) {
     const base = `/projects/${projectId}`;
@@ -3194,10 +3218,33 @@ export function ProjectPage({ projectId }: Props) {
                         }`}
                   </span>
                   {indexStatus.semantic?.enabled !== false ? (
-                    <span className="rounded bg-gray-100 px-2 py-0.5 text-gray-500">
-                      {indexStatus.semantic?.provider ?? "ollama"} ·{" "}
-                      {indexStatus.semantic?.model_id ??
-                        "batiai/qwen3-embedding:0.6b"}
+                    <label className="rounded bg-gray-100 px-2 py-0.5 text-gray-500">
+                      <span className="sr-only">Project embedding model</span>
+                      <select
+                        value={indexStatus.semantic?.override ?? ""}
+                        disabled={embeddingBusy}
+                        onChange={(event) =>
+                          void handleProjectEmbeddingModelChange(
+                            event.target.value || null,
+                          )
+                        }
+                        className="max-w-80 bg-transparent text-xs text-gray-600 outline-none disabled:text-gray-300"
+                      >
+                        {embeddingSelections.map((selection) => (
+                          <option
+                            key={selection.value ?? "default"}
+                            value={selection.value ?? ""}
+                          >
+                            {selection.label}
+                            {selection.readiness ? ` · ${selection.readiness}` : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {projectEmbeddingWarning ? (
+                    <span className="text-gray-500">
+                      This project has not been embedded with the selected model.
                     </span>
                   ) : null}
                   {compactStatus ? (
@@ -3237,7 +3284,9 @@ export function ProjectPage({ projectId }: Props) {
                   ) : (
                     <Play className="h-3 w-3" />
                   )}
-                  Start Embedding
+                  {projectEmbeddingWarning
+                    ? "Embed with this model"
+                    : "Start Embedding"}
                 </button>
               </IndexActionTooltip>
               <IndexActionTooltip

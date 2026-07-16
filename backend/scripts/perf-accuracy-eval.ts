@@ -35,7 +35,7 @@ import {
 } from "../src/lib/indexing/indexer";
 import {
   expectedDimensionsForSettings,
-  readUserEmbeddingSettings,
+  resolveProjectEmbeddingSettings,
   type EmbeddingSettings,
 } from "../src/lib/indexing/embeddings";
 import { searchProjectIndex } from "../src/lib/indexing/search";
@@ -308,7 +308,10 @@ async function runLive(options: CliOptions): Promise<void> {
     const result = await runWithDatabaseContext(context, async () => {
       verifyProjectIdentity(project);
       const lexical = getProjectIndexStatus(project.id);
-      const settings = readUserEmbeddingSettings(project.user_id);
+      const settings = resolveProjectEmbeddingSettings(
+        project.user_id,
+        project.id,
+      );
       const semantic = getProjectSemanticIndexStatus(
         project.id,
         project.user_id,
