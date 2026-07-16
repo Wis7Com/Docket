@@ -1,10 +1,33 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import {
+    useEffect,
+    useRef,
+    useState,
+    useSyncExternalStore,
+    type SetStateAction,
+} from "react";
 import { useRouter } from "next/navigation";
 import { getChat, streamChat, streamProjectChat } from "@/app/lib/docketApi";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
 import { useGenerateChatTitle } from "./useGenerateChatTitle";
+import { useNotifications } from "@/app/contexts/NotificationContext";
+import {
+    isDifferentRunningChat,
+    runningChatHref,
+    shouldAttachChatSession,
+    controllerForChatCancel,
+} from "@/app/lib/chatSession.logic";
+import {
+    beginChatSession,
+    finishActiveChatSession,
+    flushActiveChatSession,
+    getActiveChatSession,
+    getAnyActiveChatSession,
+    getChatSessionSnapshot,
+    subscribeToChatSession,
+    updateActiveChatSession,
+} from "@/app/contexts/ChatSessionContext";
 import type {
     AssistantEvent,
     DocketCitationAnnotation,
@@ -38,13 +61,110 @@ export function useAssistantChat({
         setNewChatMessages,
     } = useChatHistoryContext();
     const { generate: generateTitle } = useGenerateChatTitle();
+    const { notify } = useNotifications();
 
-    const [messages, setMessages] = useState<DocketMessage[]>(initialMessages);
-    const [isResponseLoading, setIsResponseLoading] = useState(false);
-    const [isLoadingCitations, setIsLoadingCitations] = useState(false);
+    // A stream token must outlive a retained route component, while the route
+    // attachment token is reset whenever its dynamic chat id changes.
+    const streamTokenRef = useRef<symbol | null>(null);
+    const ownerTokenRef = useRef<symbol | null>(null);
+    const lastFlushedTokenRef = useRef<symbol | null>(null);
+    const seenSessionTokenRef = useRef<symbol | null>(null);
+    const routeChatIdRef = useRef(initialChatId);
+    if (routeChatIdRef.current !== initialChatId) {
+        routeChatIdRef.current = initialChatId;
+        seenSessionTokenRef.current = null;
+        ownerTokenRef.current = null;
+        lastFlushedTokenRef.current = null;
+    }
+    const sessionSnapshot = useSyncExternalStore(
+        subscribeToChatSession,
+        getChatSessionSnapshot,
+        () => null,
+    );
+    const matchingSession = getActiveChatSession(initialChatId, projectId);
+    const sessionMatchesRoute =
+        !!sessionSnapshot &&
+        sessionSnapshot.projectId === projectId &&
+        sessionSnapshot.chatId === initialChatId;
+    const ownsSession = sessionSnapshot?.token === ownerTokenRef.current;
+    const hasSeenSession =
+        sessionSnapshot?.token === seenSessionTokenRef.current;
+    const attachedSession =
+        sessionSnapshot &&
+        shouldAttachChatSession(
+            sessionSnapshot.status,
+            sessionMatchesRoute,
+            ownsSession,
+            hasSeenSession,
+        )
+            ? sessionSnapshot
+            : null;
+    if (attachedSession?.status === "streaming") {
+        seenSessionTokenRef.current = attachedSession.token;
+    }
+    const [localMessages, setLocalMessages] = useState<DocketMessage[]>(
+        () => matchingSession?.messages ?? initialMessages,
+    );
+    const [localIsResponseLoading, setLocalIsResponseLoading] = useState(
+        () => matchingSession?.isResponseLoading ?? false,
+    );
+    const [localIsLoadingCitations, setLocalIsLoadingCitations] = useState(
+        () => matchingSession?.isLoadingCitations ?? false,
+    );
     const [chatId, setChatId] = useState<string | undefined>(initialChatId);
+    const messages = attachedSession?.messages ?? localMessages;
+    const isResponseLoading =
+        attachedSession?.isResponseLoading ?? localIsResponseLoading;
+    const isLoadingCitations =
+        attachedSession?.isLoadingCitations ?? localIsLoadingCitations;
 
     const abortControllerRef = useRef<AbortController | null>(null);
+
+    // The SSE closure owns the active session. It writes to the external store
+    // directly, so React unmounting a route cannot drop stream progress.
+    const ownsActiveSession = () => {
+        const active = getAnyActiveChatSession();
+        return active?.token === streamTokenRef.current;
+    };
+    const setMessages = (update: SetStateAction<DocketMessage[]>) => {
+        const active = getAnyActiveChatSession();
+        if (active && ownsActiveSession()) {
+            const next = typeof update === "function"
+                ? (update as (value: DocketMessage[]) => DocketMessage[])(active.messages)
+                : update;
+            updateActiveChatSession({ messages: next }, streamTokenRef.current);
+            return;
+        }
+        setLocalMessages(update);
+    };
+    const setIsResponseLoading = (update: SetStateAction<boolean>) => {
+        const active = getAnyActiveChatSession();
+        if (active && ownsActiveSession()) {
+            const next = typeof update === "function"
+                ? (update as (value: boolean) => boolean)(active.isResponseLoading)
+                : update;
+            updateActiveChatSession(
+                { isResponseLoading: next },
+                streamTokenRef.current,
+            );
+            return;
+        }
+        setLocalIsResponseLoading(update);
+    };
+    const setIsLoadingCitations = (update: SetStateAction<boolean>) => {
+        const active = getAnyActiveChatSession();
+        if (active && ownsActiveSession()) {
+            const next = typeof update === "function"
+                ? (update as (value: boolean) => boolean)(active.isLoadingCitations)
+                : update;
+            updateActiveChatSession(
+                { isLoadingCitations: next },
+                streamTokenRef.current,
+            );
+            return;
+        }
+        setLocalIsLoadingCitations(update);
+    };
 
     // Next can retain this hook instance while moving between dynamic chat
     // routes. Keep the request id aligned with the id in the current URL so a
@@ -185,8 +305,14 @@ export function useAssistantChat({
     };
 
     const cancel = () => {
-        if (abortControllerRef.current) {
-            abortControllerRef.current.abort();
+        const controller = controllerForChatCancel(
+            abortControllerRef.current,
+            getAnyActiveChatSession(),
+            chatId,
+            projectId,
+        );
+        if (controller) {
+            controller.abort();
             abortControllerRef.current = null;
             setIsResponseLoading(false);
             setIsLoadingCitations(false);
@@ -194,12 +320,19 @@ export function useAssistantChat({
     };
 
     useEffect(() => {
-        return () => {
-            stopDrip();
-            abortControllerRef.current?.abort();
-            abortControllerRef.current = null;
-        };
-    }, []);
+        if (
+            !attachedSession ||
+            attachedSession.status !== "streaming" ||
+            attachedSession.token === ownerTokenRef.current ||
+            lastFlushedTokenRef.current === attachedSession.token
+        ) {
+            return;
+        }
+        lastFlushedTokenRef.current = attachedSession.token;
+        // Fast-forward only a new attachment; the stream owner never listens
+        // to or flushes its own writes.
+        flushActiveChatSession();
+    }, [attachedSession]);
 
     // Transient placeholder events (tool_call_start, thinking) fill the
     // latency gap between real SSE events so the wrapper doesn't look stuck.
@@ -297,6 +430,22 @@ export function useAssistantChat({
     ): Promise<string | null> => {
         if (!message.content.trim()) return null;
 
+        const running = getAnyActiveChatSession();
+        if (running && isDifferentRunningChat(running, { chatId, projectId })) {
+            const href = runningChatHref(running);
+            notify({
+                title: "An answer is still being generated",
+                body: "Finish or stop the current answer before starting another one.",
+                href,
+                kind: "chat-error",
+                actionLabel: href ? "Go to chat" : undefined,
+            });
+            return null;
+        }
+        // A same-chat retry supersedes the existing request instead of leaving
+        // two writers racing for the same persisted conversation.
+        running?.controller?.abort();
+
         setIsResponseLoading(true);
 
         const lastMessage = messages[messages.length - 1];
@@ -309,10 +458,11 @@ export function useAssistantChat({
             ? messages
             : [...messages, message];
 
-        setMessages([
+        const sessionMessages: DocketMessage[] = [
             ...newMessages,
             { role: "assistant", content: "", annotations: [], events: [] },
-        ]);
+        ];
+        setMessages(sessionMessages);
 
         let streamedChatId: string | null = null;
 
@@ -324,6 +474,17 @@ export function useAssistantChat({
         try {
             const controller = new AbortController();
             abortControllerRef.current = controller;
+            const streamToken = beginChatSession({
+                chatId,
+                projectId,
+                messages: sessionMessages,
+                isResponseLoading: true,
+                isLoadingCitations: false,
+                controller,
+                flush: flushDrip,
+            });
+            streamTokenRef.current = streamToken;
+            ownerTokenRef.current = streamToken;
 
             const apiMessages = newMessages.map((currentMessage) => ({
                 role: currentMessage.role,
@@ -420,6 +581,10 @@ export function useAssistantChat({
                         if (data.type === "chat_id") {
                             streamedChatId = data.chatId;
                             setChatId(data.chatId);
+                            updateActiveChatSession(
+                                { chatId: data.chatId },
+                                streamTokenRef.current,
+                            );
                             setCurrentChatId(data.chatId);
                             continue;
                         }
@@ -944,9 +1109,11 @@ export function useAssistantChat({
             setIsLoadingCitations(false);
 
             const finalChatId = streamedChatId || chatId || null;
+            let completedChatTitle: string | null = null;
             if (finalChatId) {
                 try {
                     const detail = await getChat(finalChatId);
+                    completedChatTitle = detail.chat.title;
                     setMessages(detail.messages);
                 } catch (err) {
                     console.warn(
@@ -955,6 +1122,17 @@ export function useAssistantChat({
                     );
                 }
             }
+            const chatBasePath = projectId
+                ? `/projects/${projectId}/assistant/chat`
+                : `/assistant/chat`;
+            const finalChatHref = finalChatId
+                ? `${chatBasePath}/${finalChatId}`
+                : undefined;
+            const wasViewingFinishingChat =
+                typeof window !== "undefined" &&
+                (window.location.pathname === finalChatHref ||
+                    window.location.pathname === chatBasePath ||
+                    window.location.pathname === `${chatBasePath}/${initialChatId}`);
             if (finalChatId && finalChatId !== initialChatId) {
                 if (initialChatId) {
                     replaceChatId(
@@ -964,10 +1142,14 @@ export function useAssistantChat({
                     );
                 }
                 setCurrentChatId(finalChatId);
-                const chatBasePath = projectId
-                    ? `/projects/${projectId}/assistant/chat`
-                    : `/assistant/chat`;
-                router.replace(`${chatBasePath}/${finalChatId}`);
+                // Never yank a user back from a page they intentionally
+                // visited while the answer was streaming. This also retains
+                // the dynamic-route stale-id guard for project chat tabs.
+                if (
+                    wasViewingFinishingChat
+                ) {
+                    router.replace(`${chatBasePath}/${finalChatId}`);
+                }
             }
 
             await loadChats();
@@ -982,6 +1164,19 @@ export function useAssistantChat({
                         `Files: ${message.files.map((f) => f.filename).join(", ")}`,
                     );
                 void generateTitle(finalChatIdForTitle, titleParts.join("\n"));
+            }
+
+            finishActiveChatSession(streamTokenRef.current, "completed");
+            if (
+                finalChatHref &&
+                !wasViewingFinishingChat
+            ) {
+                notify({
+                    title: completedChatTitle || "Answer ready",
+                    body: "Your answer is ready to review.",
+                    href: finalChatHref,
+                    kind: "chat-complete",
+                });
             }
 
             return streamedChatId || null;
@@ -1068,6 +1263,32 @@ export function useAssistantChat({
 
             setIsResponseLoading(false);
             setIsLoadingCitations(false);
+            if (!(error instanceof Error && error.name === "AbortError")) {
+                const failedChatId = streamedChatId || chatId;
+                const failedHref = failedChatId
+                    ? projectId
+                        ? `/projects/${projectId}/assistant/chat/${failedChatId}`
+                        : `/assistant/chat/${failedChatId}`
+                    : undefined;
+                if (
+                    failedHref &&
+                    typeof window !== "undefined" &&
+                    window.location.pathname !== failedHref
+                ) {
+                    notify({
+                        title: "Answer failed",
+                        body: error instanceof Error ? error.message : "Sorry, something went wrong.",
+                        href: failedHref,
+                        kind: "chat-error",
+                    });
+                }
+            }
+            finishActiveChatSession(
+                streamTokenRef.current,
+                error instanceof Error && error.name === "AbortError"
+                    ? "cancelled"
+                    : "failed",
+            );
             return null;
         } finally {
             abortControllerRef.current = null;

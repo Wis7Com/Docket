@@ -3,6 +3,9 @@
 import { useState, useEffect } from "react";
 import { Menu } from "lucide-react";
 import { ChatHistoryProvider } from "@/app/contexts/ChatHistoryContext";
+import { NotificationProvider } from "@/app/contexts/NotificationContext";
+import { EmbeddingWatcherProvider } from "@/app/contexts/EmbeddingWatcherContext";
+import { ChatSessionProvider } from "@/app/contexts/ChatSessionContext";
 import { SidebarContext } from "@/app/contexts/SidebarContext";
 import { AppSidebar } from "@/app/components/shared/AppSidebar";
 
@@ -55,34 +58,40 @@ export default function DocketLayout({
 
   return (
     <ChatHistoryProvider>
-      <SidebarContext.Provider
-        value={{
-          setSidebarOpen: (open) => {
-            setIsSidebarOpen(open);
-            setIsSidebarOpenDesktop(open);
-          },
-        }}
-      >
-        <div className="h-dvh bg-white flex flex-col">
-          <div className="flex-1 flex overflow-hidden">
-            <AppSidebar isOpen={isSidebarOpen} onToggle={handleSidebarToggle} />
-            <div className="flex-1 flex flex-col h-dvh md:overflow-hidden relative w-full">
-              {/* Mobile header */}
-              <div className="flex md:hidden items-center gap-3 px-4 py-3 border-b border-gray-100 shrink-0">
-                <button
-                  onClick={handleSidebarToggle}
-                  className="flex items-center justify-center w-8 h-8 rounded hover:bg-gray-100 text-gray-500 transition-colors"
-                >
-                  <Menu className="h-5 w-5" />
-                </button>
+      <NotificationProvider>
+        <EmbeddingWatcherProvider>
+          <ChatSessionProvider>
+            <SidebarContext.Provider
+              value={{
+                setSidebarOpen: (open) => {
+                  setIsSidebarOpen(open);
+                  setIsSidebarOpenDesktop(open);
+                },
+              }}
+            >
+              <div className="h-dvh bg-white flex flex-col">
+                <div className="flex-1 flex overflow-hidden">
+                  <AppSidebar isOpen={isSidebarOpen} onToggle={handleSidebarToggle} />
+                  <div className="flex-1 flex flex-col h-dvh md:overflow-hidden relative w-full">
+                    {/* Mobile header */}
+                    <div className="flex md:hidden items-center gap-3 px-4 py-3 border-b border-gray-100 shrink-0">
+                      <button
+                        onClick={handleSidebarToggle}
+                        className="flex items-center justify-center w-8 h-8 rounded hover:bg-gray-100 text-gray-500 transition-colors"
+                      >
+                        <Menu className="h-5 w-5" />
+                      </button>
+                    </div>
+                    <main className="flex-1 overflow-y-auto md:overflow-hidden w-full h-full">
+                      {children}
+                    </main>
+                  </div>
+                </div>
               </div>
-              <main className="flex-1 overflow-y-auto md:overflow-hidden w-full h-full">
-                {children}
-              </main>
-            </div>
-          </div>
-        </div>
-      </SidebarContext.Provider>
+            </SidebarContext.Provider>
+          </ChatSessionProvider>
+        </EmbeddingWatcherProvider>
+      </NotificationProvider>
     </ChatHistoryProvider>
   );
 }

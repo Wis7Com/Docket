@@ -99,6 +99,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { DocViewModal } from "@/app/components/shared/DocViewModal";
 import { AddNewTRModal } from "@/app/components/tabular/AddNewTRModal";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
+import { useEmbeddingWatcher } from "@/app/contexts/EmbeddingWatcherContext";
 import { ProjectAnnotationBrowser } from "./ProjectAnnotationBrowser";
 import { ColorLegendEditor } from "./ColorLegendEditor";
 
@@ -1255,6 +1256,7 @@ export function ProjectPage({ projectId }: Props) {
 
   const router = useRouter();
   const { saveChat } = useChatHistoryContext();
+  const { registerEmbedding, unregisterEmbedding } = useEmbeddingWatcher();
 
   const refreshIndexStatus = useCallback(async () => {
     try {
@@ -1322,6 +1324,7 @@ export function ProjectPage({ projectId }: Props) {
     setEmbeddingBusy(true);
     try {
       await startProjectEmbedding(projectId);
+      registerEmbedding({ projectId, projectName: project?.name ?? projectId });
       await refreshIndexStatus();
     } finally {
       setEmbeddingBusy(false);
@@ -1345,6 +1348,8 @@ export function ProjectPage({ projectId }: Props) {
     setEmbeddingBusy(true);
     try {
       await pauseProjectEmbedding(projectId);
+      // A user-requested pause is not a failed job and should stay quiet.
+      unregisterEmbedding(projectId);
       await refreshIndexStatus();
     } finally {
       setEmbeddingBusy(false);
@@ -1520,6 +1525,10 @@ export function ProjectPage({ projectId }: Props) {
     currentSemanticProgress.total > 0;
   const semanticEmbeddingPaused = indexStatus?.semantic?.paused === true;
   const semanticEmbeddingActive = currentSemanticProgress?.active === true;
+  useEffect(() => {
+    if (!semanticEmbeddingActive) return;
+    registerEmbedding({ projectId, projectName: project?.name ?? projectId });
+  }, [project?.name, projectId, registerEmbedding, semanticEmbeddingActive]);
   const projectEmbeddingWarning = indexStatus?.semantic
     ? shouldShowProjectEmbeddingWarning(indexStatus.semantic)
     : false;

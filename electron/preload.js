@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld("docket", {
   getToken: () => ipcRenderer.invoke("docket:getToken"),
   getUser: () => ipcRenderer.invoke("docket:getUser"),
   getApiPort: () => ipcRenderer.invoke("docket:getApiPort"),
+  focusMainWindow: () => ipcRenderer.invoke("docket:focusMainWindow"),
   openDocumentViewer: (payload) =>
     ipcRenderer.invoke("docket:openDocumentViewer", payload),
   openMainRoute: (payload) => ipcRenderer.invoke("docket:openMainRoute", payload),

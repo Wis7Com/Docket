@@ -15,6 +15,7 @@
 interface DocketBridge {
   getToken: () => Promise<string | null>;
   getUser: () => Promise<{ id: string; email: string } | null>;
+  focusMainWindow?: () => Promise<{ ok: boolean }>;
 }
 
 declare global {

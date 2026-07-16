@@ -2882,6 +2882,15 @@ ipcMain.handle("docket:getUser", (event) => {
 ipcMain.handle("docket:getApiPort", (event) =>
   isTrustedIpcSender(event) ? getBackendPort() : null,
 );
+ipcMain.handle("docket:focusMainWindow", (event) => {
+  if (!isTrustedIpcSender(event) || !win || win.isDestroyed()) {
+    return { ok: false };
+  }
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  return { ok: true };
+});
 ipcMain.handle(
   "docket:openDocumentViewer",
   (event, payload: DocumentViewerPayload) => {
