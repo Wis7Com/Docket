@@ -23,19 +23,9 @@ import type {
 } from "../shared/types";
 import { useSidebar } from "@/app/contexts/SidebarContext";
 import { invalidateDocxBytes } from "@/app/hooks/useFetchDocxBytes";
-import { ctrlZoomFactor, useCtrlZoom } from "@/lib/ctrlZoom";
-
-const CHAT_FONT_SCALE_KEY = "docket-chat-font-scale";
-const CHAT_FONT_SCALE_MIN = 0.8;
-const CHAT_FONT_SCALE_MAX = 1.6;
-const CHAT_FONT_SCALE_STEP = 0.1;
-
-function clampChatFontScale(value: number) {
-    return Math.min(
-        CHAT_FONT_SCALE_MAX,
-        Math.max(CHAT_FONT_SCALE_MIN, Math.round(value * 10) / 10),
-    );
-}
+import { ChatFontScaleControl } from "./ChatFontScaleControl";
+import { useChatFontScale } from "@/app/hooks/useChatFontScale";
+import { GLOBAL_CHAT_FONT_SCALE_KEY } from "@/app/lib/chatFontScale";
 
 interface Props {
     messages: DocketMessage[];
@@ -325,50 +315,17 @@ export function ChatView({
     const latestUserMessageRef = useRef<HTMLDivElement>(null);
     const chatInputRef = useRef<HTMLDivElement>(null);
     const hasScrolledRef = useRef(false);
-    const fontScaleLoadedRef = useRef(false);
     const [messagesVisible, setMessagesVisible] = useState(false);
     const [showScrollButton, setShowScrollButton] = useState(false);
     const [inputHeight, setInputHeight] = useState(0);
     const [minHeight, setMinHeight] = useState("0px");
-    const [fontScale, setFontScale] = useState(1);
-
-    const updateFontScale = useCallback((value: number) => {
-        setFontScale(clampChatFontScale(value));
-    }, []);
-
-    useEffect(() => {
-        let frame = requestAnimationFrame(() => {
-            try {
-                const saved = Number(localStorage.getItem(CHAT_FONT_SCALE_KEY));
-                if (Number.isFinite(saved) && saved > 0) {
-                    setFontScale(clampChatFontScale(saved));
-                }
-            } catch {
-                // Storage can be unavailable in locked-down browser contexts.
-            } finally {
-                fontScaleLoadedRef.current = true;
-            }
-            frame = 0;
-        });
-        return () => {
-            if (frame) cancelAnimationFrame(frame);
-        };
-    }, []);
-
-    useEffect(() => {
-        if (!fontScaleLoadedRef.current) return;
-        try {
-            localStorage.setItem(CHAT_FONT_SCALE_KEY, String(fontScale));
-        } catch {
-            // Storage can be unavailable in locked-down browser contexts.
-        }
-    }, [fontScale]);
-
-    useCtrlZoom(messagesContainerRef, (detail) => {
-        setFontScale((value) =>
-            clampChatFontScale(value * ctrlZoomFactor(detail)),
-        );
-    });
+    const {
+        fontScale,
+        increase: increaseFontScale,
+        decrease: decreaseFontScale,
+        canIncrease,
+        canDecrease,
+    } = useChatFontScale(messagesContainerRef, GLOBAL_CHAT_FONT_SCALE_KEY);
 
     useEffect(() => {
         const el = chatInputRef.current;
@@ -627,38 +584,16 @@ export function ChatView({
                 )}
 
                 <div
-                    className="absolute right-4 z-20 flex items-center gap-px rounded-full border border-gray-200 bg-white/70 px-1 py-1 shadow-md backdrop-blur-md"
+                    className="absolute right-4 z-20"
                     style={{ bottom: inputHeight + 12 }}
                 >
-                    <button
-                        type="button"
-                        aria-label="Decrease chat text size"
-                        onClick={() =>
-                            updateFontScale(
-                                fontScale - CHAT_FONT_SCALE_STEP,
-                            )
-                        }
-                        disabled={fontScale <= CHAT_FONT_SCALE_MIN}
-                        className="flex h-7 w-7 items-center justify-center rounded-full text-xs font-medium text-gray-600 transition-colors hover:bg-white disabled:opacity-30"
-                    >
-                        A-
-                    </button>
-                    <span className="w-9 select-none text-center text-xs font-medium tabular-nums text-gray-600">
-                        {Math.round(fontScale * 100)}%
-                    </span>
-                    <button
-                        type="button"
-                        aria-label="Increase chat text size"
-                        onClick={() =>
-                            updateFontScale(
-                                fontScale + CHAT_FONT_SCALE_STEP,
-                            )
-                        }
-                        disabled={fontScale >= CHAT_FONT_SCALE_MAX}
-                        className="flex h-7 w-7 items-center justify-center rounded-full text-xs font-medium text-gray-600 transition-colors hover:bg-white disabled:opacity-30"
-                    >
-                        A+
-                    </button>
+                    <ChatFontScaleControl
+                        fontScale={fontScale}
+                        onDecrease={decreaseFontScale}
+                        onIncrease={increaseFontScale}
+                        canDecrease={canDecrease}
+                        canIncrease={canIncrease}
+                    />
                 </div>
 
                 {/* Chat input */}

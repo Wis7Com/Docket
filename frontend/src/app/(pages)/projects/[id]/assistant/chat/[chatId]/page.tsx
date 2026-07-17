@@ -38,10 +38,12 @@ import {
     type ProjectSearchResult,
 } from "@/app/lib/docketApi";
 import { useAssistantChat } from "@/app/hooks/useAssistantChat";
+import { useChatFontScale } from "@/app/hooks/useChatFontScale";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
 import { UserMessage } from "@/app/components/assistant/UserMessage";
 import { AssistantMessage } from "@/app/components/assistant/AssistantMessage";
 import { ChatInput } from "@/app/components/assistant/ChatInput";
+import { ChatFontScaleControl } from "@/app/components/assistant/ChatFontScaleControl";
 import type { ChatInputHandle } from "@/app/components/assistant/ChatInput";
 import {
     ProjectExplorer,
@@ -72,6 +74,7 @@ import type {
 } from "@/app/components/shared/types";
 import { expandCitationToEntries } from "@/app/components/shared/types";
 import { buildCitationNavigationKey } from "@/app/components/shared/citationNavigation";
+import { PROJECT_CHAT_FONT_SCALE_KEY } from "@/app/lib/chatFontScale";
 
 interface Props {
     params: Promise<{ id: string; chatId: string }>;
@@ -578,6 +581,13 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     const messagesContainerRef = useRef<HTMLDivElement>(null);
     const latestUserMessageRef = useRef<HTMLDivElement>(null);
     const [minHeight, setMinHeight] = useState("0px");
+    const {
+        fontScale,
+        increase: increaseFontScale,
+        decrease: decreaseFontScale,
+        canIncrease,
+        canDecrease,
+    } = useChatFontScale(messagesContainerRef, PROJECT_CHAT_FONT_SCALE_KEY);
 
     const {
         setCurrentChatId,
@@ -808,7 +818,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         setMinHeight(
             `${Math.max(0, containerEl.clientHeight - 48 - userEl.offsetHeight - 16)}px`,
         );
-    }, [messages.length]);
+    }, [fontScale, messages.length]);
 
     useEffect(() => {
         if (!activeTabId) return;
@@ -2183,90 +2193,113 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                             <AssistantGreeting username={username} />
                         </div>
                     ) : (
-                        <div
-                            ref={messagesContainerRef}
-                            className="flex-1 overflow-y-auto px-4 py-4 space-y-4 min-h-0"
-                            style={{ scrollbarGutter: "stable" }}
-                        >
-                            {(() => {
-                                const lastUserIdx = messages
-                                    .map((m) => m.role)
-                                    .lastIndexOf("user");
-                                const lastAssistantIdx = messages
-                                    .map((m) => m.role)
-                                    .lastIndexOf("assistant");
-                                return messages.map((msg, i) =>
-                                    msg.role === "user" ? (
-                                        <div
-                                            key={i}
-                                            ref={
-                                                i === lastUserIdx
-                                                    ? latestUserMessageRef
-                                                    : null
-                                            }
-                                        >
-                                            <UserMessage
-                                                content={msg.content ?? ""}
-                                                files={msg.files}
-                                            />
+                        <div className="relative flex-1 min-h-0">
+                            <div
+                                ref={messagesContainerRef}
+                                data-ctrl-zoom="chat"
+                                className="h-full min-h-0 overflow-y-auto"
+                                style={{ scrollbarGutter: "stable" }}
+                            >
+                                <div
+                                    className="space-y-4 px-4 py-4"
+                                    style={{ zoom: fontScale }}
+                                >
+                                    {(() => {
+                                        const lastUserIdx = messages
+                                            .map((m) => m.role)
+                                            .lastIndexOf("user");
+                                        const lastAssistantIdx = messages
+                                            .map((m) => m.role)
+                                            .lastIndexOf("assistant");
+                                        return messages.map((msg, i) =>
+                                            msg.role === "user" ? (
+                                                <div
+                                                    key={i}
+                                                    ref={
+                                                        i === lastUserIdx
+                                                            ? latestUserMessageRef
+                                                            : null
+                                                    }
+                                                >
+                                                    <UserMessage
+                                                        content={msg.content ?? ""}
+                                                        files={msg.files}
+                                                    />
+                                                </div>
+                                            ) : (
+                                                <AssistantMessage
+                                                    key={i}
+                                                    content={msg.content ?? ""}
+                                                    events={msg.events}
+                                                    isStreaming={
+                                                        i ===
+                                                            messages.length -
+                                                                1 &&
+                                                        isResponseLoading
+                                                    }
+                                                    isError={!!msg.error}
+                                                    errorMessage={
+                                                        typeof msg.error === "string"
+                                                            ? msg.error
+                                                            : undefined
+                                                    }
+                                                    annotations={msg.annotations}
+                                                    onCitationClick={
+                                                        handleCitationClick
+                                                    }
+                                                    minHeight={
+                                                        i === lastAssistantIdx
+                                                            ? minHeight
+                                                            : "0px"
+                                                    }
+                                                    onEditViewClick={
+                                                        handleEditViewClick
+                                                    }
+                                                    onOpenDocument={
+                                                        handleOpenDocument
+                                                    }
+                                                    onEditResolved={
+                                                        handleEditResolved
+                                                    }
+                                                    onEditError={handleEditError}
+                                                    isDocReloading={(docId) =>
+                                                        reloadingDocIds.has(docId)
+                                                    }
+                                                />
+                                            ),
+                                        );
+                                    })()}
+                                    {queuedMessage && (
+                                        <div className="flex justify-end">
+                                            <div className="max-w-[80%] rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
+                                                <p className="whitespace-pre-wrap">{queuedMessage.message.content}</p>
+                                                <div className="mt-2 flex items-center justify-end gap-2 text-xs text-gray-500">
+                                                    <Loader2 className="h-3 w-3 animate-spin" />
+                                                    <span>다음 턴 대기 중</span>
+                                                    <button
+                                                        type="button"
+                                                        onClick={cancelQueuedMessage}
+                                                        className="rounded p-0.5 hover:bg-gray-200"
+                                                        aria-label="Cancel queued message"
+                                                    >
+                                                        <X className="h-3.5 w-3.5" />
+                                                    </button>
+                                                </div>
+                                            </div>
                                         </div>
-                                    ) : (
-                                        <AssistantMessage
-                                            key={i}
-                                            content={msg.content ?? ""}
-                                            events={msg.events}
-                                            isStreaming={
-                                                i === messages.length - 1 &&
-                                                isResponseLoading
-                                            }
-                                            isError={!!msg.error}
-                                            errorMessage={
-                                                typeof msg.error === "string"
-                                                    ? msg.error
-                                                    : undefined
-                                            }
-                                            annotations={msg.annotations}
-                                            onCitationClick={
-                                                handleCitationClick
-                                            }
-                                            minHeight={
-                                                i === lastAssistantIdx
-                                                    ? minHeight
-                                                    : "0px"
-                                            }
-                                            onEditViewClick={
-                                                handleEditViewClick
-                                            }
-                                            onOpenDocument={handleOpenDocument}
-                                            onEditResolved={handleEditResolved}
-                                            onEditError={handleEditError}
-                                            isDocReloading={(docId) =>
-                                                reloadingDocIds.has(docId)
-                                            }
-                                        />
-                                    ),
-                                );
-                            })()}
-                            {queuedMessage && (
-                                <div className="flex justify-end">
-                                    <div className="max-w-[80%] rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
-                                        <p className="whitespace-pre-wrap">{queuedMessage.message.content}</p>
-                                        <div className="mt-2 flex items-center justify-end gap-2 text-xs text-gray-500">
-                                            <Loader2 className="h-3 w-3 animate-spin" />
-                                            <span>다음 턴 대기 중</span>
-                                            <button
-                                                type="button"
-                                                onClick={cancelQueuedMessage}
-                                                className="rounded p-0.5 hover:bg-gray-200"
-                                                aria-label="Cancel queued message"
-                                            >
-                                                <X className="h-3.5 w-3.5" />
-                                            </button>
-                                        </div>
-                                    </div>
+                                    )}
+                                    <div ref={messagesEndRef} />
                                 </div>
-                            )}
-                            <div ref={messagesEndRef} />
+                            </div>
+                            <div className="absolute bottom-3 right-3 z-20">
+                                <ChatFontScaleControl
+                                    fontScale={fontScale}
+                                    onDecrease={decreaseFontScale}
+                                    onIncrease={increaseFontScale}
+                                    canDecrease={canDecrease}
+                                    canIncrease={canIncrease}
+                                />
+                            </div>
                         </div>
                     )}
 
