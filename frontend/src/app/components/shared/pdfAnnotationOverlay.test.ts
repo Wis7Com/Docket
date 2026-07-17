@@ -65,6 +65,7 @@ test("buildPdfAnnotationOverlayItems maps saved highlights into viewport markers
             border: "0",
             background: "#ffe066",
             opacity: "0.42",
+            mixBlendMode: "multiply",
         },
         note: null,
     });
@@ -94,9 +95,10 @@ test("buildPdfAnnotationOverlayItems maps saved comments into markers and notes"
             top: -6,
             width: 20,
             height: 10,
-            border: "1px solid #74c0fc",
-            background: "#74c0fc",
-            opacity: "0.24",
+            border: "1.5px dashed #74c0fc",
+            background: "transparent",
+            opacity: "1",
+            mixBlendMode: "normal",
         },
         note: {
             text: "Review this point",
@@ -105,8 +107,39 @@ test("buildPdfAnnotationOverlayItems maps saved comments into markers and notes"
             anchorLeft: 17,
             anchorTop: -1,
             border: "1px solid #74c0fc",
+            connectorColor: "#74c0fc",
         },
     });
+});
+
+test("overlapping comments are ordered before highlights so highlights receive topmost clicks", () => {
+    const items = buildPdfAnnotationOverlayItems(
+        [
+            {
+                ...annotations[0],
+                rects: [{ page: 1, x: 10, y: 20, width: 30, height: 12 }],
+            },
+            {
+                ...annotations[1],
+                page_number: 1,
+                rects: [{ page: 1, x: 10, y: 20, width: 30, height: 12 }],
+            },
+        ],
+        1,
+        {
+            convertToViewportRectangle: ([x1, y1, x2, y2]) => [
+                x1,
+                y1,
+                x2,
+                y2,
+            ],
+        },
+    );
+
+    assert.deepEqual(
+        items.map((item) => item.annotationType),
+        ["comment", "highlight"],
+    );
 });
 
 test("multi-line saved comments render one note for one annotation", () => {

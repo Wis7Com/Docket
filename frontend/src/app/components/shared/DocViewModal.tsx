@@ -25,6 +25,7 @@ interface Props {
     initialSearchKey?: string | null;
     onClose: () => void;
     onDelete?: (doc: DocketDocument) => void;
+    onAnnotationsChanged?: (docId: string) => void;
 }
 
 export function DocViewModal({
@@ -36,6 +37,7 @@ export function DocViewModal({
     initialSearchKey,
     onClose,
     onDelete,
+    onAnnotationsChanged,
 }: Props) {
     const [mounted, setMounted] = useState(false);
     const [position, setPosition] = useState<{ x: number; y: number } | null>(
@@ -214,6 +216,7 @@ export function DocViewModal({
                         quotes={searchQuotes}
                         quote={normalizedSearchQuote || undefined}
                         fallbackPage={initialSearchPage ?? undefined}
+                        onAnnotationsChanged={onAnnotationsChanged}
                     />
                 </div>
             </div>

@@ -1151,7 +1151,30 @@ export function useAssistantChat({
                 try {
                     const detail = await getChat(finalChatId);
                     completedChatTitle = detail.chat.title;
-                    setMessages(detail.messages);
+                    setMessages((localMessages) => {
+                        const fetchedLast = detail.messages.at(-1);
+                        const fetchedHasAssistant =
+                            fetchedLast?.role === "assistant";
+                        if (
+                            fetchedHasAssistant ||
+                            detail.messages.length >= localMessages.length
+                        ) {
+                            return detail.messages;
+                        }
+                        // A slow assistant-row insert can briefly make a
+                        // completed chat look shorter than the in-memory SSE
+                        // transcript. Preserve the final content_replace and
+                        // citation events rather than wiping the answer.
+                        console.warn(
+                            "[useAssistantChat] keeping streamed answer while completed chat catches up",
+                            {
+                                chatId: finalChatId,
+                                localCount: localMessages.length,
+                                fetchedCount: detail.messages.length,
+                            },
+                        );
+                        return localMessages;
+                    });
                 } catch (err) {
                     console.warn(
                         "[useAssistantChat] failed to hydrate completed chat:",

@@ -594,6 +594,13 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         });
 
         const annotations = extractAnnotations(fullText, docIndex, events, citations);
+        const debugInsertDelayMs = Number.parseInt(
+            process.env.DOCKET_DEBUG_INSERT_DELAY_MS ?? "",
+            10,
+        );
+        if (Number.isFinite(debugInsertDelayMs) && debugInsertDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, debugInsertDelayMs));
+        }
         await db.from("chat_messages").insert({
             chat_id: chatId,
             role: "assistant",
@@ -607,6 +614,8 @@ chatRouter.post("/", requireAuth, async (req, res) => {
                 .update({ title: lastUser.content.slice(0, 120) })
                 .eq("id", chatId);
         }
+        // [DONE] triggers client hydration, so persistence must win this race.
+        write("data: [DONE]\n\n");
     } catch (err) {
         console.error("[chat/stream] error:", err);
         try {

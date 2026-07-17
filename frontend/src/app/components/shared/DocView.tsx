@@ -111,8 +111,16 @@ interface Props {
     focusAnnotationKey?: number | string;
     /** Bump to re-trigger navigation for the same citation without reloading the PDF. */
     citationNavigationKey?: string | null;
+    /** Called after a citation-navigation request has scrolled the viewer. */
+    onCitationNavigationHandled?: (key: string) => void;
+    /** Restored after a route remount when no citation click is pending. */
+    initialScrollTop?: number | null;
+    /** Persists the user's PDF scroll position for a route remount. */
+    onScrollChange?: (top: number) => void;
     /** Reports progressive PDF page rendering: (renderedPages, totalPages). */
     onRenderProgress?: (rendered: number, total: number) => void;
+    /** Reports saved annotation mutations so parents can refresh side lists. */
+    onAnnotationsChanged?: (docId: string) => void;
     rounded?: boolean;
     bordered?: boolean;
 }
@@ -146,7 +154,11 @@ export function DocView({
     focusAnnotationId,
     focusAnnotationKey,
     citationNavigationKey,
+    onCitationNavigationHandled,
+    initialScrollTop,
+    onScrollChange,
     onRenderProgress,
+    onAnnotationsChanged,
     rounded = true,
     bordered = true,
 }: Props) {
@@ -176,6 +188,7 @@ export function DocView({
     const commentInputRef = useRef<HTMLTextAreaElement | null>(null);
     const zoomRef = useRef(1.0);
     const currentPageRef = useRef(1);
+    const lastHandledCitationNavigationKeyRef = useRef<string | null>(null);
     const highlightRunRef = useRef(0);
     const pdfRenderRunRef = useRef(0);
     const annotationStatusTimerRef = useRef<number | null>(null);
@@ -185,8 +198,12 @@ export function DocView({
     // Ref'd so renderPDF (a useCallback) always reports to the latest
     // handler without re-rendering the PDF when the parent re-renders.
     const onRenderProgressRef = useRef(onRenderProgress);
+    const onScrollChangeRef = useRef(onScrollChange);
     useEffect(() => {
         onRenderProgressRef.current = onRenderProgress;
+    });
+    useEffect(() => {
+        onScrollChangeRef.current = onScrollChange;
     });
 
     const quoteList: QuoteEntry[] = useMemo(() => {
@@ -342,6 +359,7 @@ export function DocView({
 
         const runScrollUpdate = () => {
             scrollFrameRef.current = null;
+            onScrollChangeRef.current?.(scrollEl.scrollTop);
             const pages = pageWrappersRef.current;
             if (!pages.length) return;
             const scrollCenter = scrollEl.scrollTop + scrollEl.clientHeight / 2;
@@ -1562,6 +1580,10 @@ export function DocView({
             currentPageRef.current = 1;
 
             const hasCitation = list.length > 0;
+            const citationNavigationPending =
+                Boolean(citationNavigationKey) &&
+                lastHandledCitationNavigationKeyRef.current !==
+                    citationNavigationKey;
             if (hasCitation && scrollContainerRef.current) {
                 scrollContainerRef.current.style.opacity = "0";
             }
@@ -1608,10 +1630,12 @@ export function DocView({
 
             const scale = computePdfScale(container);
 
-            const hintedPage =
-                list.find((entry) => entry.page && entry.page >= 1)?.page ??
-                scrollToPage ??
-                1;
+            const hintedPage = citationNavigationPending
+                ? (list.find((entry) => entry.page && entry.page >= 1)
+                      ?.page ??
+                  scrollToPage ??
+                  1)
+                : (scrollToPage ?? 1);
             const initialPage = Math.min(
                 doc.numPages,
                 Math.max(1, hintedPage),
@@ -1626,6 +1650,18 @@ export function DocView({
             container.appendChild(fragment);
             pdfRuntimeRef.current = { doc, lib, scale, renderRun, container };
             scheduleWindowRender(initialPage);
+            if (
+                !citationNavigationPending &&
+                typeof initialScrollTop === "number" &&
+                initialScrollTop > 0
+            ) {
+                window.requestAnimationFrame(() => {
+                    const scrollEl = scrollContainerRef.current;
+                    if (!scrollEl || !isCurrentRender()) return;
+                    scrollEl.scrollTop = initialScrollTop;
+                    scheduleWindowRender();
+                });
+            }
 
             const initialHighlightList = quoteListRef.current;
             if (initialHighlightList.length > 0 && !citationRevealed) {
@@ -1635,7 +1671,14 @@ export function DocView({
                         initialHighlightList.find((entry) => entry.page)
                             ?.page ?? null;
                 }
-                if (targetPage) await scrollToHighlightOnPage(targetPage);
+                if (targetPage && citationNavigationPending) {
+                    await scrollToHighlightOnPage(targetPage);
+                    lastHandledCitationNavigationKeyRef.current =
+                        citationNavigationKey ?? null;
+                    if (citationNavigationKey) {
+                        onCitationNavigationHandled?.(citationNavigationKey);
+                    }
+                }
                 reveal();
             } else if (!hasCitation && scrollToPage && scrollToPage > 1) {
                 const wrapper = pageWrappersRef.current[scrollToPage - 1];
@@ -1647,21 +1690,14 @@ export function DocView({
                 scheduleWindowRender(scrollToPage);
             }
 
-            // Apply highlights across all entries, then scroll to the first hit.
-            let targetPage: number | null = null;
+            // Keep applying highlight boxes for live quote updates, but never
+            // treat that update as navigation. Scrolling is reserved for an
+            // explicit citation-click key above.
             const latestHighlightList = quoteListRef.current;
             if (latestHighlightList.length && !hasCitation) {
-                targetPage = await applyHighlights(latestHighlightList);
-                if (targetPage === null) {
-                    // Fallback: scroll to the first entry's page hint, even without a highlight
-                    const hint =
-                        latestHighlightList.find((e) => e.page)?.page ?? null;
-                    targetPage = hint;
-                }
+                await applyHighlights(latestHighlightList);
             }
-            if (targetPage && targetPage >= 1) {
-                await scrollToHighlightOnPage(targetPage);
-            } else if (!hasCitation && scrollToPage && scrollToPage > 1) {
+            if (!hasCitation && scrollToPage && scrollToPage > 1) {
                 // Restore scroll position after zoom re-render
                 const wrapper = pageWrappersRef.current[scrollToPage - 1];
                 if (wrapper)
@@ -1782,14 +1818,24 @@ export function DocView({
             const runId = ++highlightRunRef.current;
             const targetPage = await applyHighlights(list, runId);
             if (runId !== highlightRunRef.current) return;
+            const citationNavigationPending =
+                Boolean(citationNavigationKey) &&
+                lastHandledCitationNavigationKeyRef.current !==
+                    citationNavigationKey;
+            if (!citationNavigationPending) return;
             const scrollPage =
                 targetPage ?? list.find((e) => e.page)?.page ?? null;
             if (scrollPage && scrollPage >= 1) {
                 await scrollToHighlightOnPage(scrollPage);
+                lastHandledCitationNavigationKeyRef.current =
+                    citationNavigationKey ?? null;
+                if (citationNavigationKey) {
+                    onCitationNavigationHandled?.(citationNavigationKey);
+                }
             }
         },
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [applyHighlights],
+        [applyHighlights, citationNavigationKey, onCitationNavigationHandled],
     );
 
     async function scrollToNavItem(item: DocumentNavigationItem) {
@@ -2049,6 +2095,7 @@ export function DocView({
             setAnnotations((prev) => [...prev, saved]);
             setSelectedAnnotationId(saved.id);
             if (saved.version_id) setAnnotationVersionId(saved.version_id);
+            onAnnotationsChanged?.(doc.document_id);
             showAnnotationStatus("Saved", 1600);
         } catch (err) {
             showAnnotationStatus(null);
@@ -2206,7 +2253,28 @@ export function DocView({
             return;
         }
         const annotationId = commentEditor.annotationId;
+        const current = annotations.find((ann) => ann.id === annotationId);
+        if (!current) return;
+        if (!next) {
+            setAnnotationError("Comment cannot be blank.");
+            return;
+        }
         closeCommentEditor();
+        if (current.annotation_type === "highlight") {
+            await saveAnnotationPayload(
+                buildPdfAnnotationCreatePayload({
+                    rects: current.rects,
+                    annotationType: "comment",
+                    color: current.color,
+                    displayVersionId: current.version_id,
+                    documentVersionId: doc.version_id ?? null,
+                    quote: current.quote,
+                    comment: next,
+                    source: "user",
+                }),
+            );
+            return;
+        }
         setAnnotationBusy(true);
         setAnnotationError(null);
         showAnnotationStatus("Saving...");
@@ -2222,6 +2290,7 @@ export function DocView({
                 prev.map((ann) => (ann.id === updated.id ? updated : ann)),
             );
             if (updated.version_id) setAnnotationVersionId(updated.version_id);
+            onAnnotationsChanged?.(doc.document_id);
             showAnnotationStatus("Saved", 1600);
         } catch (err) {
             showAnnotationStatus(null);
@@ -2417,6 +2486,7 @@ export function DocView({
                 prev.map((ann) => (ann.id === updated.id ? updated : ann)),
             );
             if (updated.version_id) setAnnotationVersionId(updated.version_id);
+            onAnnotationsChanged?.(doc.document_id);
             showAnnotationStatus("Saved", 1600);
         } catch (err) {
             showAnnotationStatus(null);
@@ -2442,6 +2512,7 @@ export function DocView({
             );
             setSelectedAnnotationId(null);
             setContextMenu(null);
+            onAnnotationsChanged?.(doc.document_id);
             showAnnotationStatus("Saved", 1600);
         } catch (err) {
             showAnnotationStatus(null);
@@ -2583,6 +2654,11 @@ export function DocView({
             ? (annotations.find((ann) => ann.id === contextMenu.annotationId) ??
               null)
             : null;
+    const selectedAnnotation =
+        selectedAnnotationId == null
+            ? null
+            : (annotations.find((ann) => ann.id === selectedAnnotationId) ??
+              null);
 
     const menuStyle =
         contextMenu == null
@@ -2841,7 +2917,10 @@ export function DocView({
                                             className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-gray-700 hover:bg-gray-50 disabled:opacity-40"
                                         >
                                             <MessageSquarePlus className="h-3.5 w-3.5" />
-                                            Add/Edit comment
+                                            {menuAnnotation?.annotation_type ===
+                                            "comment"
+                                                ? "Edit comment"
+                                                : "Add comment"}
                                         </button>
                                         <div className="flex items-center gap-1 px-3 py-2">
                                             {annotationColors.map(
@@ -2966,8 +3045,7 @@ export function DocView({
                                 type="submit"
                                 disabled={
                                     annotationBusy ||
-                                    (commentEditor.kind === "selection" &&
-                                        commentDraft.trim().length === 0)
+                                    commentDraft.trim().length === 0
                                 }
                                 className="rounded bg-gray-900 px-2 py-1 text-xs text-white disabled:opacity-40"
                             >
@@ -3114,7 +3192,12 @@ export function DocView({
                                 {selectedAnnotationId && (
                                     <>
                                         <button
-                                            title="Edit comment"
+                                            title={
+                                                selectedAnnotation?.annotation_type ===
+                                                "comment"
+                                                    ? "Edit comment"
+                                                    : "Add comment"
+                                            }
                                             disabled={annotationBusy}
                                             onClick={() => {
                                                 void handleEditSelectedComment();

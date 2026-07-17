@@ -694,6 +694,10 @@ test("completed project chat responses do not reset open document tabs", () => {
     ),
     "utf8",
   );
+  const docViewSource = fs.readFileSync(
+    new URL("./DocView.tsx", import.meta.url),
+    "utf8",
+  );
 
   assert.match(
     hookSource,
@@ -711,6 +715,11 @@ test("completed project chat responses do not reset open document tabs", () => {
     "a stale internal chat id must not trigger a page-remounting route replacement",
   );
   assert.match(
+    hookSource,
+    /fetchedHasAssistant \|\|[\s\S]*detail\.messages\.length >= localMessages\.length/,
+    "a stale completion hydrate must retain the locally streamed assistant message",
+  );
+  assert.match(
     pageSource,
     /sessionStorage\.getItem\([\s\S]*viewerStateStorageKey\(projectId\)/,
     "a route remount must restore the project's open viewer tabs",
@@ -719,6 +728,21 @@ test("completed project chat responses do not reset open document tabs", () => {
     pageSource,
     /sessionStorage\.setItem\([\s\S]*viewerStateStorageKey\(projectId\)/,
     "open viewer tabs must be saved before a completion route remount",
+  );
+  assert.match(
+    docViewSource,
+    /citationNavigationPending[\s\S]*lastHandledCitationNavigationKeyRef/,
+    "highlight updates must distinguish an explicit citation click from a remount",
+  );
+  assert.match(
+    docViewSource,
+    /onCitationNavigationHandled\?\.\(citationNavigationKey\)/,
+    "a handled citation click must be consumed so a later remount cannot jump again",
+  );
+  assert.match(
+    docViewSource,
+    /initialScrollTop[\s\S]*scrollEl\.scrollTop = initialScrollTop/,
+    "a viewer remount must restore the user's scroll position",
   );
 });
 

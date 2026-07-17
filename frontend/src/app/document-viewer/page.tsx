@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { Download, MessageSquarePlus, Minus, X } from "lucide-react";
 import { DocView } from "@/app/components/shared/DocView";
 import { createChat, getDocumentUrl } from "@/app/lib/docketApi";
+import { publishAnnotationsChanged } from "@/app/lib/annotationsChangedChannel";
 
 type ViewerBridge = {
     minimizeDocumentViewer?: () => Promise<unknown>;
@@ -192,6 +193,7 @@ function DocumentViewerContent() {
                     quotes={searchQuotes}
                     quote={searchQuote || undefined}
                     focusAnnotationId={annotationId}
+                    onAnnotationsChanged={publishAnnotationsChanged}
                     onRenderProgress={(rendered, total) =>
                         setRenderProgress(total > 0 ? rendered / total : 1)
                     }

@@ -332,7 +332,20 @@ test("project chat exposes a dedicated annotation retrieval tool", () => {
     assert.ok(annotationTool);
     assert.match(annotationTool.function.description, /hilighted/i);
     assert.match(annotationTool.function.description, /하이라이트/);
+    assert.match(annotationTool.function.description, /independent annotations/i);
+    assert.match(annotationTool.function.description, /annotation_type='comment'/);
     assert.match(annotationTool.function.description, /Do not substitute/i);
+    const properties = annotationTool.function.parameters.properties;
+    assert.ok(properties.annotation_type);
+    assert.ok(properties.has_comment);
+    assert.match(
+        properties.annotation_type.description,
+        /all independent comment annotations/i,
+    );
+    assert.match(
+        properties.has_comment.description,
+        /Backward-compatible filter/i,
+    );
 });
 
 test("project chat exposes the server-side annotation digest schema", () => {
@@ -353,6 +366,17 @@ test("project chat exposes the server-side annotation digest schema", () => {
     ]) {
         assert.ok(properties[name as keyof typeof properties]);
     }
+    assert.match(digestTool.function.description, /independent annotations/i);
+    assert.ok(properties.annotation_type);
+    assert.ok(properties.has_comment);
+    assert.match(
+        properties.annotation_type.description,
+        /all independent comment annotations/i,
+    );
+    assert.match(
+        properties.has_comment.description,
+        /Backward-compatible filter/i,
+    );
 });
 
 test("filterToolsByDisabled is deny-only and ignores unknown tool names", () => {
@@ -963,7 +987,10 @@ test("renumberCitations compacts surviving refs and rewrites markers", () => {
     ]);
     assert.deepEqual(
         renumberCitations("Both [1, 2].", [{ ref: 1, quote: "alpha" }]),
-        { text: "Both [1].", citations: [{ ref: 1, quote: "alpha" }] },
+        {
+            text: "Both [1, 2].",
+            citations: [{ ref: 1, quote: "alpha" }],
+        },
     );
 });
 
@@ -995,10 +1022,10 @@ test("one bad citation among several keeps the good ones end to end", () => {
     );
     const repaired = renumberCitations(text, contract.citations);
 
-    assert.equal(repaired.text, "Alpha [1]. Unknown . Gamma [2].");
+    assert.equal(repaired.text, text);
     assert.deepEqual(
         repaired.citations.map((citation) => citation.ref),
-        [1, 2],
+        [1, 3],
     );
     assert.deepEqual(contract.errors, [{ code: "unknown_document", ref: 2 }]);
 });
@@ -1013,7 +1040,7 @@ not json
     assert.deepEqual(extractAnnotations(text, docIndex), []);
 });
 
-test("sanitizeAssistantVisibleText removes internal labels and unsupported markers", () => {
+test("sanitizeAssistantVisibleText removes internal labels but keeps unresolved markers", () => {
     const text = `The credit-agreement.pdf(doc-0) point is supported [1].
 
 The source sentence also had a page-looking marker [19], and doc-1 should not be exposed.
@@ -1032,7 +1059,18 @@ The source sentence also had a page-looking marker [19], and doc-1 should not be
         ),
         `The credit-agreement.pdf point is supported [1].
 
-The source sentence also had a page-looking marker, and shareholders-agreement.pdf should not be exposed.`,
+The source sentence also had a page-looking marker [19], and shareholders-agreement.pdf should not be exposed.`,
+    );
+});
+
+test("sanitizeAssistantVisibleText removes punctuation artifacts beside unresolved markers", () => {
+    assert.equal(
+        sanitizeAssistantVisibleText(
+            "$160,, [2] Robocall,. [3] debate,— [4]",
+            [],
+            {},
+        ),
+        "$160, [2] Robocall. [3] debate— [4]",
     );
 });
 

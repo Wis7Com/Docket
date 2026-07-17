@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  assertRetrievalResultCoversEvaluationSet,
   evaluationRunResultSchema,
   evaluationSetSchema,
   renderEvaluationResultJson,
@@ -120,6 +121,43 @@ test("retrieval scoring requires an exact document and page in the top k", () =>
     k: 3,
   });
   assert.equal(nonExactName.hit, false);
+});
+
+test("retrieval join rejects missing QA ids instead of reporting false misses", () => {
+  const result = makeResult();
+  const evaluationSet = evaluationSetSchema.parse({
+    name: "baseline",
+    qa: [
+      {
+        id: "qa-1",
+        question: "First",
+        expected_answer_gist: "First answer",
+        gold_doc: "source-one.pdf",
+        gold_page: 2,
+      },
+      {
+        id: "qa-2",
+        question: "Second",
+        expected_answer_gist: "Second answer",
+        gold_doc: "source-two.pdf",
+        gold_page: 3,
+      },
+    ],
+  });
+
+  assert.throws(
+    () => assertRetrievalResultCoversEvaluationSet(evaluationSet, result),
+    /missing QA ids: qa-2/,
+  );
+  assert.doesNotThrow(() =>
+    assertRetrievalResultCoversEvaluationSet(evaluationSet, {
+      ...result,
+      qa_results: [
+        ...result.qa_results,
+        { ...result.qa_results[0]!, id: "qa-2" },
+      ],
+    }),
+  );
 });
 
 test("checklist summary excludes not-applicable items from the denominator", () => {

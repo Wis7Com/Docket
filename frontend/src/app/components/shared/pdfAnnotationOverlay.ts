@@ -20,6 +20,7 @@ export type PdfAnnotationOverlayItem = {
         border: string;
         background: string;
         opacity: string;
+        mixBlendMode: string;
     };
     note: null | {
         text: string;
@@ -28,6 +29,7 @@ export type PdfAnnotationOverlayItem = {
         anchorLeft: number;
         anchorTop: number;
         border: string;
+        connectorColor: string;
     };
 };
 
@@ -49,13 +51,22 @@ function readNotePosition(
     return { page: raw.page, x: raw.x, y: raw.y };
 }
 
+function annotationPaintOrder(annotationType: PdfAnnotation["annotation_type"]) {
+    return annotationType === "comment" ? 0 : 1;
+}
+
 export function buildPdfAnnotationOverlayItems(
     annotations: PdfAnnotation[],
     pageNumber: number,
     viewport: ViewportLike,
 ): PdfAnnotationOverlayItem[] {
     const items: PdfAnnotationOverlayItem[] = [];
-    for (const ann of annotations) {
+    const orderedAnnotations = [...annotations].sort(
+        (a, b) =>
+            annotationPaintOrder(a.annotation_type) -
+            annotationPaintOrder(b.annotation_type),
+    );
+    for (const ann of orderedAnnotations) {
         const pageRects = ann.rects
             .map((rect, rectIndex) => ({ rect, rectIndex }))
             .filter(({ rect }) => rect.page === pageNumber);
@@ -107,9 +118,12 @@ export function buildPdfAnnotationOverlayItems(
                     top: y,
                     width,
                     height,
-                    border: isComment ? `1px solid ${ann.color}` : "0",
-                    background: ann.color,
-                    opacity: isComment ? "0.24" : "0.42",
+                    border: isComment
+                        ? `1.5px dashed ${ann.color}`
+                        : "0",
+                    background: isComment ? "transparent" : ann.color,
+                    opacity: isComment ? "1" : "0.42",
+                    mixBlendMode: isComment ? "normal" : "multiply",
                 },
                 note:
                     isComment && ann.comment && pageRectIndex === 0
@@ -120,6 +134,7 @@ export function buildPdfAnnotationOverlayItems(
                               anchorLeft: x + Math.min(width, 12),
                               anchorTop: y + height / 2,
                               border: `1px solid ${ann.color}`,
+                              connectorColor: ann.color,
                           }
                         : null,
             });

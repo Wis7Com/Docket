@@ -248,7 +248,7 @@ export const PROJECT_EXTRA_TOOLS = [
         function: {
             name: "get_user_pdf_annotations",
             description:
-                "Retrieve the authenticated user's saved PDF annotations: highlighted or hilighted text, marked passages, comments, notes, and Korean requests such as 하이라이트, 형광펜, 주석, 메모, 표시한 내용. MUST be called when the user asks what they annotated/highlighted/marked or asks to list, fetch, or summarize their annotations. Do not substitute search_project_documents, find_in_document, or regex matching: those search document text, not the user's annotations. Results are limited to documents available in this project chat.",
+                "Retrieve the authenticated user's saved PDF annotations: highlighted or hilighted text, marked passages, comments, notes, and Korean requests such as 하이라이트, 형광펜, 주석, 메모, 표시한 내용. Comments are independent annotations; use annotation_type='comment' to return all comment annotations. MUST be called when the user asks what they annotated/highlighted/marked or asks to list, fetch, or summarize their annotations. Do not substitute search_project_documents, find_in_document, or regex matching: those search document text, not the user's annotations. Results are limited to documents available in this project chat.",
             parameters: {
                 type: "object",
                 properties: {
@@ -266,7 +266,8 @@ export const PROJECT_EXTRA_TOOLS = [
                     annotation_type: {
                         type: "string",
                         enum: ["highlight", "comment"],
-                        description: "Optional annotation type filter.",
+                        description:
+                            "Optional annotation type filter. Use 'comment' to return all independent comment annotations.",
                     },
                     color_family: {
                         type: "array",
@@ -300,7 +301,7 @@ export const PROJECT_EXTRA_TOOLS = [
                     has_comment: {
                         type: "boolean",
                         description:
-                            "Whether the annotation has a non-empty user comment.",
+                            "Backward-compatible filter for rows with non-empty comment text. Prefer annotation_type='comment' when the user asks for comments.",
                     },
                     offset: {
                         type: "integer",
@@ -330,7 +331,7 @@ export const PROJECT_EXTRA_TOOLS = [
         function: {
             name: "get_annotation_digest",
             description:
-                "Collect an exhaustive, server-paged digest of saved PDF annotations in one tool call. Use this for item-by-item lists, exports, audits, or synthesis that must cover hundreds of annotations. The complete filtered summary is returned even when the item hard cap requires a follow-up cursor.",
+                "Collect an exhaustive, server-paged digest of saved PDF annotations in one tool call. Comments are independent annotations; use annotation_type='comment' to cover all comment annotations. Use this for item-by-item lists, exports, audits, or synthesis that must cover hundreds of annotations. The complete filtered summary is returned even when the item hard cap requires a follow-up cursor.",
             parameters: {
                 type: "object",
                 properties: {
@@ -355,12 +356,13 @@ export const PROJECT_EXTRA_TOOLS = [
                     annotation_type: {
                         type: "string",
                         enum: ["highlight", "comment"],
-                        description: "Optional annotation type filter.",
+                        description:
+                            "Optional annotation type filter. Use 'comment' to return all independent comment annotations.",
                     },
                     has_comment: {
                         type: "boolean",
                         description:
-                            "Whether the annotation has a non-empty user comment.",
+                            "Backward-compatible filter for rows with non-empty comment text. Prefer annotation_type='comment' when the user asks for comments.",
                     },
                     doc_ids: {
                         type: "array",
@@ -4611,6 +4613,15 @@ export function validateCitationEvidence(
                   expectedQuote,
               );
         if (!match) {
+            if (process.env.DOCKET_CITATION_DEBUG === "1") {
+                console.debug("[citations/debug] quote not found", {
+                    ref: citation.ref,
+                    doc_id: citation.doc_id,
+                    page: citation.page,
+                    modelQuote: citation.quote,
+                    nearestIndexText: candidateRows[0]?.content.slice(0, 500),
+                });
+            }
             errors.push({ code: "quote_not_found", ref: citation.ref });
             continue;
         }
@@ -4685,16 +4696,10 @@ export function sanitizeAssistantVisibleText(
     docIndex: DocIndex,
 ): string {
     let cleaned = stripCitationBlock(stripLeakedModelReasoning(text));
-    const validRefs = new Set(
-        citations
-            .map((c) => c.ref)
-            .filter((ref) => Number.isInteger(ref) && ref > 0),
-    );
-
-    cleaned = cleaned.replace(/\s*\[(\d{1,3})\]/g, (match, rawRef) => {
-        const ref = Number(rawRef);
-        return validRefs.has(ref) ? match : "";
-    });
+    // Keep unresolved [N] markers in the prose. The renderer turns markers
+    // without exactly one verified annotation into an amber "?" badge, which
+    // is safer and more honest than silently deleting the model's source cue.
+    void citations;
 
     for (const [label, info] of Object.entries(docIndex)) {
         const escapedLabel = escapeRegExp(label);
@@ -4717,6 +4722,12 @@ export function sanitizeAssistantVisibleText(
     }
 
     return cleaned
+        // Some models place a citation marker after repeated punctuation. Keep
+        // the marker, but reduce the punctuation run to its final character:
+        // "$160,, [2]" -> "$160, [2]", "Robocall,. [2]" -> "Robocall. [2]".
+        .replace(/[,.;:!?—-](?:\s*[,.;:!?—-])+(?=\s*\[\d)/g, (run) =>
+            run.match(/[,.;:!?—-](?=\s*\[\d)/)?.[0] ?? run.at(-1) ?? run,
+        )
         .replace(/[ \t]{2,}/g, " ")
         .replace(/[ \t]+\n/g, "\n")
         .replace(/\n{3,}/g, "\n\n")
@@ -4726,16 +4737,23 @@ export function sanitizeAssistantVisibleText(
 /**
  * Compact the surviving citation refs into a dense 1..K sequence, rewriting
  * BOTH the inline [N] markers in `visibleText` and the citation objects
- * together so a discarded citation never leaves a numbering gap or a dangling
- * multi-ref marker. Numbering follows first marker appearance. A marker whose
- * ref has no surviving citation is dropped; a multi-ref marker keeps only its
- * surviving refs.
+ * together when every marker is verified. If any marker is unresolved, keep
+ * every original ref: renumbering could otherwise turn an amber unresolved
+ * marker into a link to the wrong verified source.
  */
 export function renumberCitations<T extends { ref: number }>(
     visibleText: string,
     citations: T[],
 ): { text: string; citations: T[] } {
     const surviving = new Set(citations.map((citation) => citation.ref));
+    const markerRefsInText = Array.from(
+        visibleText.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g),
+    ).flatMap((match) =>
+        match[1].split(",").map((raw) => Number.parseInt(raw.trim(), 10)),
+    );
+    if (markerRefsInText.some((ref) => !surviving.has(ref))) {
+        return { text: visibleText, citations };
+    }
     const remap = new Map<number, number>();
     for (const match of visibleText.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g)) {
         for (const raw of match[1].split(",")) {
@@ -4750,9 +4768,11 @@ export function renumberCitations<T extends { ref: number }>(
         (_whole, group: string) => {
             const mapped = group
                 .split(",")
-                .map((raw) => remap.get(Number.parseInt(raw.trim(), 10)))
-                .filter((ref): ref is number => ref !== undefined);
-            return mapped.length ? `[${mapped.join(", ")}]` : "";
+                .map(
+                    (raw) =>
+                        remap.get(Number.parseInt(raw.trim(), 10)) as number,
+                );
+            return `[${mapped.join(", ")}]`;
         },
     );
     const nextCitations = citations
@@ -5559,7 +5579,9 @@ export async function runLLMStream(params: {
             shouldAttemptCitationRepair({
                 answerText,
                 calledToolNames: citationRepairToolNames,
-                verifiedCitationCount: verifiedCitations.length,
+                discardedCitationCount: Object.values(
+                    countCitationDiscards(citationErrorGroups),
+                ).reduce((total, count) => total + count, 0),
                 envValue: process.env.DOCKET_CITATION_REPAIR,
                 repairAttempted: citationRepairAttempted,
             })
@@ -5616,7 +5638,18 @@ export async function runLLMStream(params: {
                         );
                         if (repairEvidence.citations.length > 0) {
                             citationText = repairResult.text;
-                            verifiedCitations = repairEvidence.citations;
+                            const citationsByRef = new Map(
+                                verifiedCitations.map((citation) => [
+                                    citation.ref,
+                                    citation,
+                                ]),
+                            );
+                            for (const citation of repairEvidence.citations) {
+                                citationsByRef.set(citation.ref, citation);
+                            }
+                            verifiedCitations = Array.from(
+                                citationsByRef.values(),
+                            );
                             repairAddedCitationCount =
                                 repairEvidence.citations.length;
                         }
@@ -5751,7 +5784,6 @@ export async function runLLMStream(params: {
 
     // Parse and emit citations from <CITATIONS> block
     write(`data: ${JSON.stringify({ type: "citations", citations })}\n\n`);
-    write("data: [DONE]\n\n");
 
     return { fullText: answerText, events, citations };
 }

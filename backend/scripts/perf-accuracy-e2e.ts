@@ -22,13 +22,13 @@ import {
 } from "../src/lib/chatTools";
 import { getProjectIndexCorpusStats } from "../src/lib/indexing/search";
 import {
+  assertRetrievalResultCoversEvaluationSet,
   evaluationRunResultSchema,
   evaluationSetSchema,
   renderEvaluationResultJson,
   renderEvaluationResultMarkdown,
   type EvaluationRunResult,
   type EvaluationSet,
-  type RetrievalHit,
 } from "../src/lib/perfAccuracyEval";
 import {
   aggregateRound3Runs,
@@ -251,6 +251,9 @@ async function runLiveOnce(
         await readJson(options.retrievalResultPath),
       )
     : null;
+  if (retrievalRun && (options.mode === "qa" || options.mode === "all")) {
+    assertRetrievalResultCoversEvaluationSet(evalset, retrievalRun);
+  }
   const retrievalById = new Map(
     retrievalRun?.qa_results.map(
       (item) => [item.id, item.retrieval] as const,
@@ -489,7 +492,7 @@ async function runLiveOnce(
       top_k: retrievalRun?.top_k ?? 8,
       qa_results: qaResults,
       scenario_results: scenarioResults,
-      notes: `Direct production project-chat E2E; mode=${options.mode}; run=${runNumber}/${options.runs}; persistent chats disabled.`,
+      notes: `Direct production project-chat E2E; mode=${options.mode}; run=${runNumber}/${options.runs}; persistent chats disabled.${retrievalRun ? ` retrieval_run=${retrievalRun.run_id}.` : ""}`,
     });
   });
 
@@ -547,20 +550,6 @@ async function mainLive(options: Options): Promise<void> {
     ),
   ]);
   console.info(`Wrote ${path.join(outputDir, `${stem}.json`)}`);
-}
-
-function missingRetrievalHit(k: number): RetrievalHit {
-  return {
-    k,
-    candidate_count: 0,
-    hit: false,
-    rank: null,
-    document_hit: false,
-    document_rank: null,
-    matched_document_id: null,
-    matched_filename: null,
-    matched_page: null,
-  };
 }
 
 function safeStem(value: string): string {

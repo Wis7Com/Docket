@@ -18,7 +18,7 @@ test("citation repair defaults on for short answers and requires document eviden
   const eligible = {
     answerText: "short answer",
     calledToolNames: ["search_project_documents"],
-    verifiedCitationCount: 0,
+    discardedCitationCount: 1,
   };
   assert.equal(shouldAttemptCitationRepair(eligible), true);
   assert.equal(citationRepairEnabled(undefined), true);
@@ -47,7 +47,7 @@ test("citation repair defaults on for short answers and requires document eviden
     false,
   );
   assert.equal(
-    shouldAttemptCitationRepair({ ...eligible, verifiedCitationCount: 1 }),
+    shouldAttemptCitationRepair({ ...eligible, discardedCitationCount: 0 }),
     false,
   );
   assert.equal(

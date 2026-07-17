@@ -993,7 +993,7 @@ function MarkdownContent({
                             return (
                                 <span
                                     role="status"
-                                    title={`Citation ${unresolvedMatch[1]} is unavailable because its source could not be verified.`}
+                                    title={`This citation could not be verified against the source (citation ${unresolvedMatch[1]}).`}
                                     className="mx-0.5 inline-flex items-center justify-center rounded-full w-4 h-4 text-[10px] font-medium align-super bg-amber-100 text-amber-900"
                                 >
                                     ?

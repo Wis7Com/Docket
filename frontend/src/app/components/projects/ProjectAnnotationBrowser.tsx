@@ -17,6 +17,7 @@ import {
 interface Props {
   projectId: string;
   documents: DocketDocument[];
+  refreshKey?: number;
   onOpen: (
     doc: DocketDocument,
     target: { id: string; page_number: number; quote: string | null },
@@ -41,6 +42,7 @@ const FAMILY_SWATCH: Record<AnnotationColorFamily, string> = {
 export function ProjectAnnotationBrowser({
   projectId,
   documents,
+  refreshKey = 0,
   onOpen,
   legend,
 }: Props) {
@@ -106,7 +108,7 @@ export function ProjectAnnotationBrowser({
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [load]);
+  }, [load, refreshKey]);
 
   async function loadMore() {
     if (nextOffset === null || loadingMore) return;
@@ -248,7 +250,10 @@ export function ProjectAnnotationBrowser({
               const document = documents.find(
                 (item) => item.id === annotation.document_id,
               );
-              const preview = annotation.quote || annotation.comment;
+              const preview =
+                annotation.annotation_type === "comment"
+                  ? annotation.comment || annotation.quote
+                  : annotation.quote || annotation.comment;
               return (
                 <button
                   key={annotation.id}

@@ -643,6 +643,15 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
                 events,
                 citations,
             );
+            const debugInsertDelayMs = Number.parseInt(
+                process.env.DOCKET_DEBUG_INSERT_DELAY_MS ?? "",
+                10,
+            );
+            if (Number.isFinite(debugInsertDelayMs) && debugInsertDelayMs > 0) {
+                await new Promise((resolve) =>
+                    setTimeout(resolve, debugInsertDelayMs),
+                );
+            }
             await db.from("chat_messages").insert({
                 chat_id: chatId,
                 role: "assistant",
@@ -656,6 +665,9 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
                     .update({ title: lastUser.content.slice(0, 120) })
                     .eq("id", chatId);
             }
+            // The client hydrates the chat when it receives [DONE]. Do not
+            // signal completion until the assistant row is durably visible.
+            write("data: [DONE]\n\n");
         } catch (err) {
             console.error("[project-chat/stream] error:", err);
             try {

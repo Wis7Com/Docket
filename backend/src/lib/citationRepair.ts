@@ -26,7 +26,7 @@ const MARKER_RE = /\[(\d+)(?:\s*,\s*\d+)*\]/g;
 export type CitationRepairEligibility = {
   answerText: string;
   calledToolNames: readonly string[];
-  verifiedCitationCount: number;
+  discardedCitationCount: number;
   envValue?: string;
   repairAttempted?: boolean;
 };
@@ -116,7 +116,7 @@ export function shouldAttemptCitationRepair(
     citationRepairEnabled(input.envValue) &&
     !input.repairAttempted &&
     input.answerText.trim().length >= CITATION_REPAIR_MIN_ANSWER_CHARS &&
-    input.verifiedCitationCount === 0 &&
+    input.discardedCitationCount > 0 &&
     input.calledToolNames.some(isCitationRepairDocumentTool)
   );
 }

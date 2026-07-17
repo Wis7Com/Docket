@@ -33,6 +33,8 @@ interface Props {
     onDeleteDoc?: (docId: string) => Promise<void>;
     onMoveDoc?: (docId: string, targetFolderId: string | null) => Promise<void>;
     onMoveFolder?: (folderId: string, targetFolderId: string | null) => Promise<void>;
+    annotationRefreshDocId?: string | null;
+    annotationRefreshKey?: number | string | null;
     selectable?: boolean;
     deselectedDocIds?: Set<string>;
     onToggleDoc?: (docId: string, selected: boolean) => void;
@@ -141,6 +143,8 @@ export function ProjectExplorer({
     onDeleteDoc,
     onMoveDoc,
     onMoveFolder,
+    annotationRefreshDocId,
+    annotationRefreshKey,
     selectable = false,
     deselectedDocIds = new Set<string>(),
     onToggleDoc,
@@ -192,19 +196,9 @@ export function ProjectExplorer({
         return () => document.removeEventListener("dragend", handleDragEnd);
     }, []);
 
-    function toggleDocAnnotations(docId: string) {
-        const isExpanded = expandedDocIds.has(docId);
-        setExpandedDocIds((prev) => {
-            const next = new Set(prev);
-            if (isExpanded) next.delete(docId);
-            else next.add(docId);
-            return next;
-        });
-        if (isExpanded) return;
-        // Refetch on every expand so the list reflects annotations added
-        // in the viewer since the last look; cached rows show meanwhile.
+    function refetchDocAnnotations(docId: string) {
         setLoadingAnnotationDocIds((prev) => new Set([...prev, docId]));
-        listPdfAnnotations(docId)
+        return listPdfAnnotations(docId)
             .then((rows) => {
                 setAnnotationsByDoc((prev) => ({ ...prev, [docId]: rows }));
             })
@@ -218,6 +212,29 @@ export function ProjectExplorer({
                     return next;
                 });
             });
+    }
+
+    useEffect(() => {
+        if (!annotationRefreshDocId) return;
+        if (!expandedDocIds.has(annotationRefreshDocId)) return;
+        void refetchDocAnnotations(annotationRefreshDocId);
+        // annotationRefreshKey is the external mutation tick; expandedDocIds
+        // decides whether the changed document is visible enough to refresh.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [annotationRefreshDocId, annotationRefreshKey]);
+
+    function toggleDocAnnotations(docId: string) {
+        const isExpanded = expandedDocIds.has(docId);
+        setExpandedDocIds((prev) => {
+            const next = new Set(prev);
+            if (isExpanded) next.delete(docId);
+            else next.add(docId);
+            return next;
+        });
+        if (isExpanded) return;
+        // Refetch on every expand so the list reflects annotations added
+        // in the viewer since the last look; cached rows show meanwhile.
+        void refetchDocAnnotations(docId);
     }
 
     async function handleDeleteAnnotation(docId: string, annotationId: string) {
@@ -677,9 +694,14 @@ export function ProjectExplorer({
                                             })()}
                                             {annotations.map((ann) => {
                                                 const text =
-                                                    ann.quote?.trim() ||
-                                                    ann.comment?.trim() ||
-                                                    "(no text)";
+                                                    ann.annotation_type ===
+                                                    "comment"
+                                                        ? ann.comment?.trim() ||
+                                                          ann.quote?.trim() ||
+                                                          "(no text)"
+                                                        : ann.quote?.trim() ||
+                                                          ann.comment?.trim() ||
+                                                          "(no text)";
                                                 const selected = Boolean(
                                                     selectedAnnotationIdsByDoc[
                                                         doc.id
@@ -712,10 +734,15 @@ export function ProjectExplorer({
                                                         });
                                                     }}
                                                     title={
+                                                        ann.annotation_type ===
+                                                            "comment" &&
                                                         ann.comment?.trim() &&
                                                         ann.quote?.trim()
-                                                            ? `${ann.quote}\n— ${ann.comment}`
-                                                            : text
+                                                            ? `${ann.comment}\n— ${ann.quote}`
+                                                            : ann.comment?.trim() &&
+                                                                ann.quote?.trim()
+                                                              ? `${ann.quote}\n— ${ann.comment}`
+                                                              : text
                                                     }
                                                     className={`flex items-center gap-1.5 py-1 pr-2 rounded-sm cursor-pointer select-none transition-colors ${
                                                         selected

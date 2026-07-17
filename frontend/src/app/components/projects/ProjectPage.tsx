@@ -80,6 +80,7 @@ import {
   projectEmbeddingSelections,
   shouldShowProjectEmbeddingWarning,
 } from "@/app/lib/projectEmbeddingSelection";
+import { subscribeAnnotationsChanged } from "@/app/lib/annotationsChangedChannel";
 import { clearLocalSessionCache } from "@/lib/supabase";
 import type {
   DocketDocument,
@@ -864,7 +865,10 @@ function DocAnnotationRows({
         </div>
       </div>
       {annotations.map((ann) => {
-        const text = ann.quote?.trim() || ann.comment?.trim() || "(no text)";
+        const text =
+          ann.annotation_type === "comment"
+            ? ann.comment?.trim() || ann.quote?.trim() || "(no text)"
+            : ann.quote?.trim() || ann.comment?.trim() || "(no text)";
         const selected = selectedIds.has(ann.id);
         return (
           <div
@@ -881,9 +885,13 @@ function DocAnnotationRows({
               });
             }}
             title={
-              ann.comment?.trim() && ann.quote?.trim()
-                ? `${ann.quote}\n— ${ann.comment}`
-                : text
+              ann.annotation_type === "comment" &&
+              ann.comment?.trim() &&
+              ann.quote?.trim()
+                ? `${ann.comment}\n— ${ann.quote}`
+                : ann.comment?.trim() && ann.quote?.trim()
+                  ? `${ann.quote}\n— ${ann.comment}`
+                  : text
             }
             className={`group flex items-center h-9 pr-8 border-b border-gray-50 text-xs text-gray-600 cursor-pointer transition-colors ${
               selected
@@ -1057,6 +1065,8 @@ export function ProjectPage({ projectId }: Props) {
   const [loadingAnnotationDocIds, setLoadingAnnotationDocIds] = useState<
     Set<string>
   >(() => new Set());
+  const [annotationBrowserRefreshKey, setAnnotationBrowserRefreshKey] =
+    useState(0);
 
   const toggleAnnotations = (docId: string) => {
     const already = expandedAnnotationDocIds.has(docId);
@@ -1094,6 +1104,40 @@ export function ProjectPage({ projectId }: Props) {
         });
       });
   };
+
+  const handleDocAnnotationsChanged = useCallback(
+    (docId: string) => {
+      if (documentsPanel === "annotations") {
+        setAnnotationBrowserRefreshKey((key) => key + 1);
+      }
+      if (!expandedAnnotationDocIds.has(docId)) return;
+      setLoadingAnnotationDocIds((prev) => new Set([...prev, docId]));
+      listPdfAnnotations(docId)
+        .then((rows) => {
+          setAnnotationsByDocId((prev) => {
+            const next = new Map(prev);
+            next.set(docId, rows);
+            return next;
+          });
+        })
+        .catch((e) => {
+          console.error("listPdfAnnotations failed", e);
+        })
+        .finally(() => {
+          setLoadingAnnotationDocIds((prev) => {
+            const next = new Set(prev);
+            next.delete(docId);
+            return next;
+          });
+        });
+    },
+    [documentsPanel, expandedAnnotationDocIds],
+  );
+
+  useEffect(
+    () => subscribeAnnotationsChanged(handleDocAnnotationsChanged),
+    [handleDocAnnotationsChanged],
+  );
 
   async function handleDeleteAnnotation(docId: string, annotationId: string) {
     setAnnotationsByDocId((prev) => {
@@ -3539,6 +3583,7 @@ export function ProjectPage({ projectId }: Props) {
             <ProjectAnnotationBrowser
               projectId={projectId}
               documents={project.documents ?? []}
+              refreshKey={annotationBrowserRefreshKey}
               onOpen={(doc, target) =>
                 openDocumentViewer(doc, { annotationTarget: target })
               }
@@ -4206,6 +4251,7 @@ export function ProjectPage({ projectId }: Props) {
         initialSearchQuote={viewingDocSearchTarget?.quote ?? null}
         initialSearchPage={viewingDocSearchTarget?.page ?? null}
         initialSearchKey={viewingDocSearchTarget?.key ?? null}
+        onAnnotationsChanged={handleDocAnnotationsChanged}
         onClose={() => {
           setViewingDoc(null);
           setViewingDocVersion(null);

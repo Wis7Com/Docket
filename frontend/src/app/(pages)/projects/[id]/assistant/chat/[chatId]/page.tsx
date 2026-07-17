@@ -75,6 +75,7 @@ import type {
 import { expandCitationToEntries } from "@/app/components/shared/types";
 import { buildCitationNavigationKey } from "@/app/components/shared/citationNavigation";
 import { PROJECT_CHAT_FONT_SCALE_KEY } from "@/app/lib/chatFontScale";
+import { subscribeAnnotationsChanged } from "@/app/lib/annotationsChangedChannel";
 
 interface Props {
     params: Promise<{ id: string; chatId: string }>;
@@ -496,6 +497,10 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     const [explorerSearchPageSize, setExplorerSearchPageSize] =
         useState<number>(CHAT_SEARCH_PAGE_SIZES[0]);
     const [explorerSearchPage, setExplorerSearchPage] = useState(1);
+    const [annotationRefresh, setAnnotationRefresh] = useState<{
+        docId: string | null;
+        key: number;
+    }>({ docId: null, key: 0 });
 
     // Upload state
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -520,6 +525,18 @@ export default function ProjectAssistantChatPage({ params }: Props) {
         useState<EditScrollTarget | null>(null);
     const [reloadingDocIds, setReloadingDocIds] = useState<Set<string>>(
         () => new Set(),
+    );
+
+    const handleAnnotationsChanged = useCallback((docId: string) => {
+        setAnnotationRefresh((previous) => ({
+            docId,
+            key: previous.key + 1,
+        }));
+    }, []);
+
+    useEffect(
+        () => subscribeAnnotationsChanged(handleAnnotationsChanged),
+        [handleAnnotationsChanged],
     );
 
     const activeTab = tabs.find((t) => t.documentId === activeTabId) ?? null;
@@ -1872,6 +1889,12 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                         onSelectBriefs={
                                             handleSelectBriefSources
                                         }
+                                        annotationRefreshDocId={
+                                            annotationRefresh.docId
+                                        }
+                                        annotationRefreshKey={
+                                            annotationRefresh.key
+                                        }
                                         onDocClick={handleDocClick}
                                         onAnnotationClick={(doc, ann) => {
                                             openTab(
@@ -2104,6 +2127,21 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     citationNavigationKey={
                                         activeCitationNavigationKey
                                     }
+                                    onCitationNavigationHandled={(key) => {
+                                        setActiveCitationNavigationKey(
+                                            (current) =>
+                                                current === key ? null : current,
+                                        );
+                                    }}
+                                    initialScrollTop={
+                                        activeTab.scrollTop ?? null
+                                    }
+                                    onScrollChange={(top) =>
+                                        handleTabScrollChange(
+                                            activeTab.documentId,
+                                            top,
+                                        )
+                                    }
                                     focusAnnotationId={
                                         activeTab.focusAnnotationId ?? null
                                     }
@@ -2117,6 +2155,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                                     ? rendered / total
                                                     : 1,
                                         })
+                                    }
+                                    onAnnotationsChanged={
+                                        handleAnnotationsChanged
                                     }
                                     rounded={false}
                                     bordered={false}

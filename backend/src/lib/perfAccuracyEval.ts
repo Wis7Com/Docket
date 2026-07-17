@@ -325,6 +325,38 @@ export type ScenarioEvaluationResult = z.infer<
 >;
 export type EvaluationRunResult = z.infer<typeof evaluationRunResultSchema>;
 
+/**
+ * Prevent an E2E answer report from presenting absent retrieval data as misses.
+ * QA ids without explicit ids follow the same stable qa-N convention as the
+ * evaluation runners.
+ */
+export function assertRetrievalResultCoversEvaluationSet(
+  evaluationSet: Pick<EvaluationSet, "name" | "qa">,
+  retrievalResult: Pick<EvaluationRunResult, "evalset_name" | "qa_results">,
+): void {
+  if (
+    evaluationSet.name &&
+    retrievalResult.evalset_name &&
+    evaluationSet.name !== retrievalResult.evalset_name
+  ) {
+    throw new Error(
+      `Retrieval result belongs to ${JSON.stringify(retrievalResult.evalset_name)}, not ${JSON.stringify(evaluationSet.name)}.`,
+    );
+  }
+
+  const retrievedIds = new Set(
+    retrievalResult.qa_results.map((result) => result.id),
+  );
+  const missingIds = evaluationSet.qa
+    .map((item, index) => item.id ?? `qa-${index + 1}`)
+    .filter((id) => !retrievedIds.has(id));
+  if (missingIds.length > 0) {
+    throw new Error(
+      `Retrieval result is not joined to this evaluation set; missing QA ids: ${missingIds.join(", ")}. Re-run retrieval or provide its matching report.`,
+    );
+  }
+}
+
 type DuplicateIdCandidate = { id: string; index: number };
 
 function addDuplicateIdIssues(

@@ -404,6 +404,7 @@ export function createPdfAnnotationInteractions(
         noteEl: HTMLElement,
         lineEl: SVGLineElement | null,
     ) {
+        if (event.button !== 0) return;
         event.preventDefault();
         event.stopPropagation();
         const annotation = annotationsRef.current.find(
@@ -411,6 +412,16 @@ export function createPdfAnnotationInteractions(
         );
         const documentId = docIdRef.current;
         if (!annotation || !documentId) return;
+
+        const startX = event.clientX;
+        const startY = event.clientY;
+        const clickThresholdPx = 3;
+        let moved = false;
+        let nextPosition = clientPointToPdfPosition(
+            event.clientX,
+            event.clientY,
+            pageEntry,
+        );
 
         // Capture the pointer so the drag keeps receiving moves even though
         // repaints may swap DOM around, and so it survives the pointer
@@ -422,17 +433,19 @@ export function createPdfAnnotationInteractions(
             // the window listeners below are the fallback.
         }
 
-        let nextPosition = clientPointToPdfPosition(
-            event.clientX,
-            event.clientY,
-            pageEntry,
-        );
-
         // During the drag, move the bubble (and its connector tail) directly
         // in the DOM. We intentionally do NOT call setAnnotations per frame:
         // that would rebuild the whole overlay layer and destroy the element
         // we're dragging. State is committed once on pointer-up.
         const apply = (moveEvent: PointerEvent) => {
+            if (
+                !moved &&
+                Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) <
+                    clickThresholdPx
+            ) {
+                return;
+            }
+            moved = true;
             nextPosition = clientPointToPdfPosition(
                 moveEvent.clientX,
                 moveEvent.clientY,
@@ -457,6 +470,23 @@ export function createPdfAnnotationInteractions(
                 noteEl.releasePointerCapture(upEvent.pointerId);
             } catch {
                 // ignore — capture may already be gone
+            }
+            if (
+                !moved &&
+                Math.hypot(upEvent.clientX - startX, upEvent.clientY - startY) <
+                    clickThresholdPx
+            ) {
+                setSelectedAnnotationId(annotationId);
+                setActiveSelection(null);
+                window.getSelection()?.removeAllRanges();
+                setContextMenu({
+                    kind: "annotation",
+                    variant: "quick",
+                    x: upEvent.clientX,
+                    y: upEvent.clientY,
+                    annotationId,
+                });
+                return;
             }
             apply(upEvent);
             // Commit the final position to React state so the next repaint
@@ -547,7 +577,7 @@ export function createPdfAnnotationInteractions(
                 marker.style.border = item.marker.border;
                 marker.style.background = item.marker.background;
                 marker.style.opacity = item.marker.opacity;
-                marker.style.mixBlendMode = "multiply";
+                marker.style.mixBlendMode = item.marker.mixBlendMode;
                 marker.style.cursor = "pointer";
                 marker.style.pointerEvents = overlayInteractionActive
                     ? "none"
@@ -649,7 +679,7 @@ export function createPdfAnnotationInteractions(
                     line.setAttribute("y1", String(item.note.anchorTop));
                     line.setAttribute("x2", String(item.note.left + 10));
                     line.setAttribute("y2", String(item.note.top + 10));
-                    line.setAttribute("stroke", item.marker.background);
+                    line.setAttribute("stroke", item.note.connectorColor);
                     line.setAttribute("stroke-width", "1.5");
                     line.setAttribute("stroke-linecap", "round");
                     connector.appendChild(line);
@@ -679,6 +709,20 @@ export function createPdfAnnotationInteractions(
                     note.style.userSelect = "none";
                     note.addEventListener("pointerdown", (e) => {
                         beginNoteDrag(item.annotationId, p, e, note, line);
+                    });
+                    note.addEventListener("contextmenu", (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setSelectedAnnotationId(item.annotationId);
+                        setActiveSelection(null);
+                        window.getSelection()?.removeAllRanges();
+                        setContextMenu({
+                            kind: "annotation",
+                            variant: "context",
+                            x: e.clientX,
+                            y: e.clientY,
+                            annotationId: item.annotationId,
+                        });
                     });
                     layer.appendChild(note);
                 }
