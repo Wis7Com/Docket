@@ -1,5 +1,5 @@
-export type RunningChatIdentity = { chatId?: string; projectId?: string };
-export type ChatSessionStatus = "streaming" | "completed" | "cancelled" | "failed";
+export type RunningChatIdentity = { kind?: "chat" | "tabular"; chatId?: string; projectId?: string };
+export type ChatSessionStatus = "waiting" | "streaming" | "completed" | "cancelled" | "failed";
 export type AbortableChatSession = RunningChatIdentity & {
   controller?: AbortController;
 };
@@ -11,7 +11,7 @@ export type SelectableChatSession = RunningChatIdentity & {
 
 export type ChatAdmission =
   | { kind: "allow" }
-  | { kind: "blocked-local-busy"; conflict: RunningChatIdentity };
+  | { kind: "queue-local-busy"; conflict: RunningChatIdentity };
 
 export function controllerForChatCancel(
   localController: AbortController | null,
@@ -34,7 +34,7 @@ export function shouldAttachChatSession(
 ): boolean {
   // A terminal snapshot is only for a route that was already attached while
   // streaming. A later mount must use freshly hydrated persisted messages.
-  return status === "streaming"
+  return status === "streaming" || status === "waiting"
     ? matchesRoute || ownsSession
     : hasSeenSession && matchesRoute;
 }
@@ -55,6 +55,8 @@ export function selectAttachedSession<T extends SelectableChatSession>(
     .sort((a, b) => {
       if (a.status === "streaming" && b.status !== "streaming") return -1;
       if (a.status !== "streaming" && b.status === "streaming") return 1;
+      if (a.status === "waiting" && b.status !== "waiting") return -1;
+      if (a.status !== "waiting" && b.status === "waiting") return 1;
       return b.seq - a.seq;
     });
   return candidates[0] ?? null;
@@ -81,6 +83,7 @@ export function isDifferentRunningChat(
   running: RunningChatIdentity | null,
   current: RunningChatIdentity,
 ): boolean {
+  if (running?.kind === "tabular") return true;
   return !!running && (
     running.chatId !== current.chatId || running.projectId !== current.projectId
   );
@@ -98,7 +101,7 @@ export function evaluateChatAdmission({
   // Two new chats have no id until their first SSE event. Treating both as
   // the same chat preserves retry semantics during that short window.
   return gpuBound && gpuBusySession && isDifferentRunningChat(gpuBusySession, current)
-    ? { kind: "blocked-local-busy", conflict: gpuBusySession }
+    ? { kind: "queue-local-busy", conflict: gpuBusySession }
     : { kind: "allow" };
 }
 
@@ -128,7 +131,7 @@ export function streamingChatKeys<T extends SelectableChatSession>(
 ): Set<string> {
   const keys = new Set<string>();
   for (const session of sessions.values()) {
-    if (session.status === "streaming" && session.chatId != null) {
+    if ((session.status === "streaming" || session.status === "waiting") && session.chatId != null) {
       keys.add(chatSessionKey(session.chatId, session.projectId));
     }
   }

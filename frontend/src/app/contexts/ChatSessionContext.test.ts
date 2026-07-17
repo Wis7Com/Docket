@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   abortAllChatSessions,
   beginChatSession,
+  beginWaitingChatSession,
   finishActiveChatSession,
   flushChatSession,
   getActiveChatSession,
@@ -112,4 +113,15 @@ test("provider teardown aborts every streaming controller", () => {
   assert.equal(secondController.signal.aborted, true);
   finishActiveChatSession(first, "cancelled");
   finishActiveChatSession(second, "cancelled");
+});
+
+test("a replacement request removes a waiting job before starting", () => {
+  const waiting = beginWaitingChatSession(session({
+    chatId: "queued-chat",
+    gpuBound: true,
+    messages: [{ role: "user", content: "waiting" }],
+  }));
+  const replacement = beginChatSession(session({ chatId: "queued-chat" }));
+  assert.equal(getSessionByToken(waiting), null);
+  finishActiveChatSession(replacement, "completed");
 });

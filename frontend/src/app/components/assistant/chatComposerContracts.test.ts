@@ -49,3 +49,13 @@ test("project chat shows + and forwards request-level tool preferences", () => {
   assert.match(chatHook, /disabled_tools: message\.disabled_tools/g);
   assert.match(docketApi, /disabled_tools\?: string\[\]/g);
 });
+
+test("composer sends a typed next turn while retaining stop for an empty composer", () => {
+  const chatInput = fs.readFileSync(
+    new URL("./ChatInput.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.match(chatInput, /if \(isLoading && !value\.trim\(\)\)/);
+  assert.match(chatInput, /if \(isLoading\) onQueueMessage\?\.\(nextMessage\)/);
+  assert.match(chatInput, /hasQueuedMessage/);
+});

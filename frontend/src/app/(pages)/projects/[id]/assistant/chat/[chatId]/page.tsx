@@ -590,7 +590,18 @@ export default function ProjectAssistantChatPage({ params }: Props) {
     } = useChatHistoryContext();
     const [projectChats, setProjectChats] = useState<DocketChat[]>([]);
     const [initialMessages] = useState<DocketMessage[]>(newChatMessages ?? []);
-    const { messages, isResponseLoading, handleChat, setMessages, cancel } =
+    const {
+        messages,
+        isResponseLoading,
+        handleChat,
+        setMessages,
+        cancel,
+        queueMessage,
+        queuedMessage,
+        cancelQueuedMessage,
+        restoreDraft,
+        clearRestoreDraft,
+    } =
         useAssistantChat({ initialMessages, chatId, projectId });
 
     const hasLoaded = useRef(false);
@@ -2236,6 +2247,25 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     ),
                                 );
                             })()}
+                            {queuedMessage && (
+                                <div className="flex justify-end">
+                                    <div className="max-w-[80%] rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
+                                        <p className="whitespace-pre-wrap">{queuedMessage.message.content}</p>
+                                        <div className="mt-2 flex items-center justify-end gap-2 text-xs text-gray-500">
+                                            <Loader2 className="h-3 w-3 animate-spin" />
+                                            <span>다음 턴 대기 중</span>
+                                            <button
+                                                type="button"
+                                                onClick={cancelQueuedMessage}
+                                                className="rounded p-0.5 hover:bg-gray-200"
+                                                aria-label="Cancel queued message"
+                                            >
+                                                <X className="h-3.5 w-3.5" />
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
                             <div ref={messagesEndRef} />
                         </div>
                     )}
@@ -2245,8 +2275,27 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                         <ChatInput
                             ref={chatInputRef}
                             onSubmit={handleSubmit}
+                            onQueueMessage={(message) => {
+                                const attachedDocumentIds = (message.files ?? [])
+                                    .map((file) => file.document_id)
+                                    .filter((id): id is string => Boolean(id));
+                                const sourceSelection = buildDocumentSourceSelection(
+                                    project?.documents ?? [],
+                                    deselectedDocIds,
+                                    attachedDocumentIds,
+                                );
+                                queueMessage(message, {
+                                    displayedDoc: activeTab
+                                        ? { filename: activeTab.filename, documentId: activeTab.documentId }
+                                        : null,
+                                    selectedDocumentIds: sourceSelection.selectedDocumentIds,
+                                });
+                            }}
                             onCancel={cancel}
                             isLoading={isResponseLoading}
+                            hasQueuedMessage={!!queuedMessage}
+                            restoreDraft={restoreDraft}
+                            onDraftRestored={clearRestoreDraft}
                             projectMode
                             chatId={chatId}
                             projectId={projectId}

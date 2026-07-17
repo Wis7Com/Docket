@@ -16,6 +16,7 @@ test("a completed snapshot does not shadow hydration on a later mount", () => {
   assert.equal(shouldAttachChatSession("completed", true, false, true), true);
   assert.equal(shouldAttachChatSession("completed", false, false, true), false);
   assert.equal(shouldAttachChatSession("streaming", true, false, false), true);
+  assert.equal(shouldAttachChatSession("waiting", true, false, false), true);
   assert.equal(shouldAttachChatSession("streaming", false, false, true), false);
 });
 
@@ -68,13 +69,13 @@ test("route writes reach only the streaming session owned by this hook instance"
   );
 });
 
-test("GPU admission only blocks a different local chat", () => {
+test("GPU admission queues a different local chat", () => {
   const busy = { chatId: "chat-1", projectId: "project-1" };
   assert.deepEqual(evaluateChatAdmission({
     gpuBound: true,
     gpuBusySession: busy,
     current: { chatId: "chat-2", projectId: "project-1" },
-  }), { kind: "blocked-local-busy", conflict: busy });
+  }), { kind: "queue-local-busy", conflict: busy });
   assert.deepEqual(evaluateChatAdmission({
     gpuBound: true,
     gpuBusySession: busy,
@@ -131,4 +132,12 @@ test("streaming chat keys include persisted streams with their project identity"
     JSON.stringify([null, "chat-1"]),
     JSON.stringify(["project-1", "chat-1"]),
   ].sort());
+});
+
+test("waiting chats remain visible as in-progress sidebar activity", () => {
+  const waiting = Symbol("waiting");
+  const sessions = new Map([
+    [waiting, { token: waiting, seq: 1, status: "waiting" as const, chatId: "chat-1" }],
+  ]);
+  assert.deepEqual([...streamingChatKeys(sessions)], [JSON.stringify([null, "chat-1"])]);
 });

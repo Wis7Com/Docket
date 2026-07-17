@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Plus,
@@ -17,7 +17,6 @@ import {
   getTabularReview,
   getProject,
   regenerateTabularCell,
-  streamTabularGeneration,
   updateTabularReview,
 } from "@/app/lib/docketApi";
 import type {
@@ -44,6 +43,14 @@ import type { TRTableHandle } from "./TRTable";
 import { TRChatPanel } from "./TRChatPanel";
 import { exportTabularReviewToExcel } from "./exportToExcel";
 import { useSidebar } from "@/app/contexts/SidebarContext";
+import { useNotifications } from "@/app/contexts/NotificationContext";
+import { ModelToggle } from "../assistant/ModelToggle";
+import { isGpuBoundModel } from "@/app/lib/modelAvailability";
+import {
+  getTabularRunSnapshot,
+  startTabularRun,
+  subscribeToTabularRun,
+} from "@/app/contexts/TabularRunStore";
 
 interface Props {
   reviewId: string;
@@ -58,7 +65,6 @@ export function TRView({ reviewId, projectId }: Props) {
   const [documents, setDocuments] = useState<DocketDocument[]>([]);
   const [columns, setColumns] = useState<ColumnConfig[]>([]);
   const [loading, setLoading] = useState(true);
-  const [generating, setGenerating] = useState(false);
   const [savingColumn, setSavingColumn] = useState(false);
   const [savingColumnsConfig, setSavingColumnsConfig] = useState(false);
   const [addColOpen, setAddColOpen] = useState(false);
@@ -89,6 +95,15 @@ export function TRView({ reviewId, projectId }: Props) {
   const tableRef = useRef<TRTableHandle>(null);
   const router = useRouter();
   const { profile } = useUserProfile();
+  const { notify } = useNotifications();
+  const tabularRun = useSyncExternalStore(
+    subscribeToTabularRun,
+    getTabularRunSnapshot,
+    () => null,
+  );
+  const generating = tabularRun?.reviewId === reviewId &&
+    (tabularRun.status === "waiting" || tabularRun.status === "running");
+  const waitingForGpu = tabularRun?.reviewId === reviewId && tabularRun.status === "waiting";
   const apiKeys = {
     claudeApiKey: profile?.claudeApiKey ?? null,
     geminiApiKey: profile?.geminiApiKey ?? null,
@@ -98,7 +113,15 @@ export function TRView({ reviewId, projectId }: Props) {
     openaiCompatibleApiKey: profile?.openaiCompatibleApiKey ?? null,
     openaiCompatibleBaseUrl: profile?.openaiCompatibleBaseUrl ?? null,
   };
-  const tabularModel = profile?.tabularModel ?? "gemini-3-flash-preview";
+  const tabularModel = review?.model ?? profile?.tabularModel ?? "gemini-3-flash-preview";
+
+  useEffect(() => {
+    if (!tabularRun || tabularRun.reviewId !== reviewId || tabularRun.updates.size === 0) return;
+    setCells((current) => current.map((cell) => {
+      const update = tabularRun.updates.get(`${cell.document_id}:${cell.column_index}`);
+      return update ? { ...cell, content: update.content, status: update.status } : cell;
+    }));
+  }, [reviewId, tabularRun]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -233,7 +256,7 @@ export function TRView({ reviewId, projectId }: Props) {
   }
 
   async function handleGenerate() {
-    if (!review || generating) return;
+    if (!review || generating || tabularRun?.status === "waiting" || tabularRun?.status === "running") return;
 
     // If columns changed since last save, update the review first
     if (columns.length === 0) return;
@@ -242,8 +265,6 @@ export function TRView({ reviewId, projectId }: Props) {
       setApiKeyModalProvider(getModelProvider(tabularModel));
       return;
     }
-
-    setGenerating(true);
 
     // Optimistically set empty/pending/error cells to generating (skip done cells)
     setCells((prev) =>
@@ -274,49 +295,20 @@ export function TRView({ reviewId, projectId }: Props) {
       ),
     );
 
-    try {
-      const response = await streamTabularGeneration(projectId, reviewId);
-      if (!response.body) throw new Error("No body");
+    startTabularRun({
+      projectId,
+      reviewId,
+      title: review.title ?? "Tabular Review",
+      gpuBound: isGpuBoundModel(tabularModel, {
+        openaiCompatibleBaseUrl: profile?.openaiCompatibleBaseUrl ?? null,
+      }),
+      notify,
+    });
+  }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-
-        for (const line of lines) {
-          if (!line.startsWith("data:")) continue;
-          const dataStr = line.slice(5).trim();
-          if (dataStr === "[DONE]") break;
-          try {
-            const data = JSON.parse(dataStr);
-            if (data.type === "cell_update") {
-              setCells((prev) =>
-                prev.map((c) =>
-                  c.document_id === data.document_id &&
-                  c.column_index === data.column_index
-                    ? {
-                        ...c,
-                        content: data.content,
-                        status: data.status,
-                      }
-                    : c,
-                ),
-              );
-            }
-          } catch {}
-        }
-      }
-    } catch (err) {
-      console.error("Generation failed", err);
-    } finally {
-      setGenerating(false);
-    }
+  async function handleModelChange(model: string) {
+    const updated = await updateTabularReview(projectId, reviewId, { model });
+    setReview(updated);
   }
 
   async function handleAddColumn(newColumns: ColumnConfig[]) {
@@ -557,8 +549,24 @@ export function TRView({ reviewId, projectId }: Props) {
                 ) : (
                   <Play className="h-4 w-4" />
                 )}
-                {generating ? "Running…" : "Run"}
+                {waitingForGpu
+                  ? "대기 중 — 로컬 모델이 다른 작업을 처리 중입니다"
+                  : generating ? "Running…" : "Run"}
               </button>
+              {generating && (
+                <button
+                  type="button"
+                  onClick={() => tabularRun?.cancel()}
+                  className="flex h-8 items-center px-2 text-sm text-gray-500 hover:text-gray-900"
+                >
+                  Cancel
+                </button>
+              )}
+              <ModelToggle
+                value={tabularModel}
+                onChange={(model) => void handleModelChange(model)}
+                apiKeys={apiKeys}
+              />
             </div>
           )}
         </div>
@@ -653,6 +661,8 @@ export function TRView({ reviewId, projectId }: Props) {
               }}
               initialChatId={selectedChatId}
               onChatIdChange={setSelectedChatId}
+              model={tabularModel}
+              onModelChange={(model) => void handleModelChange(model)}
             />
           )}
           <TRTable

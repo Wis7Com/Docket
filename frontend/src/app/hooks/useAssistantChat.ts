@@ -15,7 +15,6 @@ import { useNotifications } from "@/app/contexts/NotificationContext";
 import { useUserProfile } from "@/contexts/UserProfileContext";
 import {
     evaluateChatAdmission,
-    runningChatHref,
     selectAttachedSession,
     controllerForChatCancel,
     shouldRouteWriteToSession,
@@ -23,15 +22,23 @@ import {
 import {
     EMPTY_SESSIONS,
     beginChatSession,
+    beginWaitingChatSession,
     finishActiveChatSession,
     flushChatSession,
     getActiveChatSession,
     getChatSessionsSnapshot,
-    getGpuBusySession,
     getSessionByToken,
+    queueChatMessage,
+    restoreChatDraft,
     subscribeToChatSession,
+    takeQueuedMessage,
     updateActiveChatSession,
 } from "@/app/contexts/ChatSessionContext";
+import {
+    enqueueGpuJob,
+    getGpuBusyJob,
+    removeGpuJob,
+} from "@/app/contexts/GpuQueueStore";
 import { isGpuBoundModel } from "@/app/lib/modelAvailability";
 import type {
     AssistantEvent,
@@ -96,7 +103,7 @@ export function useAssistantChat({
         ownerTokenRef.current,
         seenSessionTokenRef.current,
     );
-    if (attachedSession?.status === "streaming") {
+    if (attachedSession?.status === "streaming" || attachedSession?.status === "waiting") {
         seenSessionTokenRef.current = attachedSession.token;
     }
     const [localMessages, setLocalMessages] = useState<DocketMessage[]>(
@@ -114,6 +121,8 @@ export function useAssistantChat({
         attachedSession?.isResponseLoading ?? localIsResponseLoading;
     const isLoadingCitations =
         attachedSession?.isLoadingCitations ?? localIsLoadingCitations;
+    const queuedMessage = attachedSession?.queuedMessage ?? null;
+    const restoreDraft = attachedSession?.draft ?? matchingSession?.draft ?? null;
 
     // Route interactions write to a live session only when this hook owns it.
     // Fresh mounts keep their hydration writes local so they cannot overwrite
@@ -202,9 +211,21 @@ export function useAssistantChat({
     };
 
     const cancel = () => {
+        const active = getActiveChatSession(chatId, projectId);
+        if (active?.status === "waiting") {
+            if (active.queueJobId) removeGpuJob(active.queueJobId);
+            updateActiveChatSession({
+                messages: active.messages.slice(0, -2),
+                draft: active.waitingMessage?.content,
+                waitingMessage: undefined,
+                queueJobId: undefined,
+            }, active.token);
+            finishActiveChatSession(active.token, "cancelled");
+            return;
+        }
         const controller = controllerForChatCancel(
             null,
-            getActiveChatSession(chatId, projectId),
+            active,
             chatId,
             projectId,
         );
@@ -253,43 +274,85 @@ export function useAssistantChat({
             displayedDoc?: { filename: string; documentId: string } | null;
             selectedDocumentIds?: string[];
         },
+        baseMessages?: DocketMessage[],
+        existingWaitingToken?: symbol,
+        targetChatIdOverride?: string,
     ): Promise<string | null> => {
         if (!message.content.trim()) return null;
+
+        const waitingSession = existingWaitingToken
+            ? getSessionByToken(existingWaitingToken)
+            : null;
+        const targetChatId = targetChatIdOverride ?? waitingSession?.chatId ?? chatId;
 
         const gpuBound = isGpuBoundModel(message.model ?? "", {
             openaiCompatibleBaseUrl: profile?.openaiCompatibleBaseUrl ?? null,
         });
         const admission = evaluateChatAdmission({
             gpuBound,
-            gpuBusySession: getGpuBusySession(),
-            current: { chatId, projectId },
+            gpuBusySession: getGpuBusyJob(),
+            current: { chatId: targetChatId, projectId },
         });
-        if (admission.kind === "blocked-local-busy") {
-            const href = runningChatHref(admission.conflict);
-            notify({
-                title: "Local model is busy",
-                body: "The local model can generate one answer at a time. Finish or stop the current answer, or switch this chat to an API model.",
-                href,
-                kind: "chat-error",
-                actionLabel: href ? "Go to chat" : undefined,
+        if (!waitingSession && admission.kind === "queue-local-busy") {
+            const sessionMessages: DocketMessage[] = [
+                ...(baseMessages ?? messages),
+                message,
+                {
+                    role: "assistant",
+                    content: "로컬 모델 대기 중 — 다른 채팅의 응답 생성이 끝나면 시작됩니다",
+                    annotations: [],
+                    events: [{ type: "thinking", isStreaming: true }],
+                },
+            ];
+            const queueJobId = `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+            const token = beginWaitingChatSession({
+                chatId: targetChatId,
+                projectId,
+                messages: sessionMessages,
+                isResponseLoading: true,
+                isLoadingCitations: false,
+                model: message.model,
+                gpuBound: true,
+                waitingMessage: message,
+                queueJobId,
+            });
+            streamTokenRef.current = token;
+            ownerTokenRef.current = token;
+            enqueueGpuJob({
+                id: queueJobId,
+                kind: "chat",
+                label: message.content.slice(0, 80),
+                chatId: targetChatId,
+                projectId,
+                start: () => {
+                    updateActiveChatSession({
+                        status: "streaming",
+                        queueJobId: undefined,
+                        waitingMessage: undefined,
+                    }, token);
+                    void handleChat(message, opts, undefined, token);
+                },
             });
             return null;
         }
         // A same-chat retry supersedes the existing request instead of leaving
         // two writers racing for the same persisted conversation.
-        if (chatId != null) {
-            getActiveChatSession(chatId, projectId)?.controller?.abort();
+        if (targetChatId != null && !waitingSession) {
+            getActiveChatSession(targetChatId, projectId)?.controller?.abort();
         }
 
-        const lastMessage = messages[messages.length - 1];
+        const sourceMessages = waitingSession
+            ? waitingSession.messages.slice(0, -1)
+            : baseMessages ?? messages;
+        const lastMessage = sourceMessages[sourceMessages.length - 1];
         const isMessageAlreadyAdded =
             lastMessage &&
             lastMessage.role === "user" &&
             lastMessage.content === message.content;
 
         const newMessages: DocketMessage[] = isMessageAlreadyAdded
-            ? messages
-            : [...messages, message];
+            ? sourceMessages
+            : [...sourceMessages, message];
 
         const sessionMessages: DocketMessage[] = [
             ...newMessages,
@@ -434,8 +497,8 @@ export function useAssistantChat({
         };
 
         try {
-            streamToken = beginChatSession({
-                chatId,
+            streamToken = waitingSession?.token ?? beginChatSession({
+                chatId: targetChatId,
                 projectId,
                 messages: sessionMessages,
                 isResponseLoading: true,
@@ -445,6 +508,15 @@ export function useAssistantChat({
                 controller: stream.controller,
                 flush: flushDrip,
             });
+            if (waitingSession) {
+                updateActiveChatSession({
+                    isResponseLoading: true,
+                    isLoadingCitations: false,
+                    controller: stream.controller,
+                    flush: flushDrip,
+                    messages: sessionMessages,
+                }, streamToken);
+            }
             stream.token = streamToken;
             streamTokenRef.current = streamToken;
             ownerTokenRef.current = streamToken;
@@ -476,7 +548,7 @@ export function useAssistantChat({
                 ? streamProjectChat({
                       projectId,
                       messages: apiMessages,
-                      chat_id: chatId,
+                      chat_id: targetChatId,
                       model,
                       displayed_doc: displayedDoc
                           ? {
@@ -492,7 +564,7 @@ export function useAssistantChat({
                   })
                 : streamChat({
                       messages: apiMessages,
-                      chat_id: chatId,
+                      chat_id: targetChatId,
                       model,
                       disabled_tools: message.disabled_tools,
                       signal: stream.controller.signal,
@@ -1134,6 +1206,17 @@ export function useAssistantChat({
             }
 
             finishActiveChatSession(streamToken, "completed");
+            const queuedAfterCompletion = takeQueuedMessage(streamToken);
+            if (queuedAfterCompletion) {
+                const terminal = getSessionByToken(streamToken);
+                void handleChat(
+                    queuedAfterCompletion.message,
+                    queuedAfterCompletion.opts,
+                    terminal?.messages,
+                    undefined,
+                    terminal?.chatId,
+                );
+            }
             if (
                 finalChatHref &&
                 !wasViewingFinishingChat
@@ -1250,12 +1333,39 @@ export function useAssistantChat({
                     });
                 }
             }
-            finishActiveChatSession(
-                streamToken,
-                error instanceof Error && error.name === "AbortError"
-                    ? "cancelled"
-                    : "failed",
-            );
+            const terminalStatus = error instanceof Error && error.name === "AbortError"
+                ? "cancelled"
+                : "failed";
+            finishActiveChatSession(streamToken, terminalStatus);
+            const queuedAfterTerminal = takeQueuedMessage(streamToken);
+            if (queuedAfterTerminal) {
+                if (terminalStatus === "failed") {
+                    restoreChatDraft(streamToken, queuedAfterTerminal.message.content);
+                    const failedSession = getSessionByToken(streamToken);
+                    const failedChatId = failedSession?.chatId ?? chatId;
+                    const failedHref = failedChatId
+                        ? projectId
+                            ? `/projects/${projectId}/assistant/chat/${failedChatId}`
+                            : `/assistant/chat/${failedChatId}`
+                        : undefined;
+                    notify({
+                        title: "Queued message was not sent",
+                        body: "대기 중이던 메시지가 전송되지 않았습니다",
+                        href: failedHref,
+                        kind: "chat-error",
+                        actionLabel: failedHref ? "Go to chat" : undefined,
+                    });
+                } else {
+                    const terminal = getSessionByToken(streamToken);
+                    void handleChat(
+                        queuedAfterTerminal.message,
+                        queuedAfterTerminal.opts,
+                        terminal?.messages,
+                        undefined,
+                        terminal?.chatId,
+                    );
+                }
+            }
             return null;
         } finally {
             stopDrip();
@@ -1290,5 +1400,23 @@ export function useAssistantChat({
         setMessages,
         cancel,
         chatId,
+        queuedMessage,
+        restoreDraft,
+        clearRestoreDraft: () => {
+            const active = getActiveChatSession(chatId, projectId);
+            if (active?.draft) updateActiveChatSession({ draft: undefined }, active.token);
+        },
+        queueMessage: (message: DocketMessage, opts?: {
+            displayedDoc?: { filename: string; documentId: string } | null;
+            selectedDocumentIds?: string[];
+        }) => {
+            const active = getActiveChatSession(chatId, projectId);
+            return queueChatMessage(active?.token ?? null, { message, opts });
+        },
+        cancelQueuedMessage: () => {
+            const active = getActiveChatSession(chatId, projectId);
+            const queued = takeQueuedMessage(active?.token ?? null);
+            if (queued) restoreChatDraft(active?.token ?? null, queued.message.content);
+        },
     };
 }

@@ -974,6 +974,7 @@ export async function createTabularReview(
   projectId: string,
   payload: {
     title?: string;
+    model?: string | null;
     document_ids: string[];
     columns_config: { index: number; name: string; prompt: string }[];
     workflow_id?: string;
@@ -1000,6 +1001,7 @@ export async function updateTabularReview(
   reviewId: string,
   payload: {
     title?: string;
+    model?: string | null;
     columns_config?: { index: number; name: string; prompt: string }[];
     document_ids?: string[];
   },
@@ -1064,6 +1066,7 @@ export async function deleteTabularReview(
 export async function streamTabularGeneration(
   projectId: string,
   reviewId: string,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const authHeaders = await getAuthHeader();
   return fetch(
@@ -1071,6 +1074,7 @@ export async function streamTabularGeneration(
     {
       method: "POST",
       headers: { ...authHeaders },
+      signal,
     },
   );
 }

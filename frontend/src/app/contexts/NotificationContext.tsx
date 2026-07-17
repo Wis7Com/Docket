@@ -21,7 +21,9 @@ export type NotificationKind =
   | "chat-complete"
   | "chat-error"
   | "embedding-complete"
-  | "embedding-error";
+  | "embedding-error"
+  | "tabular-complete"
+  | "tabular-error";
 
 export type AppNotification = {
   title: string;

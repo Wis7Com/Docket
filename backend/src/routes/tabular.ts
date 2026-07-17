@@ -13,6 +13,7 @@ import {
 import { completeText, streamChatWithTools } from "../lib/llm";
 import { getUserApiKeys, getUserModelSettings } from "../lib/userSettings";
 import { checkProjectAccess, ensureReviewAccess } from "../lib/access";
+import { isLoopbackUrl } from "../lib/llm/timeouts";
 
 function formatPromptSuffix(format?: string, tags?: string[]): string {
     switch (format) {
@@ -341,6 +342,12 @@ tabularRouter.patch("/:reviewId", requireAuth, async (req, res) => {
     const projectId = routeProjectId(req);
     const updates: Record<string, unknown> = {};
     if (req.body.title != null) updates.title = req.body.title;
+    if (req.body.model !== undefined) {
+        if (req.body.model !== null && typeof req.body.model !== "string") {
+            return void res.status(400).json({ detail: "model must be a string or null" });
+        }
+        updates.model = req.body.model;
+    }
     if (req.body.columns_config != null)
         updates.columns_config = req.body.columns_config;
     updates.updated_at = new Date().toISOString();
@@ -656,8 +663,11 @@ tabularRouter.post(
             userId,
             db,
         );
+        const effectiveModel = typeof review.model === "string" && review.model
+            ? review.model
+            : tabular_model;
         const result = await queryGemini(
-            tabular_model,
+            effectiveModel,
             doc.filename as string,
             markdown,
             column.prompt,
@@ -741,6 +751,9 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
     }
 
     const { tabular_model, api_keys } = await getUserModelSettings(userId, db);
+    const effectiveModel = typeof review.model === "string" && review.model
+        ? review.model
+        : tabular_model;
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -751,8 +764,7 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
     const write = (line: string) => res.write(line);
 
     try {
-        await Promise.all(
-            docs.map(async (doc) => {
+        const processDocument = async (doc: Record<string, unknown>) => {
                 const docId = doc.id as string;
                 const filename = doc.filename as string;
                 let markdown = "";
@@ -807,7 +819,7 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                 const receivedColumns = new Set<number>();
                 try {
                     await queryGeminiAllColumns(
-                        tabular_model,
+                        effectiveModel,
                         filename,
                         markdown,
                         columnsToProcess,
@@ -849,8 +861,21 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                         );
                     }
                 }
-            }),
-        );
+        };
+        // Local models share a single GPU. The frontend serializes jobs across
+        // reviews and chats; process one document at a time here as well.
+        const isLocalModel =
+            effectiveModel.startsWith("local:") ||
+            effectiveModel.startsWith("ollama:") ||
+            effectiveModel.startsWith("mlx:") ||
+            (effectiveModel.startsWith("openai-compatible:") &&
+                !!api_keys.openaiCompatibleBaseUrl &&
+                isLoopbackUrl(api_keys.openaiCompatibleBaseUrl));
+        if (isLocalModel) {
+            for (const doc of docs) await processDocument(doc);
+        } else {
+            await Promise.all(docs.map(processDocument));
+        }
 
         write("data: [DONE]\n\n");
     } catch (err) {

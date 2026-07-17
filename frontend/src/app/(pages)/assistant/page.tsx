@@ -9,7 +9,18 @@ import type { DocketMessage } from "@/app/components/shared/types";
 
 export default function AssistantPage() {
     const router = useRouter();
-    const { messages, isResponseLoading, handleChat, handleNewChat, cancel } =
+    const {
+        messages,
+        isResponseLoading,
+        handleChat,
+        handleNewChat,
+        cancel,
+        queueMessage,
+        queuedMessage,
+        cancelQueuedMessage,
+        restoreDraft,
+        clearRestoreDraft,
+    } =
         useAssistantChat();
 
     async function handleInitialSubmit(message: DocketMessage) {
@@ -34,6 +45,11 @@ export default function AssistantPage() {
             isResponseLoading={isResponseLoading}
             handleChat={handleChat}
             cancel={cancel}
+            queueMessage={queueMessage}
+            queuedMessage={queuedMessage?.message}
+            cancelQueuedMessage={cancelQueuedMessage}
+            restoreDraft={restoreDraft}
+            onDraftRestored={clearRestoreDraft}
         />
     );
 }

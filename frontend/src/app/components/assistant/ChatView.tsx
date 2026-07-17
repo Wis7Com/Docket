@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useState, useRef, useEffect } from "react";
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, Loader2, X } from "lucide-react";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
 import { ChatInput } from "./ChatInput";
@@ -41,6 +41,11 @@ interface Props {
     messages: DocketMessage[];
     isResponseLoading: boolean;
     handleChat: (message: DocketMessage) => Promise<string | null>;
+    queueMessage?: (message: DocketMessage) => boolean;
+    queuedMessage?: DocketMessage | null;
+    cancelQueuedMessage?: () => void;
+    restoreDraft?: string | null;
+    onDraftRestored?: () => void;
     cancel: () => void;
     chatId?: string;
     projectId?: string;
@@ -50,6 +55,11 @@ export function ChatView({
     messages,
     isResponseLoading,
     handleChat,
+    queueMessage,
+    queuedMessage,
+    cancelQueuedMessage,
+    restoreDraft,
+    onDraftRestored,
     cancel,
     chatId,
     projectId,
@@ -577,6 +587,25 @@ export function ChatView({
                                     </div>
                                 ));
                             })()}
+                            {queuedMessage && (
+                                <div className="flex justify-end">
+                                    <div className="max-w-[80%] rounded-xl bg-gray-100 px-4 py-3 text-sm text-gray-700">
+                                        <p className="whitespace-pre-wrap">{queuedMessage.content}</p>
+                                        <div className="mt-2 flex items-center justify-end gap-2 text-xs text-gray-500">
+                                            <Loader2 className="h-3 w-3 animate-spin" />
+                                            <span>다음 턴 대기 중</span>
+                                            <button
+                                                type="button"
+                                                onClick={cancelQueuedMessage}
+                                                className="rounded p-0.5 hover:bg-gray-200"
+                                                aria-label="Cancel queued message"
+                                            >
+                                                <X className="h-3.5 w-3.5" />
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
                             <div ref={messagesEndRef} />
                         </div>
                     </div>
@@ -641,8 +670,12 @@ export function ChatView({
                         <div className="w-full rounded-t-[20px] bg-white">
                             <ChatInput
                                 onSubmit={handleChat}
+                                onQueueMessage={queueMessage}
                                 onCancel={cancel}
                                 isLoading={isResponseLoading}
+                                hasQueuedMessage={!!queuedMessage}
+                                restoreDraft={restoreDraft}
+                                onDraftRestored={onDraftRestored}
                                 chatId={chatId}
                                 projectId={projectId}
                             />

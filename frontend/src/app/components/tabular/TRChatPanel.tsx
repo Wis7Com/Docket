@@ -62,6 +62,8 @@ interface Props {
   onClose: () => void;
   initialChatId?: string | null;
   onChatIdChange?: (chatId: string | null) => void;
+  model: string;
+  onModelChange: (model: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -570,8 +572,10 @@ export function TRChatPanel({
   onClose,
   initialChatId,
   onChatIdChange,
+  model: currentModel,
+  onModelChange,
 }: Props) {
-  const { profile, updateModelPreference } = useUserProfile();
+  const { profile } = useUserProfile();
   const apiKeys = {
     claudeApiKey: profile?.claudeApiKey ?? null,
     geminiApiKey: profile?.geminiApiKey ?? null,
@@ -581,7 +585,6 @@ export function TRChatPanel({
     openaiCompatibleApiKey: profile?.openaiCompatibleApiKey ?? null,
     openaiCompatibleBaseUrl: profile?.openaiCompatibleBaseUrl ?? null,
   };
-  const currentModel = profile?.tabularModel ?? "gemini-3-flash-preview";
   const [apiKeyModalProvider, setApiKeyModalProvider] =
     useState<ModelProvider | null>(null);
   const [chats, setChats] = useState<TRChat[]>([]);
@@ -1388,7 +1391,7 @@ export function TRChatPanel({
         onSubmit={handleSubmit}
         onCancel={handleCancel}
         model={currentModel}
-        onModelChange={(id) => updateModelPreference("tabularModel", id)}
+        onModelChange={onModelChange}
         apiKeys={apiKeys}
       />
 

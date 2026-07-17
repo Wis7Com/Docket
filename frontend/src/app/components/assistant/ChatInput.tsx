@@ -51,8 +51,12 @@ export interface ChatInputHandle {
 
 interface Props {
   onSubmit: (message: DocketMessage) => void;
+  onQueueMessage?: (message: DocketMessage) => void;
   onCancel: () => void;
   isLoading: boolean;
+  hasQueuedMessage?: boolean;
+  restoreDraft?: string | null;
+  onDraftRestored?: () => void;
   hideAddDocButton?: boolean;
   hideWorkflowButton?: boolean;
   onProjectsClick?: () => void;
@@ -70,8 +74,12 @@ interface Props {
 export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
   {
     onSubmit,
+    onQueueMessage,
     onCancel,
     isLoading,
+    hasQueuedMessage = false,
+    restoreDraft,
+    onDraftRestored,
     hideAddDocButton,
     hideWorkflowButton,
     onProjectsClick,
@@ -112,6 +120,13 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
   const [docSelectorOpen, setDocSelectorOpen] = useState(false);
   const [apiKeyModalProvider, setApiKeyModalProvider] =
     useState<ModelProvider | null>(null);
+
+  useEffect(() => {
+    if (!restoreDraft || value.trim()) return;
+    setValue(restoreDraft);
+    onDraftRestored?.();
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [onDraftRestored, restoreDraft, value]);
 
   useEffect(() => {
     let cancelled = false;
@@ -191,7 +206,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
 
   const handleSubmit = () => {
     const query = value.trim();
-    if (!query || isLoading) return;
+    if (!query || (isLoading && hasQueuedMessage)) return;
     if (blockedForNoSources) return;
     if (!isModelAvailable(model, apiKeys)) {
       setApiKeyModalProvider(getModelProvider(model));
@@ -215,14 +230,16 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     // has not been changed explicitly in this mount.
     if (chatId) persistSelectedModelForChat(chatId, projectId, model);
 
-    onSubmit?.({
+    const nextMessage = {
       role: "user",
       content: query,
       files: files.length > 0 ? files : undefined,
       workflow: wf ?? undefined,
       disabled_tools: [...disabledTools],
       model,
-    });
+    } satisfies DocketMessage;
+    if (isLoading) onQueueMessage?.(nextMessage);
+    else onSubmit?.(nextMessage);
   };
 
   const selectWorkflow = (workflow: DocketWorkflow) => {
@@ -247,7 +264,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
   };
 
   const handleActionClick = () => {
-    if (isLoading) {
+    if (isLoading && !value.trim()) {
       onCancel();
     } else {
       handleSubmit();
@@ -434,10 +451,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                 className="relative bg-gradient-to-b from-neutral-700 to-black text-white rounded-[10px] h-8 w-8 flex items-center justify-center cursor-pointer disabled:cursor-default disabled:from-neutral-600 disabled:to-black backdrop-blur-xl border border-white/30 active:enabled:scale-95 transition-all duration-150"
                 onClick={handleActionClick}
                 disabled={
-                  !isLoading && (!value.trim() || blockedForNoSources)
+                  (!isLoading && (!value.trim() || blockedForNoSources)) ||
+                  (isLoading && !!value.trim() && (hasQueuedMessage || blockedForNoSources))
                 }
               >
-                {isLoading ? (
+                {isLoading && !value.trim() ? (
                   <Square
                     className="h-4 w-4"
                     fill="currentColor"

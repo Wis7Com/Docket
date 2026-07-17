@@ -365,6 +365,7 @@ export interface TabularReview {
     title: string | null;
     columns_config: ColumnConfig[] | null;
     workflow_id: string | null;
+    model?: string | null;
     practice?: string | null;
     /** Per-review email list. Used so standalone (project_id null) reviews can be shared directly. */
     shared_with?: string[];
