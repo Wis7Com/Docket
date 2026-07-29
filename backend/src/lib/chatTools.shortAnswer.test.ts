@@ -174,6 +174,15 @@ test("runLLMStream continues a short document-tool answer exactly once", async (
             verified_count: 0,
             used_document_tools: true,
         });
+        const diagnostics = result.events.find(
+            (event) => event.type === "citation_diagnostics",
+        );
+        assert.equal(
+            diagnostics?.type === "citation_diagnostics"
+                ? diagnostics.orphan_marker_count
+                : null,
+            0,
+        );
         assert.equal(
             writes.some((value) =>
                 value.includes(

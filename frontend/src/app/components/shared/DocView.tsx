@@ -286,6 +286,7 @@ export function DocView({
         string | null
     >(null);
     const [annotationBusy, setAnnotationBusy] = useState(false);
+    const annotationCreateInFlightRef = useRef(false);
     const [annotationError, setAnnotationError] = useState<string | null>(null);
     const [annotationStatus, setAnnotationStatus] = useState<string | null>(
         null,
@@ -2086,7 +2087,13 @@ export function DocView({
     async function saveAnnotationPayload(
         payload: PdfAnnotationCreatePayload | null,
     ) {
-        if (!doc?.document_id || !payload) return;
+        if (
+            !doc?.document_id ||
+            !payload ||
+            annotationCreateInFlightRef.current
+        )
+            return;
+        annotationCreateInFlightRef.current = true;
         setAnnotationBusy(true);
         setAnnotationError(null);
         showAnnotationStatus("Saving...");
@@ -2105,6 +2112,7 @@ export function DocView({
                     : "Failed to save annotation.",
             );
         } finally {
+            annotationCreateInFlightRef.current = false;
             setAnnotationBusy(false);
         }
     }

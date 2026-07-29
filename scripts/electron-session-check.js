@@ -76,6 +76,8 @@ async function main() {
       DOCKET_SKIP_LIBREOFFICE_PROBE: "1",
       DOCKET_FRONTEND_PORT: String(frontendPort),
       DOCKET_FRONTEND_URL: frontendUrl,
+      DOCKET_DEBUG_INSERT_DELAY_MS:
+        process.env.DOCKET_DEBUG_INSERT_DELAY_MS ?? "2000",
       OPENAI_BASE_URL: fakeOpenAiBaseUrl,
       OPENAI_API_KEY: "session-check-openai-key",
       FREE_ROUTER_PROXY_BASE_URL: fakeOpenAiBaseUrl,
@@ -403,7 +405,9 @@ async function startFakeOpenAiServer() {
         ? "Session check source clause for citation promotion."
         : quote.replace(/\s+/g, " ").slice(0, 220);
       const answer = wantsSessionClause
-        ? 'The source clause says "Session check source clause for citation promotion." [1]\n\n' +
+        ? "| Source | Finding |\n" +
+          "| --- | --- |\n" +
+          '| 00-session-source.pdf | The source clause says "Session check source clause for citation promotion." [1] |\n\n' +
           "<CITATIONS>\n" +
           JSON.stringify(
             [

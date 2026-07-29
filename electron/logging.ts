@@ -5,6 +5,13 @@ import { resolveDataDir } from "./appData";
 let logStream: fs.WriteStream | null = null;
 let logPath: string | null = null;
 let redactor: ((s: string) => string) | null = null;
+let originalConsole:
+  | {
+      log: typeof console.log;
+      warn: typeof console.warn;
+      error: typeof console.error;
+    }
+  | null = null;
 
 const MAX_LOG_FILES = 10;
 
@@ -36,12 +43,46 @@ function rotateLogs(dir: string): void {
   }
 }
 
+function serializeLogArgs(args: unknown[]): string {
+  return args
+    .map((a) => {
+      if (typeof a === "string") return a;
+      if (a instanceof Error) return `${a.name}: ${a.message}\n${a.stack ?? ""}`;
+      try {
+        return JSON.stringify(a, null, 2);
+      } catch {
+        return String(a);
+      }
+    })
+    .join(" ");
+}
+
+export function appendLogLine(prefix: string, args: unknown[]): void {
+  if (!logStream) return;
+  const line = serializeLogArgs(args);
+  const redacted = redactor ? redactor(line) : line;
+  logStream.write(`[${new Date().toISOString()}] ${prefix} ${redacted}\n`);
+}
+
+export function logRendererConsoleMessage(
+  level: number,
+  message: string,
+  line: number,
+  sourceId: string,
+): void {
+  if (level < 2) return;
+  appendLogLine("[renderer]", [
+    `${level >= 3 ? "ERROR" : "WARN"} ${message} (${sourceId}:${line})`,
+  ]);
+}
+
 /**
  * Mirrors console + child-process output to a per-launch log file inside the
  * app-data `.docket/logs/` directory. Lets users (or us, remotely) inspect what
  * happened on a packaged build where there's no terminal attached.
  */
 export function initLogging(appDataPath: string): string {
+  if (logStream) closeLogging();
   const dir = path.join(resolveDataDir(appDataPath), "logs");
   fs.mkdirSync(dir, { recursive: true });
   rotateLogs(dir);
@@ -49,37 +90,24 @@ export function initLogging(appDataPath: string): string {
   logPath = path.join(dir, `docket-${stamp}.log`);
   logStream = fs.createWriteStream(logPath, { flags: "a" });
 
-  const writeLog = (prefix: string, args: unknown[]): void => {
-    if (!logStream) return;
-    const line = args
-      .map((a) => {
-        if (typeof a === "string") return a;
-        if (a instanceof Error) return `${a.name}: ${a.message}\n${a.stack ?? ""}`;
-        try {
-          return JSON.stringify(a, null, 2);
-        } catch {
-          return String(a);
-        }
-      })
-      .join(" ");
-    const redacted = redactor ? redactor(line) : line;
-    logStream.write(`[${new Date().toISOString()}] ${prefix} ${redacted}\n`);
-  };
-
-  const origLog = console.log.bind(console);
-  const origWarn = console.warn.bind(console);
-  const origErr = console.error.bind(console);
+  if (!originalConsole) {
+    originalConsole = {
+      log: console.log.bind(console),
+      warn: console.warn.bind(console),
+      error: console.error.bind(console),
+    };
+  }
   console.log = (...args: unknown[]) => {
-    writeLog("LOG ", args);
-    origLog(...args);
+    appendLogLine("LOG ", args);
+    originalConsole?.log(...args);
   };
   console.warn = (...args: unknown[]) => {
-    writeLog("WARN", args);
-    origWarn(...args);
+    appendLogLine("WARN", args);
+    originalConsole?.warn(...args);
   };
   console.error = (...args: unknown[]) => {
-    writeLog("ERR ", args);
-    origErr(...args);
+    appendLogLine("ERR ", args);
+    originalConsole?.error(...args);
   };
 
   return logPath;
@@ -113,4 +141,17 @@ export function closeLogging(): void {
     // ignore
   }
   logStream = null;
+  if (originalConsole) {
+    console.log = originalConsole.log;
+    console.warn = originalConsole.warn;
+    console.error = originalConsole.error;
+    originalConsole = null;
+  }
+}
+
+export function flushLoggingForTests(): Promise<void> {
+  if (!logStream) return Promise.resolve();
+  return new Promise((resolve) => {
+    logStream?.write("", () => resolve());
+  });
 }

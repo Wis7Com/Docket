@@ -30,7 +30,12 @@ import {
   getBackendExitInfo,
 } from "./backend";
 import { spawnFrontend, stopFrontend, waitForFrontend } from "./frontend";
-import { initLogging, getLogPath, closeLogging } from "./logging";
+import {
+  initLogging,
+  getLogPath,
+  closeLogging,
+  logRendererConsoleMessage,
+} from "./logging";
 
 const FRONTEND_URL = process.env.DOCKET_FRONTEND_URL ?? "http://localhost:3000";
 const FRONTEND_ORIGIN = new URL(FRONTEND_URL).origin;
@@ -45,6 +50,7 @@ let sessionJwt: string | null = null;
 let sessionSecret: string | null = null;
 let startingSession = false;
 const securityScopedAccessStops = new Map<string, () => void>();
+const rendererConsoleLoggingInstalled = new WeakSet<Electron.WebContents>();
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
@@ -133,6 +139,8 @@ function createWindow(): BrowserWindow {
     },
   );
 
+  installRendererConsoleLogging(w);
+
   // Window-scoped DevTools / log shortcuts. DevTools toggles are gated on
   // dev builds.
   w.webContents.on("before-input-event", (_e, input) => {
@@ -163,6 +171,21 @@ function createWindow(): BrowserWindow {
     }
   });
   return w;
+}
+
+function installRendererConsoleLogging(w: BrowserWindow): void {
+  if (rendererConsoleLoggingInstalled.has(w.webContents)) return;
+  rendererConsoleLoggingInstalled.add(w.webContents);
+  w.webContents.on("console-message", (details) => {
+    const level =
+      details.level === "error" ? 3 : details.level === "warning" ? 2 : 1;
+    logRendererConsoleMessage(
+      level,
+      details.message,
+      details.lineNumber,
+      details.sourceId,
+    );
+  });
 }
 
 function isFrontendOrigin(url: string): boolean {
@@ -277,6 +300,7 @@ function getOrCreateDocumentViewerWindow(): BrowserWindow {
   }
   documentViewerWindow = new BrowserWindow(documentViewerWindowOptions());
   documentViewerWindow.removeMenu();
+  installRendererConsoleLogging(documentViewerWindow);
   installNavigationGuards(documentViewerWindow);
   pinWindowZoom(documentViewerWindow);
   documentViewerWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -369,12 +393,6 @@ function installSessionCheck(w: BrowserWindow): void {
   if (defaultSessionCheck) {
     console.log("[session-check] default app-level session check enabled");
   }
-
-  // Surface renderer console output in the session-check log — hydration or
-  // chunk-load failures otherwise leave no trace outside DevTools.
-  w.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`);
-  });
 
   let finished = false;
   let featureSmokeRunning = false;
@@ -690,7 +708,7 @@ async function runSessionFeatureSmoke(
   );
   const realPromptInspection = await inspectRealPromptCitationDom(w, port);
   console.log(
-    `[session-check] real prompt complete: citations=${realPromptInspection.citationButtonCount} highlights=${realPromptInspection.temporaryHighlightCount} tabs=${realPromptInspection.tabCount} tab_nav=${realPromptInspection.tabNavigationVerified}`,
+    `[session-check] real prompt complete: citations=${realPromptInspection.citationButtonCount} highlights=${realPromptInspection.temporaryHighlightCount} answer_reload=${realPromptInspection.answerSurvivesReload} tabs=${realPromptInspection.tabCount} tab_nav=${realPromptInspection.tabNavigationVerified}`,
   );
   const projectFolderInspection = await inspectProjectFolderUpgradeDom(w, port);
   if (projectFolderInspection) {
@@ -726,7 +744,7 @@ async function runSessionFeatureSmoke(
   }
   return {
     ok: true,
-    summary: `imported=${result.imported} unchanged=${result.unchanged} ui_rescan=${uiRescan.summaryText} annotations=${result.annotations} dom_canvas=${domInspection.canvasCount} dom_overlays=${domInspection.savedAnnotationCount} text_select=${domInspection.textLayerSelection.pointerEvents}/${domInspection.textLayerSelection.userSelect}/${domInspection.textLayerSelection.spanUserSelect} ui_highlight=${domInspection.highlightAnnotationCount} ui_comment=${domInspection.commentAnnotationCount} selection_annotations=${domInspection.annotationCountAfterSelection} citation_highlights=${citationInspection.temporaryHighlightCount} citation_promotions=${citationInspection.citationPromotionCount} real_prompt_citations=${realPromptInspection.citationButtonCount} real_prompt_highlights=${realPromptInspection.temporaryHighlightCount} real_prompt_answer=${realPromptInspection.answerIncludesQuote} project_tabs=${realPromptInspection.tabCount} project_tab_nav=${realPromptInspection.tabNavigationVerified} project_tab_overflow=${realPromptInspection.tabStripOverflow}${projectFolderInspection ? ` project_folder_imported=${projectFolderInspection.imported} project_folder_index_ready=${projectFolderInspection.indexReady} project_folder_index_failed=${projectFolderInspection.indexFailed} project_folder_search=${projectFolderInspection.searchResults} project_folder_citations=${projectFolderInspection.citationButtonCount} project_folder_temp_highlights=${projectFolderInspection.temporaryHighlightCount} project_folder_promotions=${projectFolderInspection.citationPromotionCount} project_folder_ui_highlights=${projectFolderInspection.userHighlightCount} project_folder_ui_comments=${projectFolderInspection.userCommentCount} project_folder_no_doc_labels=${projectFolderInspection.answerAvoidsDocLabels} project_folder_citation_error=${Boolean(projectFolderInspection.citationError)}` : ""} pdf_button_export=${exportResult.clickedExportButton} exported_v=${exportResult.exportedVersion} pdf_bytes=${pdfInspection.byteLength}`,
+    summary: `imported=${result.imported} unchanged=${result.unchanged} ui_rescan=${uiRescan.summaryText} annotations=${result.annotations} dom_canvas=${domInspection.canvasCount} dom_overlays=${domInspection.savedAnnotationCount} text_select=${domInspection.textLayerSelection.pointerEvents}/${domInspection.textLayerSelection.userSelect}/${domInspection.textLayerSelection.spanUserSelect} ui_highlight=${domInspection.highlightAnnotationCount} ui_comment=${domInspection.commentAnnotationCount} selection_annotations=${domInspection.annotationCountAfterSelection} citation_highlights=${citationInspection.temporaryHighlightCount} citation_promotions=${citationInspection.citationPromotionCount} real_prompt_citations=${realPromptInspection.citationButtonCount} real_prompt_highlights=${realPromptInspection.temporaryHighlightCount} real_prompt_answer=${realPromptInspection.answerIncludesQuote} real_prompt_answer_reload=${realPromptInspection.answerSurvivesReload} project_tabs=${realPromptInspection.tabCount} project_tab_nav=${realPromptInspection.tabNavigationVerified} project_tab_overflow=${realPromptInspection.tabStripOverflow}${projectFolderInspection ? ` project_folder_imported=${projectFolderInspection.imported} project_folder_index_ready=${projectFolderInspection.indexReady} project_folder_index_failed=${projectFolderInspection.indexFailed} project_folder_search=${projectFolderInspection.searchResults} project_folder_citations=${projectFolderInspection.citationButtonCount} project_folder_temp_highlights=${projectFolderInspection.temporaryHighlightCount} project_folder_promotions=${projectFolderInspection.citationPromotionCount} project_folder_ui_highlights=${projectFolderInspection.userHighlightCount} project_folder_ui_comments=${projectFolderInspection.userCommentCount} project_folder_no_doc_labels=${projectFolderInspection.answerAvoidsDocLabels} project_folder_citation_error=${Boolean(projectFolderInspection.citationError)}` : ""} pdf_button_export=${exportResult.clickedExportButton} exported_v=${exportResult.exportedVersion} pdf_bytes=${pdfInspection.byteLength}`,
   };
 }
 
@@ -1962,6 +1980,7 @@ async function inspectRealPromptCitationDom(
   citationButtonCount: number;
   temporaryHighlightCount: number;
   answerIncludesQuote: boolean;
+  answerSurvivesReload: boolean;
   tabNavigationVerified: boolean;
   tabCount: number;
   tabStripOverflow: boolean;
@@ -1972,6 +1991,7 @@ async function inspectRealPromptCitationDom(
       citationButtonCount: 0,
       temporaryHighlightCount: 0,
       answerIncludesQuote: false,
+      answerSurvivesReload: false,
       tabNavigationVerified: false,
       tabCount: 0,
       tabStripOverflow: false,
@@ -2256,13 +2276,17 @@ async function inspectRealPromptCitationDom(
           const textarea = document.querySelector('[data-session-check="chat-input-textarea"]');
           const submit = document.querySelector('[data-session-check="chat-submit"]');
           const token = await window.docket?.getToken?.();
+          const activeChatId = location.pathname.split("/").filter(Boolean).at(-1);
           let serverMessages = [];
           let serverError = null;
-          if (token) {
+          if (token && activeChatId) {
             try {
-              const response = await fetch("http://localhost:${port}/chat/${setup.chatId}", {
+              const response = await fetch(
+                "http://localhost:${port}/chat/" + encodeURIComponent(activeChatId),
+                {
                 headers: { Authorization: "Bearer " + token },
-              });
+                },
+              );
               if (!response.ok) {
                 serverError = response.status + " " + await response.text();
               } else {
@@ -2293,6 +2317,7 @@ async function inspectRealPromptCitationDom(
           return {
             readyState: document.readyState,
             url: location.href,
+            activeChatId,
             textarea: Boolean(textarea),
             textareaValue: textarea?.value || "",
             submit: Boolean(submit),
@@ -2340,13 +2365,34 @@ async function inspectRealPromptCitationDom(
           60000,
           diagnostics,
         );
-        const answerIncludesQuote = document.body.innerText.includes("Session check source clause for citation promotion.");
-        if (!answerIncludesQuote) {
-          throw new Error("real prompt answer did not include the expected source quote");
-        }
+        await waitFor("real prompt finalize", async () => {
+          const state = await diagnostics();
+          const submit = document.querySelector('[data-session-check="chat-submit"]');
+          const isStreaming = Boolean(submit?.querySelector("svg.lucide-square"));
+          const persistedAssistant = state.serverMessages.at(-1);
+          const answerIncludesQuote = document.body.innerText.includes(
+            "Session check source clause for citation promotion."
+          );
+          const citationStillPresent = Boolean(
+            document.querySelector(
+              '[data-session-check="assistant-citation-button"][data-citation-ref="1"]'
+            )
+          );
+          return (
+            !isStreaming &&
+            persistedAssistant?.role === "assistant" &&
+            persistedAssistant.contentPreview.includes(
+              "Session check source clause for citation promotion."
+            ) &&
+            answerIncludesQuote &&
+            citationStillPresent
+          );
+        }, 60000, diagnostics);
         return {
           citationButtonCount: document.querySelectorAll('[data-session-check="assistant-citation-button"]').length,
-          answerIncludesQuote,
+          answerIncludesQuote: document.body.innerText.includes(
+            "Session check source clause for citation promotion."
+          ),
         };
       })()
     `,
@@ -2355,6 +2401,32 @@ async function inspectRealPromptCitationDom(
     citationButtonCount: number;
     answerIncludesQuote: boolean;
   };
+
+  await w.webContents.reload();
+  const answerSurvivesReload = (await w.webContents.executeJavaScript(
+    `
+      (async () => {
+        const deadline = Date.now() + 30000;
+        while (Date.now() < deadline) {
+          const hasAnswer = document.body.innerText.includes(
+            "Session check source clause for citation promotion."
+          );
+          const hasCitation = Boolean(
+            document.querySelector(
+              '[data-session-check="assistant-citation-button"][data-citation-ref="1"]'
+            )
+          );
+          if (hasAnswer && hasCitation) return true;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        throw new Error(
+          "citation-bearing table answer disappeared after chat reload: " +
+            document.body.innerText.slice(0, 800)
+        );
+      })()
+    `,
+    true,
+  )) as boolean;
 
   const highlightInspection = (await w.webContents.executeJavaScript(
     `
@@ -2470,6 +2542,7 @@ async function inspectRealPromptCitationDom(
     citationButtonCount: buttonInspection.citationButtonCount,
     temporaryHighlightCount: highlightInspection.temporaryHighlightCount,
     answerIncludesQuote: buttonInspection.answerIncludesQuote,
+    answerSurvivesReload,
     ...tabNavigationInspection,
   };
 }
@@ -3062,6 +3135,10 @@ function cleanupChildProcesses(): void {
 }
 
 if (hasSingleInstanceLock) {
+  app.on("browser-window-created", (_event, createdWindow) => {
+    installRendererConsoleLogging(createdWindow);
+  });
+
   app.whenReady().then(() => {
     installAppIcon();
     installCsp();

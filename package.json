@@ -24,6 +24,7 @@
     "build": "npm run build:electron && npm run build:backend && npm run build:frontend",
     "pretest:electron-session": "node scripts/check-node-version.js && node scripts/ensure-dev-native-modules.js",
     "test:electron-session": "npm run build:electron && node scripts/electron-session-check.js",
+    "test:electron-logging": "node --import tsx --test electron/logging.test.ts",
     "pretest:e2e-interactive": "node scripts/check-node-version.js",
     "test:e2e-interactive": "npm run build:electron && node scripts/interactive-e2e.js",
     "fetch:libreoffice": "node scripts/fetch-libreoffice.js",

@@ -37,6 +37,7 @@ import {
   isModelAvailable,
   type ModelProvider,
 } from "@/app/lib/modelAvailability";
+import { updateLastAssistantContentEvent } from "@/app/lib/assistantStream.logic";
 import { preprocessTRCitations } from "./tabularCitationPresentation";
 
 // ---------------------------------------------------------------------------
@@ -225,6 +226,7 @@ function TRAssistantMessage({
   {
     let current: Extract<TREventGroup, { kind: "pre" }> | null = null;
     events.forEach((e, i) => {
+      if (e.type === "citation_summary" || e.type === "citation_diagnostics") return;
       if (e.type === "content") {
         if (current) {
           groups.push(current);
@@ -547,17 +549,6 @@ function HistoryDropdown({
 }
 
 // ---------------------------------------------------------------------------
-// Drip helpers
-// ---------------------------------------------------------------------------
-
-function findLastContentIndex(events: AssistantEvent[]): number {
-  for (let i = events.length - 1; i >= 0; i--) {
-    if (events[i].type === "content") return i;
-  }
-  return -1;
-}
-
-// ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
@@ -741,18 +732,7 @@ export function TRChatPanel({
     text: string,
     isStreaming?: boolean,
   ): TRMessage[] {
-    const updated = [...prev];
-    const last = updated[updated.length - 1];
-    if (last?.role !== "assistant") return prev;
-    const evts = last.events ?? [];
-    const idx = findLastContentIndex(evts);
-    if (idx < 0) return prev;
-    const newEvents = [...evts];
-    newEvents[idx] = isStreaming
-      ? { type: "content", text, isStreaming: true }
-      : { type: "content", text };
-    updated[updated.length - 1] = { ...last, events: newEvents };
-    return updated;
+    return updateLastAssistantContentEvent(prev, text, isStreaming);
   }
 
   // Mirror the dripped content text onto eventsRef.current so that any
@@ -760,19 +740,19 @@ export function TRChatPanel({
   // updateMatchingEvent, reasoning_*, etc.) doesn't wipe out the content
   // by replacing it with the stale empty placeholder.
   function syncDripIntoEventsRef(text: string, isStreaming: boolean) {
-    const evts = eventsRef.current;
-    const idx = findLastContentIndex(evts);
-    if (idx < 0) return;
-    const newEvents = [...evts];
-    newEvents[idx] = isStreaming
-      ? { type: "content", text, isStreaming: true }
-      : { type: "content", text };
-    eventsRef.current = newEvents;
+    const current = [{ role: "assistant" as const, events: eventsRef.current }];
+    const updated = updateLastAssistantContentEvent(
+      current,
+      text,
+      isStreaming,
+    );
+    if (updated !== current) eventsRef.current = updated[0].events ?? [];
   }
 
   function flushDrip() {
     stopDrip();
     const target = dripTargetRef.current;
+    if (target === "") return;
     dripDisplayLenRef.current = target.length;
     syncDripIntoEventsRef(target, false);
     setMessages((prev) => updateLastContentEvent(prev, target));

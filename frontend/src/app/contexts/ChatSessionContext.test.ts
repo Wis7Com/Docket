@@ -12,6 +12,7 @@ import {
   getStreamingSessions,
   subscribeToChatSession,
   updateActiveChatSession,
+  updateStreamingChatSessionMessages,
 } from "./ChatSessionContext";
 
 function session(overrides: Partial<Parameters<typeof beginChatSession>[0]> = {}) {
@@ -100,6 +101,68 @@ test("terminal snapshots remain attachable, flush explicitly, and are capped", (
   const terminalCount = [...getChatSessionsSnapshot().values()]
     .filter(({ status }) => status !== "streaming").length;
   assert.ok(terminalCount <= 4);
+});
+
+test("finishing a stream can atomically install hydrated terminal messages", () => {
+  const token = beginChatSession(session({
+    chatId: "hydrate-on-finish",
+    messages: [{ role: "assistant", content: "", events: [{ type: "content", text: "streamed" }] }],
+  }));
+  const hydrated = [
+    { role: "user" as const, content: "question" },
+    { role: "assistant" as const, content: "", events: [{ type: "content" as const, text: "hydrated" }] },
+  ];
+
+  finishActiveChatSession(token, "completed", { messages: hydrated });
+
+  assert.equal(getSessionByToken(token)?.status, "completed");
+  assert.equal(getSessionByToken(token)?.messages, hydrated);
+});
+
+test("a status flip cannot drop terminal hydration and warns on stale stream writes", () => {
+  const token = beginChatSession(session({
+    chatId: "status-flip-during-heal",
+    messages: [{
+      role: "assistant",
+      content: "",
+      events: [{ type: "content", text: "streamed answer" }],
+    }],
+  }));
+  finishActiveChatSession(token, "completed");
+
+  const warnings: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args); };
+  try {
+    assert.equal(
+      updateStreamingChatSessionMessages(token, [{
+        role: "assistant",
+        content: "",
+        events: [{ type: "content", text: "" }],
+      }]),
+      false,
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.match(String(warnings[0]?.[0]), /dropped streaming message update/);
+  assert.equal(
+    (warnings[0]?.[1] as { status?: string })?.status,
+    "completed",
+  );
+
+  const hydrated = [{
+    role: "assistant" as const,
+    content: "",
+    events: [{ type: "content" as const, text: "full hydrated answer" }],
+  }];
+  finishActiveChatSession(token, "completed", { messages: hydrated });
+  assert.equal(
+    getSessionByToken(token)?.messages[0].events?.[0]?.type === "content"
+      ? getSessionByToken(token)?.messages[0].events?.[0].text
+      : null,
+    "full hydrated answer",
+  );
 });
 
 test("provider teardown aborts every streaming controller", () => {

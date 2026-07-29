@@ -9,7 +9,9 @@ import {
   citationRepairBody,
   citationRepairEnabled,
   parseCitationRepairResponse,
+  reattachOrphanCitationEntries,
   shouldAttemptCitationRepair,
+  type CitationRepairCitation,
   type CitationRepairPlan,
   type QuoteCandidate,
 } from "./citationRepair";
@@ -18,7 +20,9 @@ test("citation repair defaults on for short answers and requires document eviden
   const eligible = {
     answerText: "short answer",
     calledToolNames: ["search_project_documents"],
-    discardedCitationCount: 1,
+    orphanMarkerCount: 1,
+    discardedCitationCount: 0,
+    verifiedCitationCount: 1,
   };
   assert.equal(shouldAttemptCitationRepair(eligible), true);
   assert.equal(citationRepairEnabled(undefined), true);
@@ -47,13 +51,97 @@ test("citation repair defaults on for short answers and requires document eviden
     false,
   );
   assert.equal(
-    shouldAttemptCitationRepair({ ...eligible, discardedCitationCount: 0 }),
+    shouldAttemptCitationRepair({ ...eligible, orphanMarkerCount: 0 }),
     false,
   );
   assert.equal(
     shouldAttemptCitationRepair({ ...eligible, repairAttempted: true }),
     false,
   );
+});
+
+test("citation repair gate accepts the union of deficiency signals", () => {
+  const clean = {
+    answerText: "grounded answer",
+    calledToolNames: ["search_project_documents"],
+    orphanMarkerCount: 0,
+    discardedCitationCount: 0,
+    verifiedCitationCount: 1,
+  };
+  assert.equal(shouldAttemptCitationRepair(clean), false);
+  assert.equal(
+    shouldAttemptCitationRepair({ ...clean, orphanMarkerCount: 1 }),
+    true,
+  );
+  assert.equal(
+    shouldAttemptCitationRepair({ ...clean, discardedCitationCount: 1 }),
+    true,
+  );
+  assert.equal(
+    shouldAttemptCitationRepair({ ...clean, verifiedCitationCount: 0 }),
+    true,
+  );
+});
+
+test("deterministic repair reattaches verified marker-less citation entries", () => {
+  const filename = "summary-judgment-motion.pdf";
+  const citations: CitationRepairCitation[] = Array.from(
+    { length: 16 },
+    (_, index) => ({
+      ref: index + 1,
+      doc_id: "doc-0",
+      page: index === 0 ? 99 : index + 1,
+      quote: `Exact source quote ${index + 1} contains enough words.`,
+      chunk_id: `chunk-${index + 1}`,
+    }),
+  );
+  const pseudoCitations = Array.from(
+    { length: 18 },
+    (_, index) => `| Issue ${index + 1} | Supported claim [${filename}, p. ${index + 1}] |`,
+  ).join("\n");
+  const answer = `| Issue | Analysis |\n| --- | --- |\n${pseudoCitations}\n\n<CITATIONS>\n${JSON.stringify(citations)}\n</CITATIONS>`;
+
+  const result = reattachOrphanCitationEntries(answer, citations, {
+    "doc-0": filename,
+  }, Object.fromEntries(
+    Array.from({ length: 16 }, (_, index) => [index + 1, index + 1]),
+  ));
+
+  assert.equal(result.citations.length, 16);
+  assert.deepEqual(
+    Array.from((result.text ?? "").matchAll(/\[(\d+)\]/g), (match) =>
+      Number.parseInt(match[1], 10),
+    ),
+    Array.from({ length: 16 }, (_, index) => index + 1),
+  );
+  assert.equal(
+    Array.from(
+      (result.text ?? "").matchAll(
+        new RegExp(`\\[${filename.replace(/\./g, "\\.")}, p\\. \\d+\\]`, "g"),
+      ),
+    ).length,
+    2,
+  );
+});
+
+test("deterministic repair falls back to the sentence containing the quote", () => {
+  const citation: CitationRepairCitation = {
+    ref: 4,
+    doc_id: "doc-0",
+    page: 9,
+    quote: "The exact quoted clause controls this dispute",
+  };
+  const result = reattachOrphanCitationEntries(
+    "The exact quoted clause controls this dispute and resolves the issue. A second sentence follows.",
+    [citation],
+    { "doc-0": "source.pdf" },
+  );
+
+  assert.match(
+    result.text ?? "",
+    /resolves the issue\. \[4\] A second sentence/,
+  );
+  assert.deepEqual(result.citations, [citation]);
 });
 
 test("candidate menu extracts exact structured and raw-page sentences", () => {
@@ -206,6 +294,14 @@ test("repair request exposes only answer body and numbered menu", () => {
     request.systemPrompt,
     /do not write, alter, or paraphrase any quote/i,
   );
+  assert.match(
+    request.systemPrompt,
+    /Filename\/page pseudo-citations .* are invalid output but useful location hints/,
+  );
+  assert.match(
+    request.systemPrompt,
+    /never include the pseudo-citation itself/,
+  );
   assert.match(request.userPrompt, /quote_candidate_menu/);
   assert.doesNotMatch(request.userPrompt, /"doc_id":"bad"/);
   assert.deepEqual(request.candidates, candidates);
@@ -237,6 +333,31 @@ test("mapping parser enforces schema, anchor bounds, and candidate range", () =>
   assert.equal(
     parseCitationRepairResponse(
       '{"mappings":[{"anchor_text":"short","candidate_index":1}]}',
+      candidates,
+    ),
+    null,
+  );
+  const longButBoundedAnchor = "x".repeat(200);
+  assert.deepEqual(
+    parseCitationRepairResponse(
+      JSON.stringify({
+        mappings: [
+          { anchor_text: longButBoundedAnchor, candidate_index: 1 },
+        ],
+      }),
+      candidates,
+    ),
+    {
+      mappings: [{ anchor_text: longButBoundedAnchor, candidate_index: 1 }],
+    },
+  );
+  assert.equal(
+    parseCitationRepairResponse(
+      JSON.stringify({
+        mappings: [
+          { anchor_text: "x".repeat(501), candidate_index: 1 },
+        ],
+      }),
       candidates,
     ),
     null,

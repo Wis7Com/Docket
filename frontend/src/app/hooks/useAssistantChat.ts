@@ -20,6 +20,11 @@ import {
     shouldRouteWriteToSession,
 } from "@/app/lib/chatSession.logic";
 import {
+    finalizedMessagesWithHydratedTail,
+    findLastContentIndex,
+    updateLastAssistantContentEvent,
+} from "@/app/lib/assistantStream.logic";
+import {
     EMPTY_SESSIONS,
     beginChatSession,
     beginWaitingChatSession,
@@ -33,6 +38,7 @@ import {
     subscribeToChatSession,
     takeQueuedMessage,
     updateActiveChatSession,
+    updateStreamingChatSessionMessages,
 } from "@/app/contexts/ChatSessionContext";
 import {
     enqueueGpuJob,
@@ -50,13 +56,6 @@ interface UseAssistantChatOptions {
     initialMessages?: DocketMessage[];
     chatId?: string;
     projectId?: string;
-}
-
-function findLastContentIndex(events: AssistantEvent[]): number {
-    for (let i = events.length - 1; i >= 0; i--) {
-        if (events[i].type === "content") return i;
-    }
-    return -1;
 }
 
 export function useAssistantChat({
@@ -191,24 +190,7 @@ export function useAssistantChat({
         setChatId(initialChatId);
     }, [initialChatId]);
 
-    const updateLastContentEvent = (
-        prev: DocketMessage[],
-        text: string,
-        isStreaming?: boolean,
-    ): DocketMessage[] => {
-        const updated = [...prev];
-        const last = updated[updated.length - 1];
-        if (last?.role !== "assistant") return prev;
-        const events = last.events ?? [];
-        const idx = findLastContentIndex(events);
-        if (idx < 0) return prev;
-        const newEvents = [...events];
-        newEvents[idx] = isStreaming
-            ? { type: "content", text, isStreaming: true }
-            : { type: "content", text };
-        updated[updated.length - 1] = { ...last, events: newEvents };
-        return updated;
-    };
+    const updateLastContentEvent = updateLastAssistantContentEvent<DocketMessage>;
 
     const cancel = () => {
         const active = getActiveChatSession(chatId, projectId);
@@ -370,12 +352,12 @@ export function useAssistantChat({
         };
         let streamToken: symbol | null = null;
         const updateStreamMessages = (update: SetStateAction<DocketMessage[]>) => {
-            const active = getSessionByToken(stream.token);
-            if (!active || active.status !== "streaming") return;
-            const next = typeof update === "function"
-                ? (update as (value: DocketMessage[]) => DocketMessage[])(active.messages)
-                : update;
-            updateActiveChatSession({ messages: next }, stream.token);
+            updateStreamingChatSessionMessages(
+                stream.token,
+                update as
+                    | DocketMessage[]
+                    | ((messages: DocketMessage[]) => DocketMessage[]),
+            );
         };
         const updateStreamLoading = (update: SetStateAction<boolean>) => {
             const active = getSessionByToken(stream.token);
@@ -404,6 +386,7 @@ export function useAssistantChat({
         };
         const flushDrip = () => {
             stopDrip();
+            if (stream.dripTarget === "") return;
             stream.dripDisplayLen = stream.dripTarget.length;
             setMessages((prev) => updateLastContentEvent(prev, stream.dripTarget));
         };
@@ -933,6 +916,28 @@ export function useAssistantChat({
                             continue;
                         }
 
+                        if (data.type === "annotation_read") {
+                            pushEvent({
+                                type: "annotation_read",
+                                returned:
+                                    typeof data.returned === "number"
+                                        ? data.returned
+                                        : 0,
+                                total:
+                                    typeof data.total === "number"
+                                        ? data.total
+                                        : 0,
+                                filenames: Array.isArray(data.filenames)
+                                    ? data.filenames.filter(
+                                          (filename: unknown): filename is string =>
+                                              typeof filename === "string",
+                                      )
+                                    : [],
+                            });
+                            pushThinkingPlaceholder();
+                            continue;
+                        }
+
                         if (data.type === "doc_created_start") {
                             pushEvent({
                                 type: "doc_created",
@@ -1147,20 +1152,25 @@ export function useAssistantChat({
 
             const finalChatId = streamedChatId || chatId || null;
             let completedChatTitle: string | null = null;
+            let hydratedTerminalMessages: DocketMessage[] | undefined;
             if (finalChatId) {
                 try {
                     const detail = await getChat(finalChatId);
                     completedChatTitle = detail.chat.title;
-                    setMessages((localMessages) => {
-                        const fetchedLast = detail.messages.at(-1);
-                        const fetchedHasAssistant =
-                            fetchedLast?.role === "assistant";
-                        if (
-                            fetchedHasAssistant ||
-                            detail.messages.length >= localMessages.length
-                        ) {
-                            return detail.messages;
-                        }
+                    const active = getSessionByToken(streamToken);
+                    const localMessages = active?.messages ?? [];
+                    const next = finalizedMessagesWithHydratedTail(
+                        localMessages,
+                        detail.messages,
+                    );
+                    hydratedTerminalMessages = next;
+                    if (!active) {
+                        console.warn(
+                            "[useAssistantChat] could not hydrate completed chat because the stream session is missing",
+                            { chatId: finalChatId },
+                        );
+                    }
+                    if (next !== detail.messages) {
                         // A slow assistant-row insert can briefly make a
                         // completed chat look shorter than the in-memory SSE
                         // transcript. Preserve the final content_replace and
@@ -1173,8 +1183,7 @@ export function useAssistantChat({
                                 fetchedCount: detail.messages.length,
                             },
                         );
-                        return localMessages;
-                    });
+                    }
                 } catch (err) {
                     console.warn(
                         "[useAssistantChat] failed to hydrate completed chat:",
@@ -1228,7 +1237,9 @@ export function useAssistantChat({
                 void generateTitle(finalChatIdForTitle, titleParts.join("\n"));
             }
 
-            finishActiveChatSession(streamToken, "completed");
+            finishActiveChatSession(streamToken, "completed", {
+                messages: hydratedTerminalMessages,
+            });
             const queuedAfterCompletion = takeQueuedMessage(streamToken);
             if (queuedAfterCompletion) {
                 const terminal = getSessionByToken(streamToken);

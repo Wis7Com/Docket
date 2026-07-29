@@ -65,6 +65,7 @@ import {
     citationRepairBody,
     isCitationRepairDocumentTool,
     parseCitationRepairResponse,
+    reattachOrphanCitationEntries,
     shouldAttemptCitationRepair,
     type CitationRepairEvidence,
 } from "./citationRepair";
@@ -129,6 +130,13 @@ export type ToolCall = {
     function: { name: string; arguments: string };
 };
 
+export function identicalToolCallKey(
+    name: string,
+    argumentsJson: string,
+): string {
+    return JSON.stringify([name, argumentsJson]);
+}
+
 export type ChatMessage = {
     role: string;
     content: string | null;
@@ -189,6 +197,7 @@ Rules:
 - For a single-page quote, set "page" to an integer. If a quote is one continuous sentence that spans two pages, set "page" to "N-M" and insert [[PAGE_BREAK]] in the quote at the page break. Otherwise, use separate citations for text on different pages
 - Put the <CITATIONS> block at the very end of the response. Omit it entirely if there are no citations
 - A citation marker and a citation entry are a one-to-one relationship. Never reuse a ref, omit a ref, or add an unused entry. If you cannot supply a complete, exact citation, omit that marker instead.
+- Never cite as [filename] or [filename, p. N] in prose. Those are dead text, not citation links. Every document citation in prose must be a numeric [N] marker with a matching <CITATIONS> entry.
 - When an indexed search/read result includes a chunk_id, copy that exact chunk_id into the citation entry. Never invent a chunk_id, page, or quote. The server verifies citations against the indexed source text and will discard any mismatch.
 - In Markdown tables, place each [N] marker at the end of the supported claim inside the relevant cell. A table does not waive or replace the citation contract.
 
@@ -218,6 +227,9 @@ When a user message begins with a [Workflow: <title> (id: <id>)] marker, the use
 
 DOCUMENT NAMING IN PROSE:
 The chat-local labels ("doc-0", "doc-1", "doc-N", …) are internal handles for tool calls and citation JSON ONLY. NEVER write them in your prose response or in any text the user reads — not in body text, not in headings, not in lists, not in tool-activity descriptions. The user does not know what "doc-0" means and seeing it is jarring. When referring to a document in prose, always use its filename (e.g. "the NDA draft" or "nda_v1.docx"). This rule applies to every word streamed back to the user; the only places "doc-N" identifiers are allowed are inside tool-call arguments and inside the <CITATIONS> JSON block's "doc_id" field.
+
+ANNOTATION COVERAGE:
+When the user asks for a per-highlight or per-annotation review (for example "each highlighted argument", "pair each highlight", or "analyze my marked passages"), you MUST account for every retrieved highlight or annotation. Each item must either be mapped to a row or section, explicitly grouped with named siblings (for example "p.12 and p.17 are treated together as the targeting argument"), or explicitly excluded with a short reason (for example "p.4 and p.8 are table-of-authorities lines, not arguments"). Silent merges and omissions are prohibited; all highlights are accounted for or explicitly grouped.
 
 GENERAL GUIDANCE:
 - Be precise and professional
@@ -2264,6 +2276,27 @@ function annotationIsCurrent(
     );
 }
 
+function dedupeAnnotationRows(
+    rows: readonly PdfAnnotationToolRow[],
+): PdfAnnotationToolRow[] {
+    const seen = new Set<string>();
+    return rows.filter((row) => {
+        const quote = row.quote?.trim();
+        // Independent comments commonly have no quote. Do not collapse them
+        // merely because they share a page and color.
+        if (!quote) return true;
+        const key = JSON.stringify([
+            row.document_id,
+            row.page_number,
+            quote,
+            normalizeAnnotationHex(row.color) ?? row.color,
+        ]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
 function summarizeAnnotationRows(
     rows: PdfAnnotationToolRow[],
     infoByDocumentId: Map<string, DocIndex[string]>,
@@ -2417,8 +2450,10 @@ export async function fetchUserPdfAnnotations(args: {
             [...allInfoByDocumentId].map(([id, info]) => [id, info.version_id]),
         ),
     });
-    const projectRows = projectQuery.data.filter((row) =>
-        annotationIsCurrent(row, allInfoByDocumentId),
+    const projectRows = dedupeAnnotationRows(
+        projectQuery.data.filter((row) =>
+            annotationIsCurrent(row, allInfoByDocumentId),
+        ),
     );
     if (candidates.length === 0) {
         return {
@@ -2481,7 +2516,7 @@ export async function fetchUserPdfAnnotations(args: {
     }
 
     const requestedFamilies = new Set(args.colorFamily ?? []);
-    const rows = data
+    const rowsWithDuplicates = data
         .filter((row) => annotationIsCurrent(row, infoByDocumentId))
         .filter((row) => {
             if (
@@ -2516,6 +2551,7 @@ export async function fetchUserPdfAnnotations(args: {
                 a.id.localeCompare(b.id)
             );
         });
+    const rows = dedupeAnnotationRows(rowsWithDuplicates);
     const annotations = rows
         .slice(boundedOffset, boundedOffset + boundedLimit)
         .map((row) => {
@@ -3004,6 +3040,11 @@ export async function runToolCalls(
     toolResults: unknown[];
     docsRead: { filename: string; document_id?: string }[];
     docsFound: { filename: string; query: string; total_matches: number }[];
+    annotationReads: {
+        returned: number;
+        total: number;
+        filenames: string[];
+    }[];
     docsCreated: DocCreatedResult[];
     docsReplicated: DocReplicatedResult[];
     workflowsApplied: { workflow_id: string; title: string }[];
@@ -3021,6 +3062,11 @@ export async function runToolCalls(
         filename: string;
         query: string;
         total_matches: number;
+    }[] = [];
+    const annotationReads: {
+        returned: number;
+        total: number;
+        filenames: string[];
     }[] = [];
     const docsCreated: DocCreatedResult[] = [];
     const docsReplicated: DocReplicatedResult[] = [];
@@ -3303,6 +3349,30 @@ export async function runToolCalls(
                         ? args.order
                         : undefined,
                 limit: typeof args.limit === "number" ? args.limit : undefined,
+            });
+            const annotations = Array.isArray(content.annotations)
+                ? (content.annotations as Array<Record<string, unknown>>)
+                : [];
+            annotationReads.push({
+                returned:
+                    typeof content.returned === "number"
+                        ? content.returned
+                        : annotations.length,
+                total:
+                    typeof content.total === "number"
+                        ? content.total
+                        : annotations.length,
+                filenames: [
+                    ...new Set(
+                        annotations
+                            .map((annotation) => annotation.filename)
+                            .filter(
+                                (filename): filename is string =>
+                                    typeof filename === "string" &&
+                                    filename.length > 0,
+                            ),
+                    ),
+                ],
             });
             toolResults.push({
                 role: "tool",
@@ -4315,6 +4385,7 @@ export async function runToolCalls(
         toolResults,
         docsRead,
         docsFound,
+        annotationReads,
         docsCreated,
         docsReplicated,
         workflowsApplied,
@@ -4722,6 +4793,10 @@ export function sanitizeAssistantVisibleText(
     }
 
     return cleaned
+        // Local models occasionally emit simple LaTeX wrappers in ordinary
+        // prose. They are not useful math and render literally in chat.
+        .replace(/\$\s*\\text\{([^{}]*)\}\s*\$/g, "$1")
+        .replace(/\$\s*\\dots\s*\$/g, "…")
         // Some models place a citation marker after repeated punctuation. Keep
         // the marker, but reduce the punctuation run to its final character:
         // "$160,, [2]" -> "$160, [2]", "Robocall,. [2]" -> "Robocall. [2]".
@@ -4783,6 +4858,30 @@ export function renumberCitations<T extends { ref: number }>(
         }))
         .sort((a, b) => a.ref - b.ref);
     return { text, citations: nextCitations };
+}
+
+export function citationMarkerRefs(text: string): number[] {
+    return [
+        ...new Set(
+            Array.from(
+                text.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g),
+            ).flatMap((match) =>
+                match[1]
+                    .split(",")
+                    .map((raw) => Number.parseInt(raw.trim(), 10))
+                    .filter((ref) => Number.isFinite(ref)),
+            ),
+        ),
+    ];
+}
+
+export function countOrphanCitationMarkers(
+    text: string,
+    citations: readonly { ref: number }[],
+): number {
+    const verifiedRefs = new Set(citations.map((citation) => citation.ref));
+    return citationMarkerRefs(text).filter((ref) => !verifiedRefs.has(ref))
+        .length;
 }
 
 export function dedupeCitationEvidence<
@@ -4867,6 +4966,12 @@ type AssistantEvent =
           total_matches: number;
       }
     | {
+          type: "annotation_read";
+          returned: number;
+          total: number;
+          filenames: string[];
+      }
+    | {
           type: "doc_created";
           filename: string;
           download_url: string;
@@ -4903,6 +5008,7 @@ type AssistantEvent =
           recovered: number;
           repair_attempted: boolean;
           repair_added: number;
+          orphan_marker_count: number;
           menu_candidates: number;
           mappings_proposed: number;
           mappings_accepted: number;
@@ -5100,6 +5206,7 @@ export async function runLLMStream(params: {
     let toolIteration = 0;
     const citationRepairToolNames: string[] = [];
     const citationRepairEvidence: CitationRepairEvidence[] = [];
+    const toolResultCache = new Map<string, string>();
     let citationRepairAttempted = false;
     let finalAnswerContinuationAttempted = false;
 
@@ -5306,17 +5413,54 @@ export async function runLLMStream(params: {
                             arguments: JSON.stringify(c.input),
                         },
                     }));
+                    const keyByCallId = new Map(
+                        toolCalls.map((call) => [
+                            call.id,
+                            identicalToolCallKey(
+                                call.function.name,
+                                call.function.arguments,
+                            ),
+                        ]),
+                    );
+                    const firstFreshCallByKey = new Map<string, ToolCall>();
+                    const repeatedCallSourceId = new Map<string, string>();
+                    const resultByCallId = new Map<string, string>();
+                    const freshToolCalls: ToolCall[] = [];
+                    for (const call of toolCalls) {
+                        const key = keyByCallId.get(call.id) as string;
+                        const cached = toolResultCache.get(key);
+                        if (cached !== undefined) {
+                            resultByCallId.set(call.id, cached);
+                            console.warn("[tools] repeated identical call", {
+                                name: call.function.name,
+                                source: "turn-cache",
+                            });
+                            continue;
+                        }
+                        const first = firstFreshCallByKey.get(key);
+                        if (first) {
+                            repeatedCallSourceId.set(call.id, first.id);
+                            console.warn("[tools] repeated identical call", {
+                                name: call.function.name,
+                                source: "same-batch",
+                            });
+                            continue;
+                        }
+                        firstFreshCallByKey.set(key, call);
+                        freshToolCalls.push(call);
+                    }
                     const {
                         toolResults,
                         docsRead,
                         docsFound,
+                        annotationReads,
                         docsCreated,
                         docsReplicated,
                         workflowsApplied,
                         docsEdited,
                         documentSummaries,
                     } = await runToolCalls(
-                        toolCalls,
+                        freshToolCalls,
                         docStore,
                         userId,
                         db,
@@ -5362,6 +5506,16 @@ export async function runLLMStream(params: {
                             total_matches: f.total_matches,
                         });
                     }
+                    for (const read of annotationReads) {
+                        const event: AssistantEvent = {
+                            type: "annotation_read",
+                            returned: read.returned,
+                            total: read.total,
+                            filenames: read.filenames,
+                        };
+                        events.push(event);
+                        write(`data: ${JSON.stringify(event)}\n\n`);
+                    }
                     for (const dl of docsCreated) {
                         events.push({
                             type: "doc_created",
@@ -5405,18 +5559,26 @@ export async function runLLMStream(params: {
                     // that directly — and fall back to an error result for any
                     // tool_use that didn't produce one, so Claude's next request
                     // has a tool_result for every tool_use it sent.
-                    const resultByCallId = new Map<string, string>();
                     for (const r of toolResults) {
                         const row = r as {
                             tool_call_id: string;
                             content?: unknown;
                         };
-                        resultByCallId.set(
-                            row.tool_call_id,
-                            String(row.content ?? ""),
-                        );
+                        const content = String(row.content ?? "");
+                        resultByCallId.set(row.tool_call_id, content);
+                        const key = keyByCallId.get(row.tool_call_id);
+                        if (key) toolResultCache.set(key, content);
                     }
-                    for (const call of calls) {
+                    for (const [callId, sourceId] of repeatedCallSourceId) {
+                        const content = resultByCallId.get(sourceId);
+                        if (content !== undefined) {
+                            resultByCallId.set(callId, content);
+                        }
+                    }
+                    const callById = new Map(calls.map((call) => [call.id, call]));
+                    for (const toolCall of freshToolCalls) {
+                        const call = callById.get(toolCall.id);
+                        if (!call) continue;
                         if (!isCitationRepairDocumentTool(call.name)) continue;
                         citationRepairToolNames.push(call.name);
                         const content = resultByCallId.get(call.id);
@@ -5548,6 +5710,7 @@ export async function runLLMStream(params: {
     let repairAddedCitationCount = 0;
     let citationMappingDiagnosticCounts: CitationMappingDiagnosticCounts =
         citationMappingDiagnostics();
+    let orphanMarkerCount = 0;
     if (!buildCitations) {
         const supportsLocalRecovery =
             selectedModel.startsWith("ollama:") ||
@@ -5575,13 +5738,85 @@ export async function runLLMStream(params: {
             }
         }
 
+        const orphanCitationRefs = new Set(
+            contract.errors
+                .filter((error) => error.code === "orphan_citation")
+                .map((error) => error.ref)
+                .filter((ref): ref is number => ref !== undefined),
+        );
+        const orphanCitationEvidence = validateCitationEvidence(
+            parsedCitations.filter((citation) =>
+                orphanCitationRefs.has(citation.ref),
+            ),
+            docIndex,
+        );
+        citationErrorGroups.push(orphanCitationEvidence.errors);
+        const deterministicReattachment = reattachOrphanCitationEntries(
+            citationText,
+            orphanCitationEvidence.citations,
+            Object.fromEntries(
+                Object.entries(docIndex).map(([docId, info]) => [
+                    docId,
+                    info.filename,
+                ]),
+            ),
+            Object.fromEntries(
+                parsedCitations.map((citation) => [
+                    citation.ref,
+                    citation.page,
+                ]),
+            ),
+        );
+        if (deterministicReattachment.text) {
+            citationText = deterministicReattachment.text;
+            const citationsByRef = new Map(
+                verifiedCitations.map((citation) => [citation.ref, citation]),
+            );
+            for (const citation of deterministicReattachment.citations) {
+                citationsByRef.set(citation.ref, citation);
+            }
+            verifiedCitations = Array.from(citationsByRef.values());
+            recoveredCitationCount +=
+                deterministicReattachment.citations.length;
+        }
+
+        // Evaluate the LLM-repair gate against what remains after both local
+        // recovery paths, while retaining the original validation groups for
+        // persisted diagnostics.
+        const remainingContract = validateCitationContract(
+            citationText,
+            parsedCitations,
+            docIndex,
+        );
+        const remainingEvidence = validateCitationEvidence(
+            remainingContract.citations,
+            docIndex,
+        );
+        const verifiedByRef = new Map(
+            verifiedCitations.map((citation) => [citation.ref, citation]),
+        );
+        for (const citation of remainingEvidence.citations) {
+            verifiedByRef.set(citation.ref, citation);
+        }
+        verifiedCitations = Array.from(verifiedByRef.values());
+        const remainingDiscardCounts = countCitationDiscards([
+            remainingContract.errors,
+            remainingEvidence.errors,
+        ]);
+        const discardedCitationCount = Object.values(
+            remainingDiscardCounts,
+        ).reduce((total, count) => total + count, 0);
+        orphanMarkerCount = countOrphanCitationMarkers(
+            stripCitationBlock(citationText),
+            verifiedCitations,
+        );
         if (
             shouldAttemptCitationRepair({
-                answerText,
+                answerText: citationText,
                 calledToolNames: citationRepairToolNames,
-                discardedCitationCount: Object.values(
-                    countCitationDiscards(citationErrorGroups),
-                ).reduce((total, count) => total + count, 0),
+                orphanMarkerCount,
+                discardedCitationCount,
+                verifiedCitationCount: verifiedCitations.length,
                 envValue: process.env.DOCKET_CITATION_REPAIR,
                 repairAttempted: citationRepairAttempted,
             })
@@ -5589,7 +5824,7 @@ export async function runLLMStream(params: {
             citationRepairAttempted = true;
             try {
                 const request = buildCitationRepairRequest({
-                    answerText,
+                    answerText: citationText,
                     evidence: citationRepairEvidence,
                 });
                 citationMappingDiagnosticCounts = citationMappingDiagnostics({
@@ -5611,7 +5846,7 @@ export async function runLLMStream(params: {
                     );
                     const repairResult = repairPlan
                         ? applyCitationRepairPlan(
-                              answerText,
+                              citationText,
                               repairPlan,
                               request.candidates,
                           )
@@ -5694,6 +5929,7 @@ export async function runLLMStream(params: {
             recovered: recoveredCitationCount,
             repairAttempted: citationRepairAttempted,
             repairAdded: repairAddedCitationCount,
+            orphanMarkerCount,
             ...citationMappingDiagnosticCounts,
         });
     }
@@ -5766,6 +6002,7 @@ export async function runLLMStream(params: {
         recovered: recoveredCitationCount,
         repair_attempted: citationRepairAttempted,
         repair_added: repairAddedCitationCount,
+        orphan_marker_count: orphanMarkerCount,
         ...citationMappingDiagnosticCounts,
     };
     events.push(citationDiagnostics);

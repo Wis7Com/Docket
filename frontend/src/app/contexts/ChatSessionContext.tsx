@@ -156,6 +156,26 @@ export function updateActiveChatSession(
   publish(nextSessions);
 }
 
+export function updateStreamingChatSessionMessages(
+  token: symbol | null,
+  update:
+    | DocketMessage[]
+    | ((messages: DocketMessage[]) => DocketMessage[]),
+): boolean {
+  const active = getSessionByToken(token);
+  if (!active || active.status !== "streaming") {
+    console.warn("[chat-session] dropped streaming message update", {
+      reason: !active ? "missing-session" : "non-streaming-session",
+      status: active?.status ?? null,
+    });
+    return false;
+  }
+  const messages =
+    typeof update === "function" ? update(active.messages) : update;
+  updateActiveChatSession({ messages }, token);
+  return true;
+}
+
 export function queueChatMessage(
   token: symbol | null,
   queuedMessage: QueuedChatMessage,
@@ -190,12 +210,16 @@ export function takeChatDraft(token: symbol | null): string | null {
 export function finishActiveChatSession(
   token: symbol | null,
   status: "completed" | "cancelled" | "failed" = "completed",
+  terminalUpdate: Pick<Partial<ActiveChatSession>, "messages"> = {},
 ): void {
   const active = getSessionByToken(token);
   if (!active || !token) return;
   const nextSessions = new Map(sessions);
+  const definedTerminalUpdate =
+    terminalUpdate.messages === undefined ? {} : terminalUpdate;
   nextSessions.set(token, {
     ...active,
+    ...definedTerminalUpdate,
     status,
     isResponseLoading: false,
     isLoadingCitations: false,

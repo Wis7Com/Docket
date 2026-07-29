@@ -2,16 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BUILTIN_WORKFLOWS } from "./builtinWorkflows";
 import {
-  PROJECT_EXTRA_TOOLS,
-  SYSTEM_PROMPT,
+    PROJECT_EXTRA_TOOLS,
+    SYSTEM_PROMPT,
     automaticWholeDocumentSummaryTarget,
     boundDocumentToolResult,
     documentToolResultMaxCharsForModel,
     buildWorkflowStore,
+    citationMarkerRefs,
+    countOrphanCitationMarkers,
     dedupeCitationEvidence,
     extractAnnotations,
     filterDocContext,
     filterToolsByDisabled,
+    identicalToolCallKey,
     extractAnnotationContext,
     fetchUserPdfAnnotations,
     readAnnotationContexts,
@@ -111,11 +114,26 @@ test("local Ollama models receive a final citation-format reminder", () => {
 });
 
 test("document citation instructions require markers inside Markdown tables", () => {
-  assert.match(
-    SYSTEM_PROMPT,
-    /In Markdown tables, place each \[N\] marker at the end of the supported claim inside the relevant cell/,
-  );
-  assert.match(SYSTEM_PROMPT, /A table does not waive or replace/);
+    assert.match(
+        SYSTEM_PROMPT,
+        /In Markdown tables, place each \[N\] marker at the end of the supported claim inside the relevant cell/,
+    );
+    assert.match(SYSTEM_PROMPT, /A table does not waive or replace/);
+    assert.match(
+        SYSTEM_PROMPT,
+        /Never cite as \[filename\] or \[filename, p\. N\] in prose/,
+    );
+    assert.match(SYSTEM_PROMPT, /Those are dead text, not citation links/);
+});
+
+test("annotation prompt requires explicit per-highlight coverage", () => {
+    assert.match(SYSTEM_PROMPT, /account for every retrieved highlight/);
+    assert.match(SYSTEM_PROMPT, /explicitly grouped with named siblings/);
+    assert.match(SYSTEM_PROMPT, /explicitly excluded with a short reason/);
+    assert.match(
+        SYSTEM_PROMPT,
+        /all highlights are accounted for or explicitly grouped/,
+    );
 });
 
 test("local citation recovery requires an exact quote in the named document", () => {
@@ -626,6 +644,53 @@ test("fetchUserPdfAnnotations applies filters and filtered summaries", async () 
     );
 });
 
+test("fetchUserPdfAnnotations dedupes identical saved highlights before counts and pagination", async () => {
+    const base = {
+        user_id: "user-a",
+        document_id: "document-a",
+        version_id: "version-a",
+        page_number: 13,
+        annotation_type: "highlight" as const,
+        color: "#feffa0",
+        quote: "The same selected passage.",
+        comment: null,
+        source: "user",
+        deleted_at: null,
+    };
+    const result = await fetchUserPdfAnnotations({
+        userId: "user-a",
+        db: annotationDb([
+            {
+                ...base,
+                id: "first-save",
+                created_at: "2026-07-29T10:00:00Z",
+            },
+            {
+                ...base,
+                id: "duplicate-save",
+                created_at: "2026-07-29T10:00:01Z",
+            },
+        ]),
+        docIndex,
+    });
+
+    assert.equal(result.total, 1);
+    assert.equal(result.returned, 1);
+    assert.equal(
+        (result.summary as { total: number; project_total: number }).total,
+        1,
+    );
+    assert.equal(
+        (result.summary as { total: number; project_total: number })
+            .project_total,
+        1,
+    );
+    assert.deepEqual(
+        (result.annotations as Array<{ id: string }>).map((row) => row.id),
+        ["first-save"],
+    );
+});
+
 test("fetchUserPdfAnnotations paginates 900 rows without duplicates or the old cap", async () => {
     const rows = Array.from({ length: 900 }, (_, index) => ({
         id: `annotation-${index.toString().padStart(4, "0")}`,
@@ -994,6 +1059,69 @@ test("renumberCitations compacts surviving refs and rewrites markers", () => {
     );
 });
 
+test("orphan citation marker count uses distinct visible refs", () => {
+    assert.deepEqual(citationMarkerRefs("Alpha [1]. Both [2, 3]. Again [2]."), [
+        1,
+        2,
+        3,
+    ]);
+    assert.equal(
+        countOrphanCitationMarkers("Alpha [1]. Missing block [2].", []),
+        2,
+    );
+    const elevenMarkers = Array.from(
+        { length: 11 },
+        (_, index) => `Claim [${index + 1}].`,
+    ).join(" ");
+    assert.equal(countOrphanCitationMarkers(elevenMarkers, []), 11);
+    assert.equal(
+        countOrphanCitationMarkers(elevenMarkers, [{ ref: 1 }]),
+        10,
+    );
+    assert.equal(
+        countOrphanCitationMarkers("Alpha [1]. Partial [2]. More [3].", [
+            { ref: 1 },
+        ]),
+        2,
+    );
+    assert.equal(
+        countOrphanCitationMarkers("Alpha [1]. Both [2, 3].", [
+            { ref: 1 },
+            { ref: 2 },
+            { ref: 3 },
+        ]),
+        0,
+    );
+});
+
+test("identical tool-call keys distinguish names and exact arguments", () => {
+    const first = identicalToolCallKey(
+        "find_in_document",
+        '{"doc_id":"doc-0","query":"same"}',
+    );
+    assert.equal(
+        first,
+        identicalToolCallKey(
+            "find_in_document",
+            '{"doc_id":"doc-0","query":"same"}',
+        ),
+    );
+    assert.notEqual(
+        first,
+        identicalToolCallKey(
+            "find_in_document",
+            '{"doc_id":"doc-0","query":"different"}',
+        ),
+    );
+    assert.notEqual(
+        first,
+        identicalToolCallKey(
+            "read_document",
+            '{"doc_id":"doc-0","query":"same"}',
+        ),
+    );
+});
+
 test("duplicate adjacent citation evidence collapses to one marker", () => {
     assert.deepEqual(
         dedupeCitationEvidence("Same claim [1] [2].", [
@@ -1071,6 +1199,17 @@ test("sanitizeAssistantVisibleText removes punctuation artifacts beside unresolv
             {},
         ),
         "$160, [2] Robocall. [3] debate— [4]",
+    );
+});
+
+test("sanitizeAssistantVisibleText unwraps simple Gemma LaTeX prose", () => {
+    assert.equal(
+        sanitizeAssistantVisibleText(
+            String.raw`The range is $\text{materially complete}$ and continues $\dots$`,
+            [],
+            {},
+        ),
+        "The range is materially complete and continues …",
     );
 });
 

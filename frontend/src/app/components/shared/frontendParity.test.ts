@@ -687,6 +687,10 @@ test("completed project chat responses do not reset open document tabs", () => {
     new URL("../../hooks/useAssistantChat.ts", import.meta.url),
     "utf8",
   );
+  const streamLogicSource = fs.readFileSync(
+    new URL("../../lib/assistantStream.logic.ts", import.meta.url),
+    "utf8",
+  );
   const pageSource = fs.readFileSync(
     new URL(
       "../../(pages)/projects/[id]/assistant/chat/[chatId]/page.tsx",
@@ -716,7 +720,12 @@ test("completed project chat responses do not reset open document tabs", () => {
   );
   assert.match(
     hookSource,
-    /fetchedHasAssistant \|\|[\s\S]*detail\.messages\.length >= localMessages\.length/,
+    /finalizedMessagesWithHydratedTail\(\s*localMessages,\s*detail\.messages,\s*\)/,
+    "completion hydration must pass through the streamed-tail preservation policy",
+  );
+  assert.match(
+    streamLogicSource,
+    /fetchedLast\?\.role === "assistant" \|\|[\s\S]*hydratedMessages\.length >= localMessages\.length/,
     "a stale completion hydrate must retain the locally streamed assistant message",
   );
   assert.match(
@@ -1253,6 +1262,11 @@ test("PDF annotation save status is transient", () => {
     source,
     /showAnnotationStatus\("Saved", 1600\)/,
     "successful annotation saves should show a short-lived Saved status",
+  );
+  assert.match(
+    source,
+    /annotationCreateInFlightRef\.current[\s\S]*annotationCreateInFlightRef\.current = true;[\s\S]*finally \{[\s\S]*annotationCreateInFlightRef\.current = false;/,
+    "annotation creation should synchronously reject a double-click before React applies the busy state",
   );
 });
 

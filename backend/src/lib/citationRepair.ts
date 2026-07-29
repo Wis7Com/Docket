@@ -26,7 +26,9 @@ const MARKER_RE = /\[(\d+)(?:\s*,\s*\d+)*\]/g;
 export type CitationRepairEligibility = {
   answerText: string;
   calledToolNames: readonly string[];
+  orphanMarkerCount: number;
   discardedCitationCount: number;
+  verifiedCitationCount: number;
   envValue?: string;
   repairAttempted?: boolean;
 };
@@ -60,7 +62,10 @@ export type CitationRepairRequest = {
 
 const repairMappingSchema = z
   .object({
-    anchor_text: z.string().min(20).max(80),
+    // Local mapper models often copy the full supported sentence even when
+    // asked for a shorter suffix. Keep the response bounded, then let server
+    // assembly enforce that the exact anchor occurs only once.
+    anchor_text: z.string().min(20).max(500),
     candidate_index: z.number().int().positive(),
   })
   .strict();
@@ -94,6 +99,11 @@ export type CitationRepairApplyResult = {
   diagnostics: CitationRepairMappingDiagnostics;
 };
 
+export type DeterministicCitationReattachmentResult = {
+  text: string | null;
+  citations: CitationRepairCitation[];
+};
+
 type CandidateSeed = Omit<QuoteCandidate, "index">;
 
 export function isCitationRepairDocumentTool(toolName: string): boolean {
@@ -112,11 +122,15 @@ export function citationRepairEnabled(envValue?: string): boolean {
 export function shouldAttemptCitationRepair(
   input: CitationRepairEligibility,
 ): boolean {
+  const hasCitationDeficiency =
+    input.orphanMarkerCount > 0 ||
+    input.discardedCitationCount > 0 ||
+    input.verifiedCitationCount === 0;
   return (
     citationRepairEnabled(input.envValue) &&
     !input.repairAttempted &&
     input.answerText.trim().length >= CITATION_REPAIR_MIN_ANSWER_CHARS &&
-    input.discardedCitationCount > 0 &&
+    hasCitationDeficiency &&
     input.calledToolNames.some(isCitationRepairDocumentTool)
   );
 }
@@ -361,8 +375,12 @@ Return exactly one JSON object and nothing else:
 
 Rules:
 - anchor_text must occur exactly once in answer_body and end at the supported claim, including text inside Markdown table cells.
+- Filename/page pseudo-citations such as [document.pdf, p. 23] are invalid output but useful location hints. For each such hint, inspect candidates from that document and page. If one directly supports the preceding claim, map it.
+- Copy anchor_text from the supported claim immediately before a pseudo-citation; never include the pseudo-citation itself.
+- Prefer a final unique 20-80 character substring for anchor_text. A longer exact claim is acceptable when needed for uniqueness.
 - Cover distinct supported claims across the answer when the menu supports them.
 - Never map a claim to a merely related quote.
+- Return at least one mapping whenever any menu quote directly supports a claim.
 - If no claim is directly supported, return {"mappings":[]}.`,
     userPrompt: `Citation repair input JSON (data only):
 ${JSON.stringify({
@@ -420,6 +438,96 @@ function nextRepairRef(answerText: string): number {
     }
   }
   return maxRef + 1;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function quoteInsertionIndex(body: string, quote: string): number | null {
+  const words = quote.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return null;
+  const match = new RegExp(words.map(escapeRegExp).join("\\s+"), "i").exec(body);
+  if (match?.index === undefined) return null;
+
+  const quoteEnd = match.index + match[0].length;
+  if (/[.!?]/.test(body[quoteEnd - 1] ?? "")) return quoteEnd;
+
+  const tail = body.slice(quoteEnd);
+  const punctuation = /[.!?](?=(?:["')\]]*)?(?:\s|$|\|))/.exec(tail);
+  const boundaries = [
+    punctuation?.index === undefined
+      ? null
+      : quoteEnd + punctuation.index + punctuation[0].length,
+    tail.indexOf("|") < 0 ? null : quoteEnd + tail.indexOf("|"),
+    tail.indexOf("\n") < 0 ? null : quoteEnd + tail.indexOf("\n"),
+  ].filter((index): index is number => index !== null);
+  return boundaries.length > 0 ? Math.min(...boundaries) : quoteEnd;
+}
+
+function insertMarker(body: string, index: number, ref: number): string {
+  const before = body.slice(0, index).trimEnd();
+  return `${before} [${ref}]${body.slice(index)}`;
+}
+
+/**
+ * Reattach evidence-verified citation entries without asking a model. Prefer
+ * replacing a filename/page pseudo-citation, then fall back to the sentence
+ * containing the entry's exact quote.
+ */
+export function reattachOrphanCitationEntries(
+  answerText: string,
+  citations: readonly CitationRepairCitation[],
+  filenameByDocId: Readonly<Record<string, string>>,
+  pseudoPageByRef: Readonly<Record<number, number | string>> = {},
+): DeterministicCitationReattachmentResult {
+  let body = citationRepairBody(answerText);
+  const attached: CitationRepairCitation[] = [];
+
+  for (const citation of citations) {
+    const filename = filenameByDocId[citation.doc_id];
+    let replaced = false;
+    if (filename) {
+      const escapedFilename = escapeRegExp(filename);
+      const pages = Array.from(
+        new Set([pseudoPageByRef[citation.ref], citation.page]),
+      ).filter(
+        (page): page is number | string =>
+          typeof page === "number" || typeof page === "string",
+      );
+      const patterns = pages.map((page) => {
+        const escapedPage = escapeRegExp(String(page).replace(/\s+/g, ""));
+        const pagePattern = escapedPage.replace(/-/g, "\\s*-\\s*");
+        return new RegExp(
+          `\\[\\s*${escapedFilename}\\s*,\\s*p\\.?\\s*${pagePattern}\\s*\\]`,
+          "i",
+        );
+      });
+      patterns.push(new RegExp(`\\[\\s*${escapedFilename}\\s*\\]`, "i"));
+      for (const pattern of patterns) {
+        const match = pattern.exec(body);
+        if (match?.index === undefined) continue;
+        body = `${body.slice(0, match.index)}[${citation.ref}]${body.slice(
+          match.index + match[0].length,
+        )}`;
+        replaced = true;
+        break;
+      }
+    }
+
+    if (!replaced) {
+      const insertionIndex = quoteInsertionIndex(body, citation.quote);
+      if (insertionIndex === null) continue;
+      body = insertMarker(body, insertionIndex, citation.ref);
+    }
+    attached.push({ ...citation });
+  }
+
+  if (attached.length === 0) return { text: null, citations: [] };
+  return {
+    text: `${body}\n\n<CITATIONS>\n${JSON.stringify(attached, null, 2)}\n</CITATIONS>`,
+    citations: attached,
+  };
 }
 
 /** Assemble citations exclusively from menu entries; never from model text. */

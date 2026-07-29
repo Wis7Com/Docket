@@ -1273,7 +1273,7 @@ export function AssistantMessage({
     if (events) {
         let current: Extract<EventGroup, { kind: "pre" }> | null = null;
         events.forEach((e, i) => {
-            if (e.type === "citation_summary") return;
+            if (e.type === "citation_summary" || e.type === "citation_diagnostics") return;
             if (e.type === "content") {
                 if (current) {
                     groups.push(current);
@@ -1400,6 +1400,29 @@ export function AssistantMessage({
                     isStreaming={!!event.isStreaming}
                     showConnector={showConnector}
                 />
+            );
+        }
+        if (event.type === "annotation_read") {
+            const label =
+                event.returned === event.total
+                    ? `Read ${event.total} annotation${event.total === 1 ? "" : "s"}`
+                    : `Read ${event.returned} of ${event.total} annotations`;
+            return (
+                <div
+                    key={globalIdx}
+                    className="flex items-center text-sm font-serif text-gray-500 relative"
+                >
+                    {showConnector && (
+                        <div className="absolute bottom-0 w-[1px] bg-gray-300 top-[13px] left-[2.5px] h-[calc(100%+11px)]" />
+                    )}
+                    <div className="w-1.5 h-1.5 rounded-full bg-gray-400 shrink-0" />
+                    <span className="font-medium ml-2">{label}</span>
+                    {event.filenames.length > 0 && (
+                        <span className="ml-1 truncate">
+                            from {event.filenames.join(", ")}
+                        </span>
+                    )}
+                </div>
             );
         }
         if (event.type === "doc_created") {

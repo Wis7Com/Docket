@@ -126,6 +126,12 @@ export type AssistantEvent =
           isStreaming?: boolean;
       }
     | {
+          type: "annotation_read";
+          returned: number;
+          total: number;
+          filenames: string[];
+      }
+    | {
           type: "doc_created";
           filename: string;
           download_url: string;
@@ -163,6 +169,19 @@ export type AssistantEvent =
           annotations: DocketEditAnnotation[];
           error?: string;
           isStreaming?: boolean;
+      }
+    | {
+          type: "citation_diagnostics";
+          discarded?: Record<string, number>;
+          recovered: number;
+          repair_attempted: boolean;
+          repair_added: number;
+          orphan_marker_count: number;
+          menu_candidates?: number;
+          mappings_proposed?: number;
+          mappings_accepted?: number;
+          mappings_ambiguous?: number;
+          mapper_unavailable?: boolean;
       }
     | {
           type: "citation_summary";
