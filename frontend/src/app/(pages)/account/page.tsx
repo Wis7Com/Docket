@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Check, Monitor, Moon, RefreshCw, Sun } from "lucide-react";
+import { Monitor, Moon, RefreshCw, Sun } from "lucide-react";
 import { useAuth } from "@/contexts/AuthContext";
 import { useUserProfile } from "@/contexts/UserProfileContext";
 import { useTheme, type ThemePreference } from "@/contexts/ThemeContext";
@@ -25,27 +25,51 @@ export default function AccountPage() {
   const { capabilities, loading: capabilitiesLoading, refresh } = useCapabilities();
   const { theme, setTheme } = useTheme();
   const [displayName, setDisplayName] = useState("");
-  const [isSavingName, setIsSavingName] = useState(false);
-  const [saved, setSaved] = useState(false);
+  const [nameStatus, setNameStatus] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
+  // What the server currently holds, so a re-render from the profile reload
+  // that follows a save doesn't look like a fresh edit and save again.
+  const savedNameRef = useRef<string | null>(null);
 
+  // Seed the field once, from the first profile that loads. Later profile
+  // updates are echoes of our own saves and must not overwrite what the user
+  // is typing.
   useEffect(() => {
-    if (profile?.displayName) {
-      setDisplayName(profile.displayName);
-    }
+    if (savedNameRef.current !== null || !profile) return;
+    savedNameRef.current = profile.displayName ?? "";
+    setDisplayName(profile.displayName ?? "");
   }, [profile]);
 
-  const handleSaveDisplayName = async () => {
-    setIsSavingName(true);
-    const success = await updateDisplayName(displayName.trim());
-    setIsSavingName(false);
+  // Autosave: settings persist on their own, so there is no Save button to
+  // forget to press. An empty field is treated as "still typing" rather than
+  // as a request to clear the name.
+  useEffect(() => {
+    const trimmed = displayName.trim();
+    if (savedNameRef.current === null) return;
+    if (!trimmed || trimmed === savedNameRef.current) return;
 
-    if (success) {
-      setSaved(true);
-      setTimeout(() => setSaved(false), 2000);
-    } else {
-      alert("Failed to update display name. Please try again.");
-    }
-  };
+    let active = true;
+    const timer = setTimeout(async () => {
+      setNameStatus("saving");
+      const ok = await updateDisplayName(trimmed);
+      if (!active) return;
+      if (ok) savedNameRef.current = trimmed;
+      setNameStatus(ok ? "saved" : "error");
+    }, 600);
+
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [displayName, updateDisplayName]);
+
+  // Let "Saved" fade out; a failure stays put until the next edit.
+  useEffect(() => {
+    if (nameStatus !== "saved") return;
+    const timer = setTimeout(() => setNameStatus("idle"), 2000);
+    return () => clearTimeout(timer);
+  }, [nameStatus]);
 
   if (!user) return null;
 
@@ -58,34 +82,27 @@ export default function AccountPage() {
         </div>
         <div className="space-y-4">
           <div>
-            <label className="text-sm text-gray-600 block mb-2">
-              Display Name
-            </label>
-            <div className="flex gap-2">
-              <Input
-                type="text"
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-                placeholder="Enter your name"
-                className="flex-1"
-              />
-              <Button
-                onClick={handleSaveDisplayName}
-                disabled={isSavingName || !displayName.trim() || saved}
-                className="min-w-[80px] transition-all bg-black hover:bg-gray-900 text-white"
-              >
-                {isSavingName ? (
-                  "Saving..."
-                ) : saved ? (
-                  <>
-                    <Check className="h-4 w-3" />
-                    Saved
-                  </>
-                ) : (
-                  "Save"
-                )}
-              </Button>
+            <div className="mb-2 flex items-center gap-2">
+              <label className="text-sm text-gray-600">Display Name</label>
+              {nameStatus === "saving" && (
+                <span className="text-xs text-gray-400">Saving…</span>
+              )}
+              {nameStatus === "saved" && (
+                <span className="text-xs text-gray-400">Saved</span>
+              )}
+              {nameStatus === "error" && (
+                <span className="text-xs text-amber-700">
+                  Couldn&apos;t save — retry by editing the field.
+                </span>
+              )}
             </div>
+            <Input
+              type="text"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder="Enter your name"
+              className="max-w-md"
+            />
           </div>
         </div>
       </div>
@@ -151,10 +168,24 @@ export default function AccountPage() {
                   ? ` — ${capabilities.libreoffice.version}`
                   : ""}
               </p>
+            ) : capabilities?.libreoffice.install_url ? (
+              <p className="text-sm text-amber-700">
+                Not detected. Word uploads still work for text, but PDF preview
+                is unavailable until you{" "}
+                <a
+                  href={capabilities.libreoffice.install_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline hover:text-amber-900"
+                >
+                  install LibreOffice
+                </a>
+                .
+              </p>
             ) : capabilities ? (
               <p className="text-sm text-amber-700">
-                Not detected. LibreOffice ships bundled with Docket — if this
-                message persists, the install may be incomplete. Try
+                Not detected. LibreOffice ships bundled with Docket on Windows —
+                if this message persists, the install may be incomplete. Try
                 reinstalling Docket. Word uploads still work for text, but PDF
                 preview is unavailable.
               </p>

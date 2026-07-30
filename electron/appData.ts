@@ -2,9 +2,18 @@ import { app } from "electron";
 import * as fs from "fs";
 import * as path from "path";
 
+export type ThemePreference = "light" | "dark" | "system";
+
 interface DesktopConfig {
   legacyWorkspacePath?: string;
   projectFolderBookmarks?: Record<string, string>;
+  /**
+   * UI theme. Kept here rather than in renderer localStorage: the launcher
+   * gives the frontend an OS-assigned port on every start, so the renderer's
+   * origin (http://127.0.0.1:<port>) — and with it every localStorage entry
+   * scoped to that origin — is thrown away between runs.
+   */
+  themePreference?: ThemePreference;
   /**
    * Old config key from the workspace-era desktop flow. Keep reading it so
    * existing installs can migrate their old all-in-one folder once.
@@ -83,6 +92,19 @@ export function readConfig(): DesktopConfig {
 
 export function writeConfig(config: DesktopConfig): void {
   atomicWriteFileSync(configPath(), JSON.stringify(config, null, 2));
+}
+
+export function isThemePreference(value: unknown): value is ThemePreference {
+  return value === "light" || value === "dark" || value === "system";
+}
+
+export function readThemePreference(): ThemePreference {
+  const stored = readConfig().themePreference;
+  return isThemePreference(stored) ? stored : "system";
+}
+
+export function writeThemePreference(theme: ThemePreference): void {
+  writeConfig({ ...readConfig(), themePreference: theme });
 }
 
 export function isDirectoryUsable(dir: string | undefined): boolean {

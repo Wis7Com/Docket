@@ -1270,25 +1270,30 @@ test("PDF annotation save status is transient", () => {
   );
 });
 
-test("citation save promotes highlights to app metadata until explicit PDF export", () => {
+test("citation highlights are promoted one at a time, not by a bulk toolbar action", () => {
   const source = fs.readFileSync(
     new URL("./DocView.tsx", import.meta.url),
     "utf8",
   );
-  const promoteBody = source.match(
-    /async function handlePromoteCitationHighlight\(\) \{([\s\S]*?)\n    \}/,
+  const selectionPayloadBody = source.match(
+    /function buildSelectionCreatePayload\(args: \{([\s\S]*?)\n    \}\n\n/,
   )?.[1];
-  assert.ok(promoteBody);
+  assert.ok(selectionPayloadBody);
 
   assert.match(
-    promoteBody,
-    /saveAnnotationPayload\([\s\S]*buildCitationPromotionCreatePayload/,
-    "citation Save should create an app-managed annotation row",
+    selectionPayloadBody,
+    /args\.source === "citation"[\s\S]*buildCitationPromotionCreatePayload/,
+    "picking a color on one citation highlight should create an app-managed annotation row",
   );
   assert.doesNotMatch(
-    promoteBody,
+    selectionPayloadBody,
     /exportAnnotatedPdf/,
-    "citation Save must not embed annotations into PDF bytes",
+    "promoting a citation highlight must not embed annotations into PDF bytes",
+  );
+  assert.doesNotMatch(
+    source,
+    /handlePromoteCitationHighlight|pdf-save-citation-highlight/,
+    "the bulk citation-save toolbar control should stay removed — highlights are confirmed individually",
   );
   assert.match(
     source,

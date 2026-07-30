@@ -2,7 +2,7 @@
 
 import { Suspense, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { Download, MessageSquarePlus, Minus, X } from "lucide-react";
+import { Download, Loader2, MessageSquarePlus, Minus, X } from "lucide-react";
 import { DocView } from "@/app/components/shared/DocView";
 import { createChat, getDocumentUrl } from "@/app/lib/docketApi";
 import { publishAnnotationsChanged } from "@/app/lib/annotationsChangedChannel";
@@ -31,7 +31,7 @@ function DocumentViewerContent() {
     const searchPage = searchPageValue ? Number(searchPageValue) : null;
     const annotationId = params.get("annotation_id")?.trim() || null;
     const projectId = params.get("project_id")?.trim() || null;
-    const [renderProgress, setRenderProgress] = useState<number | null>(null);
+    const [layoutPreparing, setLayoutPreparing] = useState(false);
     const [chatBusy, setChatBusy] = useState(false);
     const [chatError, setChatError] = useState<string | null>(null);
 
@@ -112,17 +112,16 @@ function DocumentViewerContent() {
         <main className="flex h-screen flex-col overflow-hidden bg-white">
             <header className="flex shrink-0 items-center justify-between border-b border-gray-100 px-5 py-3">
                 <div className="flex min-w-0 items-center gap-2">
-                    {renderProgress != null && renderProgress < 1 && (
-                        // Clockwise-filling pie: pages render progressively,
-                        // which reflows the scrollbar — show that it's
-                        // loading, not glitching.
+                    {layoutPreparing && (
+                        // Only the initial parse/layout makes the user wait;
+                        // pages themselves render on demand.
                         <span
-                            title={`Rendering pages… ${Math.round(renderProgress * 100)}%`}
-                            className="h-3.5 w-3.5 shrink-0 rounded-full"
-                            style={{
-                                background: `conic-gradient(#2563eb ${renderProgress * 360}deg, #e5e7eb 0deg)`,
-                            }}
-                        />
+                            data-session-check="viewer-layout-preparing"
+                            title="Preparing document…"
+                            className="inline-flex shrink-0"
+                        >
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
+                        </span>
                     )}
                     <div className="truncate font-serif text-base font-medium text-gray-800">
                         {filename}
@@ -194,9 +193,7 @@ function DocumentViewerContent() {
                     quote={searchQuote || undefined}
                     focusAnnotationId={annotationId}
                     onAnnotationsChanged={publishAnnotationsChanged}
-                    onRenderProgress={(rendered, total) =>
-                        setRenderProgress(total > 0 ? rendered / total : 1)
-                    }
+                    onLayoutPreparing={setLayoutPreparing}
                     fallbackPage={
                         searchPage != null && Number.isFinite(searchPage)
                             ? searchPage

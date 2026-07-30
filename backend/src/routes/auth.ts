@@ -2,7 +2,7 @@ import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
 import {
   probeLibreOffice,
-  LIBREOFFICE_DOWNLOAD_URL,
+  libreOfficeInstallUrl,
 } from "../lib/libreofficeStatus";
 
 export const authRouter = Router();
@@ -30,7 +30,7 @@ authRouter.get("/capabilities", requireAuth, async (_req, res) => {
     libreoffice: {
       available: lo.available,
       version: lo.version,
-      install_url: lo.available ? null : LIBREOFFICE_DOWNLOAD_URL,
+      install_url: lo.available ? null : libreOfficeInstallUrl(),
     },
   });
 });

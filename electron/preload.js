@@ -36,7 +36,25 @@ try {
 }
 window.addEventListener("resize", handleZoomDrift);
 
+// Theme preference, injected by main as a launch argument (see
+// themeLaunchArguments). Read synchronously so the page's pre-hydration
+// script can pick the right scheme for the very first paint — an async IPC
+// call would land after that paint and flash the wrong one.
+function readInitialTheme() {
+  const arg = process.argv.find((a) => a.startsWith("--docket-theme="));
+  const value = arg ? arg.slice("--docket-theme=".length) : "";
+  return value === "light" || value === "dark" ? value : "system";
+}
+
 contextBridge.exposeInMainWorld("docket", {
+  initialTheme: readInitialTheme(),
+  setTheme: (theme) => ipcRenderer.invoke("docket:setTheme", theme),
+  // Fires when another window changes the theme. Returns an unsubscribe fn.
+  onThemeChanged: (callback) => {
+    const listener = (_event, theme) => callback(theme);
+    ipcRenderer.on("docket:theme-changed", listener);
+    return () => ipcRenderer.removeListener("docket:theme-changed", listener);
+  },
   // Active session — used by the supabase shim and any code needing the API URL
   getToken: () => ipcRenderer.invoke("docket:getToken"),
   getUser: () => ipcRenderer.invoke("docket:getUser"),

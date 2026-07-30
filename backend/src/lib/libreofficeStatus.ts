@@ -1,17 +1,20 @@
 /**
  * LibreOffice availability detection.
  *
- * The desktop installer bundles LibreOffice under
- * `<resources>/libreoffice/program/soffice.exe` on Windows so DOCX→PDF
- * conversion works out of the box. We still probe at startup — if the
- * bundled tree is missing or corrupted, the frontend can surface that
- * clearly instead of failing silently. System installs (PATH, Program
- * Files) are tried as fallbacks for non-Windows dev environments.
+ * The Windows installer bundles LibreOffice under
+ * `<resources>/libreoffice/program/soffice.exe` so DOCX→PDF conversion works
+ * out of the box; the bundled tree wins whenever it is present. macOS and
+ * Linux builds bundle nothing, so there we look for a system install.
+ *
+ * Detection is file-existence only — we never run `soffice --version`.
+ * Launching the binary just to read a version string is what used to pop
+ * macOS quarantine/crash dialogs during automated runs, and it buys nothing:
+ * the converter resolves a binary from the same paths we check here, so a hit
+ * means conversion will work and a miss means it won't.
  */
 
 import * as fs from "fs";
 import * as path from "path";
-import { safeSpawn } from "./safeSpawn";
 
 interface Probe {
   available: boolean;
@@ -20,32 +23,37 @@ interface Probe {
 }
 
 let cached: Probe | null = null;
-let inflight: Promise<Probe> | null = null;
 
 /**
  * Version pinned by `scripts/fetch-libreoffice.js`. Keep in sync when
  * bumping LO_VERSION in that script — the bundled probe reports this
- * string verbatim instead of running soffice --version (see notes on
- * bundledSofficePath).
+ * string verbatim rather than asking the binary.
  */
 const BUNDLED_LO_VERSION = "25.8.6";
 
-const WIN_INSTALL_PATHS = [
-  "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-  "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-];
+/**
+ * System install locations, per platform. These mirror the paths
+ * `libreoffice-convert` searches so detection can never claim an install the
+ * converter would then fail to find. We also pin the converter to whatever we
+ * resolve here (see convert.ts), which keeps the two in step even when a user
+ * has LibreOffice somewhere unusual.
+ */
+const SYSTEM_INSTALL_PATHS: Record<string, string[]> = {
+  darwin: ["/Applications/LibreOffice.app/Contents/MacOS/soffice"],
+  linux: [
+    "/usr/bin/libreoffice",
+    "/usr/bin/soffice",
+    "/snap/bin/libreoffice",
+    "/opt/libreoffice/program/soffice",
+    "/usr/local/bin/soffice",
+  ],
+  win32: [
+    "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+    "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+  ],
+};
 
-const NIX_INSTALL_PATHS = [
-  "/usr/bin/soffice",
-  "/usr/local/bin/soffice",
-  "/Applications/LibreOffice.app/Contents/MacOS/soffice",
-  "/snap/bin/libreoffice",
-];
-
-function existingInstall(): string | null {
-  const candidates = process.platform === "win32"
-    ? WIN_INSTALL_PATHS
-    : NIX_INSTALL_PATHS;
+function firstExistingFile(candidates: string[]): string | null {
   for (const c of candidates) {
     try {
       if (fs.statSync(c).isFile()) return c;
@@ -69,8 +77,6 @@ function existingInstall(): string | null {
  * `child_process.execFile` (no shell) to run conversions, and `.com`
  * hangs when spawned that way. For headless conversion the GUI
  * binary is fine — output goes to a file, stdout doesn't matter.
- * Probes intentionally do NOT run `--version` on the bundled binary
- * (soffice.exe produces no stdout when piped); see probeLibreOffice.
  */
 export function bundledSofficePath(): string | null {
   if (process.platform !== "win32") return null;
@@ -95,113 +101,65 @@ export function bundledSofficePath(): string | null {
   candidates.push(
     path.join(repoRoot, "vendor", "libreoffice", "program", "soffice.exe"),
   );
-  for (const c of candidates) {
-    try {
-      if (fs.statSync(c).isFile()) return c;
-    } catch {
-      // not present
-    }
-  }
-  return null;
+  return firstExistingFile(candidates);
 }
 
-async function runProbe(executable: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    let stdout = "";
-    let resolved = false;
-    const finish = (v: string | null) => {
-      if (resolved) return;
-      resolved = true;
-      resolve(v);
-    };
-    try {
-      const proc = safeSpawn(executable, ["--version"], {
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      proc.stdout?.on("data", (b: Buffer) => (stdout += b.toString()));
-      proc.on("error", () => finish(null));
-      proc.on("exit", (code) => {
-        if (code === 0 && stdout.trim()) finish(stdout.trim());
-        else finish(null);
-      });
-      setTimeout(() => {
-        try {
-          proc.kill();
-        } catch {
-          // ignore
-        }
-        finish(null);
-      }, 3000);
-    } catch {
-      finish(null);
-    }
-  });
+/** A user-installed LibreOffice, or null when none of the known paths exist. */
+export function systemSofficePath(): string | null {
+  return firstExistingFile(SYSTEM_INSTALL_PATHS[process.platform] ?? []);
+}
+
+/**
+ * The binary conversion should use: bundled first, system install second.
+ * `DOCKET_SKIP_LIBREOFFICE_PROBE=1` forces "not found" so smoke tests can
+ * exercise the missing-LibreOffice path on a machine that has it installed.
+ */
+export function sofficePath(): string | null {
+  if (process.env.DOCKET_SKIP_LIBREOFFICE_PROBE === "1") return null;
+  return bundledSofficePath() ?? systemSofficePath();
+}
+
+/**
+ * Best-effort version string, read from install metadata rather than by
+ * running the binary. macOS keeps it in the app bundle's (XML) Info.plist;
+ * elsewhere we have no cheap source and report null, which the UI renders as
+ * a bare "Installed".
+ */
+function readSystemVersion(sofficeBinary: string): string | null {
+  if (process.platform !== "darwin") return null;
+  // …/LibreOffice.app/Contents/MacOS/soffice → …/Contents/Info.plist
+  const plist = path.resolve(sofficeBinary, "..", "..", "Info.plist");
+  try {
+    const xml = fs.readFileSync(plist, "utf8");
+    const match =
+      /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/.exec(
+        xml,
+      );
+    return match ? `LibreOffice ${match[1].trim()}` : null;
+  } catch {
+    return null;
+  }
 }
 
 export async function probeLibreOffice(): Promise<Probe> {
   if (cached) return cached;
-  if (inflight) return inflight;
 
-  inflight = (async () => {
-    if (process.env.DOCKET_SKIP_LIBREOFFICE_PROBE === "1") {
-      const result: Probe = { available: false, version: null, path: null };
-      cached = result;
-      return result;
-    }
-
-    // Bundled binary takes precedence. We trust file existence and
-    // skip `--version` because `soffice.exe` is GUI-subsystem on
-    // Windows and produces no stdout when its handles are pipes.
-    // bundledSofficePath() already verified the file is on disk.
-    const bundled = bundledSofficePath();
-    if (bundled) {
-      const result: Probe = {
-        available: true,
-        version: `LibreOffice ${BUNDLED_LO_VERSION} (bundled)`,
-        path: bundled,
-      };
-      cached = result;
-      return result;
-    }
-
-    // macOS/Linux system probes can launch a GUI-gated soffice binary and
-    // show OS crash/quarantine dialogs during automated desktop smoke tests.
-    // Keep Windows bundled detection automatic; require an explicit opt-in
-    // before probing system LibreOffice on non-Windows developer machines.
-    if (
-      process.platform !== "win32" &&
-      process.env.DOCKET_ENABLE_SYSTEM_LIBREOFFICE_PROBE !== "1"
-    ) {
-      const result: Probe = { available: false, version: null, path: null };
-      cached = result;
-      return result;
-    }
-
-    // Non-bundled fallback (dev on macOS/Linux, or Windows without
-    // the vendor tree): try PATH then known install dirs.
-    const candidates: string[] = ["soffice"];
-    const installed = existingInstall();
-    if (installed) candidates.push(installed);
-
-    for (const c of candidates) {
-      const version = await runProbe(c);
-      if (version) {
-        const result: Probe = {
-          available: true,
-          version: version.split(/\r?\n/)[0],
-          path: c === "soffice" ? null : c,
-        };
-        cached = result;
-        return result;
-      }
-    }
-    const result: Probe = { available: false, version: null, path: null };
-    cached = result;
-    return result;
-  })();
-
-  return inflight;
+  // Resolved through sofficePath() so Settings can never report an install
+  // that conversion would decline to use, or vice versa.
+  const found = sofficePath();
+  if (!found) {
+    cached = { available: false, version: null, path: null };
+    return cached;
+  }
+  cached = {
+    available: true,
+    version:
+      found === bundledSofficePath()
+        ? `LibreOffice ${BUNDLED_LO_VERSION} (bundled)`
+        : readSystemVersion(found),
+    path: found,
+  };
+  return cached;
 }
 
 export function getCachedProbe(): Probe | null {
@@ -209,8 +167,13 @@ export function getCachedProbe(): Probe | null {
 }
 
 /**
- * LibreOffice ships bundled inside Docket, so there is no external
- * download URL. Kept exported as `null` for API stability — the
- * frontend treats null as "no install link, surface a generic error".
+ * Where to send a user whose LibreOffice is missing. On Windows there is
+ * nowhere to send them — LibreOffice ships inside the installer, so a missing
+ * binary means a damaged install rather than a missing download, and the
+ * frontend says so instead of offering a link.
  */
-export const LIBREOFFICE_DOWNLOAD_URL: string | null = null;
+export function libreOfficeInstallUrl(): string | null {
+  return process.platform === "win32"
+    ? null
+    : "https://www.libreoffice.org/download/download-libreoffice/";
+}

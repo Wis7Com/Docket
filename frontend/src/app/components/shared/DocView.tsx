@@ -18,8 +18,8 @@ import {
     Highlighter,
     MessageSquare,
     MessageSquarePlus,
+    MessageSquareText,
     MousePointer2,
-    Save,
     Search,
     Trash2,
     X,
@@ -43,6 +43,7 @@ import {
     browserSavePdfDeps,
     savePdfToChosenFolder,
 } from "@/app/lib/savePdfAs";
+import { PdfToolbarTooltip } from "./PdfToolbarTooltip";
 import { DocxView } from "./DocxView";
 import { MarkdownDocView } from "./MarkdownDocView";
 import { ImageDocView } from "./ImageDocView";
@@ -121,8 +122,12 @@ interface Props {
     initialScrollTop?: number | null;
     /** Persists the user's PDF scroll position for a route remount. */
     onScrollChange?: (top: number) => void;
-    /** Reports progressive PDF page rendering: (renderedPages, totalPages). */
-    onRenderProgress?: (rendered: number, total: number) => void;
+    /**
+     * True while the PDF is being parsed and its page layout built, false once
+     * the viewer is scrollable. Pages themselves render on demand and are fast
+     * enough to need no progress reporting.
+     */
+    onLayoutPreparing?: (preparing: boolean) => void;
     /** Reports saved annotation mutations so parents can refresh side lists. */
     onAnnotationsChanged?: (docId: string) => void;
     rounded?: boolean;
@@ -161,7 +166,7 @@ export function DocView({
     onCitationNavigationHandled,
     initialScrollTop,
     onScrollChange,
-    onRenderProgress,
+    onLayoutPreparing,
     onAnnotationsChanged,
     rounded = true,
     bordered = true,
@@ -201,10 +206,10 @@ export function DocView({
     const annotationStatusRunRef = useRef(0);
     // Ref'd so renderPDF (a useCallback) always reports to the latest
     // handler without re-rendering the PDF when the parent re-renders.
-    const onRenderProgressRef = useRef(onRenderProgress);
+    const onLayoutPreparingRef = useRef(onLayoutPreparing);
     const onScrollChangeRef = useRef(onScrollChange);
     useEffect(() => {
-        onRenderProgressRef.current = onRenderProgress;
+        onLayoutPreparingRef.current = onLayoutPreparing;
     });
     useEffect(() => {
         onScrollChangeRef.current = onScrollChange;
@@ -785,17 +790,6 @@ export function DocView({
             rects: pdfRects,
             source: "citation",
         };
-    }
-
-    function collectTemporaryHighlightRects(): PdfAnnotationRect[] {
-        const rects: DOMRect[] = [];
-        for (const pageEntry of renderedPagesRef.current) {
-            if (!pageEntry) continue;
-            pageEntry.wrapper
-                .querySelectorAll<HTMLElement>(".pdf-text-highlight")
-                .forEach((el) => rects.push(el.getBoundingClientRect()));
-        }
-        return clientRectsToPdfRects(rects);
     }
 
     function buildSelectionCreatePayload(args: {
@@ -1622,7 +1616,6 @@ export function DocView({
                 width: firstViewport.width,
                 height: firstViewport.height,
             };
-            onRenderProgressRef.current?.(1, doc.numPages);
 
             // Use the first page as a temporary placeholder size. Individual
             // dimensions are measured only when that page enters the render
@@ -1971,6 +1964,10 @@ export function DocView({
         const list = quoteList;
 
         let cancelled = false;
+        // Parsing the bytes and laying out the page placeholders is the only
+        // phase the user has to wait through; individual pages then render on
+        // demand as they scroll.
+        onLayoutPreparingRef.current?.(true);
         (async () => {
             const lib = await getPdfJs();
             if (cancelled) return;
@@ -2001,6 +1998,7 @@ export function DocView({
                     if (cancelled) return;
                     console.error("PDF load failed", secondErr);
                     setPdfLoadError("This document could not be displayed.");
+                    onLayoutPreparingRef.current?.(false);
                     return;
                 }
             }
@@ -2036,9 +2034,14 @@ export function DocView({
                 console.error("PDF render failed", err);
                 setPdfLoadError("This document could not be displayed.");
             });
+            if (cancelled) return;
+            onLayoutPreparingRef.current?.(false);
         })();
         return () => {
             cancelled = true;
+            // A swap or unmount ends this document's wait; the next document's
+            // effect run raises the flag again.
+            onLayoutPreparingRef.current?.(false);
             clearRenderQueue();
             destroyCurrentPdfDocument();
         };
@@ -2386,26 +2389,6 @@ export function DocView({
         if (activeSelectionRef.current || selectedAnnotationIdRef.current) {
             setContextMenu(null);
         }
-    }
-
-    async function handlePromoteCitationHighlight() {
-        if (!quoteListRef.current.length) return;
-        const rects = collectTemporaryHighlightRects();
-        if (rects.length === 0) {
-            setAnnotationError(
-                "No temporary citation highlight found to save.",
-            );
-            return;
-        }
-        await saveAnnotationPayload(
-            buildCitationPromotionCreatePayload({
-                rects,
-                quoteList: quoteListRef.current,
-                color: annotationColor,
-                displayVersionId: annotationVersionId ?? displayVersionId,
-                documentVersionId: doc?.version_id ?? null,
-            }),
-        );
     }
 
     function handlePdfContextMenu(e: ReactMouseEvent<HTMLDivElement>) {
@@ -3073,47 +3056,53 @@ export function DocView({
                     <>
                         <div className="pointer-events-none absolute top-4 right-4 left-4 flex flex-col items-end gap-2">
                             <div className="pointer-events-auto flex max-w-full flex-wrap items-center justify-end gap-1 rounded-lg border border-white/60 bg-white/85 px-2 py-1 shadow-md backdrop-blur-md">
-                                <button
-                                    data-session-check="pdf-mode-select"
-                                    title="Select"
-                                    aria-pressed={mode === "select"}
-                                    onClick={() => setMode("select")}
-                                    className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
-                                        mode === "select"
-                                            ? "bg-gray-900 text-white"
-                                            : "text-gray-600 hover:bg-white"
-                                    }`}
-                                >
-                                    <MousePointer2 className="h-3.5 w-3.5" />
-                                </button>
-                                <button
-                                    data-session-check="pdf-mode-highlight"
-                                    title="Highlight"
-                                    aria-pressed={mode === "highlight"}
-                                    onClick={() => setMode("highlight")}
-                                    className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
-                                        mode === "highlight"
-                                            ? "bg-gray-900 text-white"
-                                            : "text-gray-600 hover:bg-white"
-                                    }`}
-                                >
-                                    <Highlighter className="h-3.5 w-3.5" />
-                                </button>
-                                <button
-                                    data-session-check="pdf-mode-comment"
-                                    title="Comment"
-                                    aria-pressed={mode === "comment"}
-                                    onClick={() =>
-                                        openActiveSelectionCommentEditor()
-                                    }
-                                    className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
-                                        mode === "comment"
-                                            ? "bg-gray-900 text-white"
-                                            : "text-gray-600 hover:bg-white"
-                                    }`}
-                                >
-                                    <MessageSquarePlus className="h-3.5 w-3.5" />
-                                </button>
+                                <PdfToolbarTooltip text="Select text">
+                                    <button
+                                        data-session-check="pdf-mode-select"
+                                        aria-label="Select text"
+                                        aria-pressed={mode === "select"}
+                                        onClick={() => setMode("select")}
+                                        className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
+                                            mode === "select"
+                                                ? "bg-gray-900 text-white"
+                                                : "text-gray-600 hover:bg-white"
+                                        }`}
+                                    >
+                                        <MousePointer2 className="h-3.5 w-3.5" />
+                                    </button>
+                                </PdfToolbarTooltip>
+                                <PdfToolbarTooltip text="Highlight the text you select">
+                                    <button
+                                        data-session-check="pdf-mode-highlight"
+                                        aria-label="Highlight the text you select"
+                                        aria-pressed={mode === "highlight"}
+                                        onClick={() => setMode("highlight")}
+                                        className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
+                                            mode === "highlight"
+                                                ? "bg-gray-900 text-white"
+                                                : "text-gray-600 hover:bg-white"
+                                        }`}
+                                    >
+                                        <Highlighter className="h-3.5 w-3.5" />
+                                    </button>
+                                </PdfToolbarTooltip>
+                                <PdfToolbarTooltip text="Add a comment to the text you select">
+                                    <button
+                                        data-session-check="pdf-mode-comment"
+                                        aria-label="Add a comment to the text you select"
+                                        aria-pressed={mode === "comment"}
+                                        onClick={() =>
+                                            openActiveSelectionCommentEditor()
+                                        }
+                                        className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
+                                            mode === "comment"
+                                                ? "bg-gray-900 text-white"
+                                                : "text-gray-600 hover:bg-white"
+                                        }`}
+                                    >
+                                        <MessageSquarePlus className="h-3.5 w-3.5" />
+                                    </button>
+                                </PdfToolbarTooltip>
                                 <div className="mx-1 h-5 w-px bg-gray-200" />
                                 {annotationColors.map((color, index) => (
                                     <button
@@ -3151,86 +3140,87 @@ export function DocView({
                                     className="h-5 w-5 rounded-full border border-white transition-transform hover:scale-110"
                                     style={{ background: COLOR_WHEEL_GRADIENT }}
                                 />
-                                {quoteList.length > 0 && (
-                                    <>
-                                        <div className="mx-1 h-5 w-px bg-gray-200" />
-                                        <button
-                                            data-session-check="pdf-save-citation-highlight"
-                                            title="Save citation highlight"
-                                            disabled={annotationBusy}
-                                            onClick={() => {
-                                                void handlePromoteCitationHighlight();
-                                            }}
-                                            className="flex h-7 w-7 items-center justify-center rounded-full text-gray-600 transition-colors hover:bg-white disabled:opacity-40"
-                                        >
-                                            <Save className="h-3.5 w-3.5" />
-                                        </button>
-                                    </>
-                                )}
                                 <div className="mx-1 h-5 w-px bg-gray-200" />
-                                <button
-                                    data-session-check="pdf-find-toggle"
-                                    title="Find in document (Ctrl+F)"
-                                    aria-pressed={findOpen}
-                                    onClick={() => {
-                                        if (findOpen) setFindOpen(false);
-                                        else openFindBar();
-                                    }}
-                                    className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
-                                        findOpen
-                                            ? "bg-gray-900 text-white"
-                                            : "text-gray-600 hover:bg-white"
-                                    }`}
-                                >
-                                    <Search className="h-3.5 w-3.5" />
-                                </button>
+                                <PdfToolbarTooltip text="Find in document (Ctrl+F)">
+                                    <button
+                                        data-session-check="pdf-find-toggle"
+                                        aria-label="Find in document"
+                                        aria-pressed={findOpen}
+                                        onClick={() => {
+                                            if (findOpen) setFindOpen(false);
+                                            else openFindBar();
+                                        }}
+                                        className={`flex h-7 w-7 items-center justify-center rounded-full transition-colors ${
+                                            findOpen
+                                                ? "bg-gray-900 text-white"
+                                                : "text-gray-600 hover:bg-white"
+                                        }`}
+                                    >
+                                        <Search className="h-3.5 w-3.5" />
+                                    </button>
+                                </PdfToolbarTooltip>
                                 <div className="mx-1 h-5 w-px bg-gray-200" />
-                                <button
-                                    data-session-check="pdf-export-annotated"
-                                    title={
+                                <PdfToolbarTooltip
+                                    text={
                                         annotations.length > 0
-                                            ? "Export PDF"
+                                            ? "Save a copy of the PDF with the saved annotations embedded"
                                             : "No annotations to export"
                                     }
-                                    disabled={
-                                        annotationBusy ||
-                                        annotations.length === 0
-                                    }
-                                    onClick={() => {
-                                        void handleExportAnnotatedPdf();
-                                    }}
-                                    className="flex h-7 items-center justify-center gap-1.5 rounded-full px-2.5 text-xs font-medium text-gray-700 transition-colors hover:bg-white disabled:opacity-40"
                                 >
-                                    <FileDown className="h-3.5 w-3.5" />
-                                    <span>Export PDF</span>
-                                </button>
+                                    <button
+                                        data-session-check="pdf-export-annotated"
+                                        disabled={
+                                            annotationBusy ||
+                                            annotations.length === 0
+                                        }
+                                        onClick={() => {
+                                            void handleExportAnnotatedPdf();
+                                        }}
+                                        className="flex h-7 items-center justify-center gap-1.5 rounded-full px-2.5 text-xs font-medium text-gray-700 transition-colors hover:bg-white disabled:opacity-40"
+                                    >
+                                        <FileDown className="h-3.5 w-3.5" />
+                                        <span>Export PDF</span>
+                                    </button>
+                                </PdfToolbarTooltip>
                                 {selectedAnnotationId && (
                                     <>
-                                        <button
-                                            title={
+                                        <PdfToolbarTooltip
+                                            text={
                                                 selectedAnnotation?.annotation_type ===
                                                 "comment"
-                                                    ? "Edit comment"
-                                                    : "Add comment"
+                                                    ? "Edit the comment on the selected annotation"
+                                                    : "Add a comment to the selected highlight"
                                             }
-                                            disabled={annotationBusy}
-                                            onClick={() => {
-                                                void handleEditSelectedComment();
-                                            }}
-                                            className="flex h-7 w-7 items-center justify-center rounded-full text-gray-600 transition-colors hover:bg-white disabled:opacity-40"
                                         >
-                                            <MessageSquarePlus className="h-3.5 w-3.5" />
-                                        </button>
-                                        <button
-                                            title="Delete annotation"
-                                            disabled={annotationBusy}
-                                            onClick={() => {
-                                                void handleDeleteSelectedAnnotation();
-                                            }}
-                                            className="flex h-7 w-7 items-center justify-center rounded-full text-red-600 transition-colors hover:bg-white disabled:opacity-40"
-                                        >
-                                            <Trash2 className="h-3.5 w-3.5" />
-                                        </button>
+                                            <button
+                                                data-session-check="pdf-edit-selected-comment"
+                                                aria-label={
+                                                    selectedAnnotation?.annotation_type ===
+                                                    "comment"
+                                                        ? "Edit the comment on the selected annotation"
+                                                        : "Add a comment to the selected highlight"
+                                                }
+                                                disabled={annotationBusy}
+                                                onClick={() => {
+                                                    void handleEditSelectedComment();
+                                                }}
+                                                className="flex h-7 w-7 items-center justify-center rounded-full text-gray-600 transition-colors hover:bg-white disabled:opacity-40"
+                                            >
+                                                <MessageSquareText className="h-3.5 w-3.5" />
+                                            </button>
+                                        </PdfToolbarTooltip>
+                                        <PdfToolbarTooltip text="Delete the selected annotation">
+                                            <button
+                                                aria-label="Delete the selected annotation"
+                                                disabled={annotationBusy}
+                                                onClick={() => {
+                                                    void handleDeleteSelectedAnnotation();
+                                                }}
+                                                className="flex h-7 w-7 items-center justify-center rounded-full text-red-600 transition-colors hover:bg-white disabled:opacity-40"
+                                            >
+                                                <Trash2 className="h-3.5 w-3.5" />
+                                            </button>
+                                        </PdfToolbarTooltip>
                                     </>
                                 )}
                             </div>

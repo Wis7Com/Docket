@@ -1,18 +1,45 @@
-import { promisify } from "util";
 import JSZip from "jszip";
 import { safeSpawnEnv } from "./safeSpawn";
-import { bundledSofficePath } from "./libreofficeStatus";
+import { sofficePath } from "./libreofficeStatus";
 
-let _convert:
-  | ((buf: Buffer, ext: string, filter: undefined) => Promise<Buffer>)
-  | null = null;
+interface ConvertOptions {
+  sofficeBinaryPaths?: string[];
+}
 
-async function getConvert() {
+type ConvertWithOptions = (
+  buf: Buffer,
+  ext: string,
+  filter: undefined,
+  options: ConvertOptions,
+  cb: (err: Error | null, out: Buffer) => void,
+) => void;
+
+let _convert: ConvertWithOptions | null = null;
+
+/**
+ * `convertWithOptions` (not `convert`) so we can hand the package the exact
+ * binary probeLibreOffice() reported. Left to itself it rediscovers soffice
+ * from its own path list, which on Windows misses our bundled tree entirely
+ * and anywhere can pick a different install than the one Settings names.
+ *
+ * Wrapped by hand rather than with promisify: the package both invokes the
+ * callback and returns a promise, which promisify flags as a mistake.
+ */
+async function convertToPdf(
+  buffer: Buffer,
+  soffice: string,
+): Promise<Buffer> {
   if (!_convert) {
     const libre = await import("libreoffice-convert");
-    _convert = promisify(libre.default.convert.bind(libre.default));
+    _convert = (
+      libre.default as unknown as { convertWithOptions: ConvertWithOptions }
+    ).convertWithOptions.bind(libre.default);
   }
-  return _convert;
+  const convert = _convert;
+  return new Promise((resolve, reject) => {
+    convert(buffer, ".pdf", undefined, { sofficeBinaryPaths: [soffice] },
+      (err, out) => (err ? reject(err) : resolve(out)));
+  });
 }
 
 /**
@@ -63,13 +90,7 @@ async function withScrubbedEnv<T>(fn: () => Promise<T>): Promise<T> {
   const original = process.env;
   // Object.defineProperty assignment — process.env is a special object on
   // some Node versions, plain assignment works.
-  const scrubbed = safeSpawnEnv();
-  // Pin libreoffice-convert to the bundled binary so it never resolves
-  // to a stale system install. Honored as LIBRE_OFFICE_PATH by the
-  // package; harmless on platforms without a bundle (null path skipped).
-  const bundled = bundledSofficePath();
-  if (bundled) scrubbed.LIBRE_OFFICE_PATH = bundled;
-  process.env = scrubbed;
+  process.env = safeSpawnEnv();
   try {
     return await fn();
   } finally {
@@ -77,16 +98,18 @@ async function withScrubbedEnv<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-function assertLibreOfficeConversionAllowed() {
-  if (bundledSofficePath()) return;
-  if (
-    process.platform !== "win32" &&
-    process.env.DOCKET_ENABLE_SYSTEM_LIBREOFFICE_PROBE !== "1"
-  ) {
-    throw new Error(
-      "System LibreOffice conversion is disabled. Set DOCKET_ENABLE_SYSTEM_LIBREOFFICE_PROBE=1 to allow DOC/DOCX→PDF conversion with the local LibreOffice install.",
-    );
-  }
+/**
+ * The binary to convert with. Throws rather than returning null so callers
+ * surface one clear message instead of a "Could not find soffice binary"
+ * from inside the conversion package.
+ */
+function requireSofficePath(): string {
+  const found = sofficePath();
+  if (found) return found;
+  throw new Error(
+    "LibreOffice was not found, so DOC/DOCX→PDF conversion is unavailable. " +
+      "Install LibreOffice and retry — Settings › System reports what the app detects.",
+  );
 }
 
 // Hard caps for LibreOffice conversion. A pathological DOCX can hang
@@ -102,10 +125,9 @@ const CONVERT_MAX_OUTPUT_BYTES = 200 * 1024 * 1024;
  */
 export async function docxToPdf(buffer: Buffer): Promise<Buffer> {
   const run = async () => {
-    assertLibreOfficeConversionAllowed();
-    const convert = await getConvert();
+    const soffice = requireSofficePath();
     const normalized = await normalizeDocxZipPaths(buffer);
-    const work = withScrubbedEnv(() => convert(normalized, ".pdf", undefined));
+    const work = withScrubbedEnv(() => convertToPdf(normalized, soffice));
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(

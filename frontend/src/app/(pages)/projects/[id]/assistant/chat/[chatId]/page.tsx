@@ -91,8 +91,8 @@ type DocTab = {
     scrollTop?: number;
     focusAnnotationId?: string | null;
     focusAnnotationKey?: number;
-    /** 0..1 progressive PDF render progress; undefined = not a PDF render. */
-    renderProgress?: number;
+    /** True while the PDF is parsed and its page layout built. */
+    layoutPreparing?: boolean;
 };
 
 type EditScrollTarget = {
@@ -2013,25 +2013,21 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                             }
                                             className={`group flex items-center gap-1.5 px-3 h-full border-r border-gray-200 cursor-pointer shrink-0 max-w-[260px] transition-colors ${
                                                 isActive
-                                                    ? "bg-gray-100"
-                                                    : "bg-white hover:bg-gray-50"
+                                                    ? "bg-white"
+                                                    : "bg-gray-100 hover:bg-gray-200"
                                             }`}
                                         >
-                                            {typeof tab.renderProgress ===
-                                                "number" &&
-                                            tab.renderProgress < 1 ? (
-                                                // Clockwise-filling pie: pages render
-                                                // progressively, which reflows the
-                                                // scrollbar — show that it's loading,
-                                                // not glitching.
+                                            {tab.layoutPreparing ? (
+                                                // Only the initial parse/layout
+                                                // makes the user wait; pages
+                                                // themselves render on demand.
                                                 <span
-                                                    data-session-check="doc-tab-render-progress"
-                                                    title={`Rendering pages… ${Math.round(tab.renderProgress * 100)}%`}
-                                                    className="h-3.5 w-3.5 shrink-0 rounded-full"
-                                                    style={{
-                                                        background: `conic-gradient(#2563eb ${tab.renderProgress * 360}deg, #e5e7eb 0deg)`,
-                                                    }}
-                                                />
+                                                    data-session-check="doc-tab-layout-preparing"
+                                                    title="Preparing document…"
+                                                    className="inline-flex shrink-0"
+                                                >
+                                                    <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-500" />
+                                                </span>
                                             ) : (
                                                 <FileText
                                                     className={`h-3.5 w-3.5 shrink-0 ${iconColor}`}
@@ -2046,8 +2042,8 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                                 <span
                                                     className={`shrink-0 inline-flex items-center rounded border px-1 py-px text-[9px] font-medium ${
                                                         isActive
-                                                            ? "border-gray-200 bg-white text-gray-600"
-                                                            : "border-gray-200 bg-gray-50 text-gray-500"
+                                                            ? "border-gray-200 bg-gray-50 text-gray-600"
+                                                            : "border-gray-200 bg-white text-gray-500"
                                                     }`}
                                                 >
                                                     V{versionNumber}
@@ -2148,12 +2144,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     focusAnnotationKey={
                                         activeTab.focusAnnotationKey
                                     }
-                                    onRenderProgress={(rendered, total) =>
+                                    onLayoutPreparing={(preparing) =>
                                         patchTab(activeTab.documentId, {
-                                            renderProgress:
-                                                total > 0
-                                                    ? rendered / total
-                                                    : 1,
+                                            layoutPreparing: preparing,
                                         })
                                     }
                                     onAnnotationsChanged={

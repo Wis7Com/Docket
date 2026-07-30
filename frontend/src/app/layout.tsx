@@ -28,8 +28,10 @@ export const metadata: Metadata = {
 };
 
 // Applies the saved theme before hydration so the first paint doesn't
-// flash the wrong scheme. Storage key must match ThemeContext.
-const themeInitScript = `(function(){try{var t=localStorage.getItem("docket-theme");var d=t==="dark"||(t!=="light"&&window.matchMedia("(prefers-color-scheme: dark)").matches);if(d)document.documentElement.classList.add("dark");}catch(e){}})();`;
+// flash the wrong scheme. Prefers the desktop bridge (the preload has it
+// ready before this runs) and falls back to localStorage for browser runs —
+// same precedence as ThemeContext, whose storage key this must match.
+const themeInitScript = `(function(){try{var t=(window.docket&&window.docket.initialTheme)||localStorage.getItem("docket-theme");var d=t==="dark"||(t!=="light"&&window.matchMedia("(prefers-color-scheme: dark)").matches);if(d)document.documentElement.classList.add("dark");}catch(e){}})();`;
 
 export default function RootLayout({
     children,

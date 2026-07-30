@@ -18,6 +18,9 @@ import {
   ensureAppDataLayout,
   resolveDataDir,
   migrateLegacyUserDataDir,
+  isThemePreference,
+  readThemePreference,
+  writeThemePreference,
 } from "./appData";
 import { readSecrets } from "./secrets";
 import { signLocalJwt } from "./jwt";
@@ -91,6 +94,15 @@ function installAppIcon(): void {
   }
 }
 
+/**
+ * Hand the saved theme to the preload as a launch argument. The renderer's
+ * pre-hydration script has to pick a theme before it can await anything, so an
+ * IPC round-trip would flash the wrong scheme; argv is there synchronously.
+ */
+function themeLaunchArguments(): string[] {
+  return [`--docket-theme=${readThemePreference()}`];
+}
+
 function createWindow(): BrowserWindow {
   const w = new BrowserWindow({
     width: 1280,
@@ -102,6 +114,7 @@ function createWindow(): BrowserWindow {
     backgroundColor: "#0b0b0d",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
+      additionalArguments: themeLaunchArguments(),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -287,6 +300,7 @@ function documentViewerWindowOptions(): Electron.BrowserWindowConstructorOptions
     backgroundColor: "#f8fafc",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
+      additionalArguments: themeLaunchArguments(),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -1776,12 +1790,22 @@ async function inspectAssistantCitationPromotionDom(
           const items = Array.from(viewer.querySelectorAll(".pdf-text-highlight"));
           return items.length > 0 ? items : null;
         }, 30000, diagnostics);
-        const save = await waitFor("save citation highlight control", () =>
-          viewer.querySelector('[data-session-check="pdf-save-citation-highlight"]'),
+        // Citation highlights are promoted one at a time: click the temporary
+        // highlight, then pick a color from the quick menu that opens.
+        const highlightBox = tempHighlights[0].getBoundingClientRect();
+        tempHighlights[0].dispatchEvent(new MouseEvent("mouseup", {
+          bubbles: true,
+          cancelable: true,
+          button: 0,
+          clientX: highlightBox.left + highlightBox.width / 2,
+          clientY: highlightBox.top + highlightBox.height / 2,
+        }));
+        const quickColor = await waitFor("citation highlight quick color control", () =>
+          document.querySelector('[data-session-check="pdf-quick-menu"] [aria-label^="Highlight "]'),
           30000,
           diagnostics,
         );
-        save.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        quickColor.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
         const afterRows = await waitFor("saved citation-promotion annotation", async () => {
           const rows = await fetchAnnotationRows();
           const promotions = rows.filter((row) =>
@@ -2967,6 +2991,24 @@ ipcMain.handle("docket:getUser", (event) => {
 ipcMain.handle("docket:getApiPort", (event) =>
   isTrustedIpcSender(event) ? getBackendPort() : null,
 );
+// Theme lives in the desktop config so it survives the frontend's port —
+// and therefore its origin — changing on every launch. Every open window is
+// told, so the document viewer follows a change made in Settings.
+ipcMain.handle("docket:setTheme", (event, theme: unknown) => {
+  if (!isTrustedIpcSender(event)) return { ok: false };
+  if (!isThemePreference(theme)) return { ok: false };
+  try {
+    writeThemePreference(theme);
+  } catch (err) {
+    console.error("[theme] failed to persist preference:", err);
+    return { ok: false };
+  }
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (w.isDestroyed()) continue;
+    w.webContents.send("docket:theme-changed", theme);
+  }
+  return { ok: true };
+});
 ipcMain.handle("docket:focusMainWindow", (event) => {
   if (!isTrustedIpcSender(event) || !win || win.isDestroyed()) {
     return { ok: false };
