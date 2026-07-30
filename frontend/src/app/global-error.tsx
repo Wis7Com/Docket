@@ -1,6 +1,22 @@
 "use client";
 
 import { useEffect } from "react";
+import { Inter, EB_Garamond } from "next/font/google";
+
+// global-error replaces the root layout, so the fonts it sets up — and the
+// CSS variables they define — are not available here. Load our own instances:
+// next/font downloads them at build time and serves them from our own origin,
+// which keeps this page working offline like the rest of the app.
+const inter = Inter({
+    variable: "--font-inter",
+    subsets: ["latin"],
+});
+
+const ebGaramond = EB_Garamond({
+    variable: "--font-eb-garamond",
+    subsets: ["latin"],
+    weight: ["400", "500"],
+});
 
 export default function GlobalError({
     error,
@@ -12,16 +28,14 @@ export default function GlobalError({
     }, [error]);
 
     return (
-        <html lang="en">
+        <html lang="en" className={`${inter.variable} ${ebGaramond.variable}`}>
             <head>
                 <title>Something went wrong – Docket</title>
                 <style>{`
-                    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=EB+Garamond:wght@400;500&display=swap');
-
                     * { margin: 0; padding: 0; box-sizing: border-box; }
 
                     body {
-                        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+                        font-family: var(--font-inter, -apple-system), BlinkMacSystemFont, sans-serif;
                         background-color: #ffffff;
                         color: #111;
                         min-height: 100vh;
@@ -37,7 +51,7 @@ export default function GlobalError({
                     }
 
                     .error-title {
-                        font-family: 'EB Garamond', Georgia, serif;
+                        font-family: var(--font-eb-garamond, Georgia), serif;
                         font-size: 1.75rem;
                         font-weight: 400;
                         color: #111;
@@ -59,7 +73,7 @@ export default function GlobalError({
                         border-radius: 0.5rem;
                         font-size: 0.875rem;
                         font-weight: 500;
-                        font-family: 'Inter', sans-serif;
+                        font-family: var(--font-inter, -apple-system), sans-serif;
                         cursor: pointer;
                         transition: all 0.15s ease;
                         text-decoration: none;

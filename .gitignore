@@ -31,3 +31,8 @@ backend/.dist-bundle/
 
 # Native OCR helper compiled locally by scripts/build-vision-ocr.js
 /native/macos-vision-ocr/docket-vision-ocr
+
+# PDF standard fonts copied out of the pinned pdfjs-dist package by
+# scripts/stage-pdf-standard-fonts.js before dev and build. Generated rather
+# than committed so they cannot drift from the library that loads them.
+/frontend/public/standard_fonts/

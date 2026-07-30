@@ -4,7 +4,9 @@
     "license": "AGPL-3.0-only",
     "private": true,
     "scripts": {
+        "predev": "node ../scripts/stage-pdf-standard-fonts.js",
         "dev": "next dev",
+        "prebuild": "node ../scripts/stage-pdf-standard-fonts.js",
         "build": "node ../scripts/clean-next-dev-types.js && next build",
         "start": "next start",
         "lint": "eslint",

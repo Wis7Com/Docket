@@ -89,6 +89,49 @@ function walk(node, packages) {
   }
 }
 
+/**
+ * `npm ls` exits non-zero for benign reasons — a peer-dep warning is enough —
+ * so its exit code cannot gate this script. But it *also* exits non-zero when
+ * packages are simply not installed, and in that case it still prints a tree:
+ * a degraded one, with the unresolved dependencies flagged and their subtrees
+ * gone. Walking that tree silently under-reports.
+ *
+ * That is not hypothetical. A frontend/ whose node_modules npm could no longer
+ * reconcile — every declared dependency reported missing while all 592 were
+ * present on disk, fixed by reinstalling — took this file from 866 packages to
+ * 504. The LGPL-3.0 libvips paragraph and the CC-BY-4.0 caniuse-lite entry went
+ * with them. Nothing failed; the file just got shorter.
+ *
+ * A notices file that quietly drops disclosures is worse than one that refuses
+ * to build, so an unresolved tree is a hard error. Only top-level dependencies
+ * are checked: platform-specific optional packages further down (the @esbuild
+ * and @img/sharp-libvips sets) are legitimately absent on any one machine and
+ * are reported with a null version by design.
+ */
+function assertTreeResolved(tree, parsed) {
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(ROOT, tree, "package.json"), "utf8"),
+  );
+  const declared = Object.keys(manifest.dependencies || {});
+  const resolved = parsed.dependencies || {};
+  const missing = declared.filter(
+    (name) => !resolved[name] || resolved[name].missing,
+  );
+  if (missing.length === 0) return;
+
+  const shown = missing.slice(0, 5).join(", ");
+  const more = missing.length > 5 ? `, +${missing.length - 5} more` : "";
+  const err = new Error(
+    `${tree}/ has ${missing.length} of ${declared.length} dependencies ` +
+      `unresolved (${shown}${more}).\n` +
+      `Refusing to write THIRD-PARTY-NOTICES.md from an incomplete tree — ` +
+      `it would silently drop disclosures.\n` +
+      `Run \`npm install --prefix ${tree}\` and try again.`,
+  );
+  err.expected = true;
+  throw err;
+}
+
 function collect() {
   const packages = new Map();
   for (const tree of TREES) {
@@ -106,13 +149,16 @@ function collect() {
     } catch (err) {
       // `npm ls` exits non-zero on peer-dep warnings but still prints the tree.
       if (!err.stdout) {
-        throw new Error(
+        const fatal = new Error(
           `Unable to read the dependency tree for ${tree}/. ` +
             `Run \`npm install\` in ${tree}/ first. (${err.message})`,
         );
+        fatal.expected = true;
+        throw fatal;
       }
       parsed = JSON.parse(err.stdout);
     }
+    assertTreeResolved(tree, parsed);
     walk(parsed, packages);
   }
   // Docket's own workspace package is not a third party.
@@ -166,6 +212,19 @@ and the **KaTeX** math fonts that ship with the \`katex\` package. OFL-1.1
 permits bundling and redistribution; it forbids selling the fonts on their
 own and requires this notice to travel with them. License text:
 <https://openfontlicense.org/>.
+
+The PDF viewer additionally serves the **14 PDF standard fonts** that ship
+with \`pdfjs-dist\`, used when a document references Helvetica, Times, Courier,
+Symbol, or ZapfDingbats without embedding them. These are two separate sets
+under two licenses: the **Liberation** fonts (Red Hat, with digitized data by
+Google) under **SIL OFL 1.1** as above, and the **Foxit** substitution fonts
+(\`Foxit*.pfb\`) under **BSD-3-Clause**, copyright the PDFium Authors. Upstream
+pdf.js loads these from a CDN at run time; Docket copies them out of the
+pinned package into \`frontend/public/standard_fonts/\` at build time
+(\`scripts/stage-pdf-standard-fonts.js\`) and serves them from the app's own
+origin, so viewing a document works offline and reaches no third party. Both
+license texts — \`LICENSE_LIBERATION\` and \`LICENSE_FOXIT\` — are copied
+alongside the fonts, which is what each license asks for.
 
 ### LibreOffice — Windows installer only
 
@@ -320,4 +379,15 @@ function main() {
   console.log(`[notices] wrote ${path.relative(ROOT, OUT)}`);
 }
 
-main();
+try {
+  main();
+} catch (err) {
+  // An incomplete install is a normal thing to hit, not a defect in this
+  // script: print it as something to act on. Anything else keeps its stack,
+  // because that would be a real bug worth seeing in full.
+  if (err && err.expected) {
+    console.error(`[notices] ${err.message}`);
+    process.exit(1);
+  }
+  throw err;
+}

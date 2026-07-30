@@ -33,6 +33,19 @@ permits bundling and redistribution; it forbids selling the fonts on their
 own and requires this notice to travel with them. License text:
 <https://openfontlicense.org/>.
 
+The PDF viewer additionally serves the **14 PDF standard fonts** that ship
+with `pdfjs-dist`, used when a document references Helvetica, Times, Courier,
+Symbol, or ZapfDingbats without embedding them. These are two separate sets
+under two licenses: the **Liberation** fonts (Red Hat, with digitized data by
+Google) under **SIL OFL 1.1** as above, and the **Foxit** substitution fonts
+(`Foxit*.pfb`) under **BSD-3-Clause**, copyright the PDFium Authors. Upstream
+pdf.js loads these from a CDN at run time; Docket copies them out of the
+pinned package into `frontend/public/standard_fonts/` at build time
+(`scripts/stage-pdf-standard-fonts.js`) and serves them from the app's own
+origin, so viewing a document works offline and reaches no third party. Both
+license texts — `LICENSE_LIBERATION` and `LICENSE_FOXIT` — are copied
+alongside the fonts, which is what each license asks for.
+
 ### LibreOffice — Windows installer only
 
 The Windows installer bundles [LibreOffice](https://www.libreoffice.org/)
