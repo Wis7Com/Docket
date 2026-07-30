@@ -1,5 +1,4 @@
 import * as path from "path";
-import * as fs from "fs";
 import type { createServerSupabase } from "./supabase";
 import { resolveSourceFolderPath, scanSourceFolder } from "./sourceFolders";
 import {
@@ -13,63 +12,13 @@ import {
   refreshProjectRegistryCounts,
   unregisterProject,
 } from "./projectRegistry";
-import {
-  getCurrentDatabaseContext,
-  runWithDatabaseContext,
-} from "../db/sqlite";
-import { isAllowedDocumentType } from "./documentTypes";
+import { runWithDatabaseContext } from "../db/sqlite";
 
 type Supa = ReturnType<typeof createServerSupabase>;
 
-const IMPORT_SKIP = new Set([".git", ".docket", "node_modules"]);
-
-function isInsideRoot(root: string, candidate: string): boolean {
-  const rel = path.relative(root, candidate);
-  return (
-    rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel)
-  );
-}
-
-function uniquePath(parent: string, name: string): string {
-  const parsed = path.parse(name);
-  let candidate = path.join(parent, name);
-  let n = 1;
-  while (fs.existsSync(candidate)) {
-    candidate = path.join(parent, `${parsed.name} (${n})${parsed.ext}`);
-    n += 1;
-  }
-  return candidate;
-}
-
-function copySupportedFilesIntoProject(args: {
-  sourceRoot: string;
-  projectRoot: string;
-}): string {
-  const destRoot = uniquePath(args.projectRoot, path.basename(args.sourceRoot));
-  const visit = (dir: string) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name.startsWith(".") || IMPORT_SKIP.has(entry.name)) continue;
-      const src = path.join(dir, entry.name);
-      const rel = path.relative(args.sourceRoot, src);
-      const dest = path.join(destRoot, rel);
-      if (entry.isDirectory()) {
-        visit(src);
-      } else if (entry.isFile() || entry.isSymbolicLink()) {
-        const ext = path.extname(entry.name).slice(1).toLowerCase();
-        if (!isAllowedDocumentType(ext)) continue;
-        const realSrc = fs.realpathSync(src);
-        if (!isInsideRoot(args.sourceRoot, realSrc)) continue;
-        fs.mkdirSync(path.dirname(dest), { recursive: true });
-        fs.copyFileSync(realSrc, dest);
-      }
-    }
-  };
-  fs.mkdirSync(destRoot, { recursive: true });
-  visit(args.sourceRoot);
-  return destRoot;
-}
-
-export async function addSourceFolderToProject(args: {
+// Only ever called with a project's own root folder — a project *is* its
+// folder, so there is no import-from-elsewhere path to handle here.
+async function addSourceFolderToProject(args: {
   db: Supa;
   projectId: string;
   userId: string;
@@ -79,17 +28,7 @@ export async function addSourceFolderToProject(args: {
   scan: Awaited<ReturnType<typeof scanSourceFolder>>;
   root: string;
 }> {
-  const requestedRoot = resolveSourceFolderPath(args.folderPath);
-  const ctx = getCurrentDatabaseContext();
-  const projectRoot =
-    ctx.kind === "project" ? fs.realpathSync(ctx.dataRoot) : null;
-  const root =
-    projectRoot && !isInsideRoot(projectRoot, requestedRoot)
-      ? copySupportedFilesIntoProject({
-          sourceRoot: requestedRoot,
-          projectRoot,
-        })
-      : requestedRoot;
+  const root = resolveSourceFolderPath(args.folderPath);
   const storedRoot = toStoredSourceFolderPath(root);
   const { data: existingFolders, error: existingErr } = await args.db
     .from("source_folders")

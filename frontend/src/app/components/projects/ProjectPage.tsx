@@ -9,7 +9,6 @@ import {
 } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
-  Upload,
   Plus,
   Loader2,
   FileText,
@@ -57,7 +56,6 @@ import {
   deletePdfAnnotation,
   exportAnnotatedPdf,
   rescanDocument,
-  addProjectSourceFolder,
   listProjectSourceFolders,
   rescanProjectSourceFolder,
   getProjectIndexStatus,
@@ -94,7 +92,6 @@ import type {
 import { ToolbarTabs } from "@/app/components/shared/ToolbarTabs";
 import { RenameableTitle } from "@/app/components/shared/RenameableTitle";
 import { RowActions } from "@/app/components/shared/RowActions";
-import { AddDocumentsModal } from "@/app/components/shared/AddDocumentsModal";
 import { OwnerOnlyModal } from "@/app/components/shared/OwnerOnlyModal";
 import { useAuth } from "@/contexts/AuthContext";
 import { DocViewModal } from "@/app/components/shared/DocViewModal";
@@ -495,83 +492,6 @@ function IndexActionTooltip({
         {text}
       </span>
     </span>
-  );
-}
-
-function SourceFolderModal({
-  open,
-  busy,
-  error,
-  path,
-  onPathChange,
-  onPick,
-  onClose,
-  onSubmit,
-}: {
-  open: boolean;
-  busy: boolean;
-  error: string | null;
-  path: string;
-  onPathChange: (path: string) => void;
-  onPick: () => void;
-  onClose: () => void;
-  onSubmit: () => void;
-}) {
-  if (!open) return null;
-  return (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/10 backdrop-blur-xs">
-      <div className="w-full max-w-xl rounded-2xl bg-white shadow-2xl">
-        <div className="flex items-center justify-between px-5 py-4">
-          <div className="flex items-center gap-2 text-sm font-medium text-gray-800">
-            <FolderOpen className="h-4 w-4 text-gray-500" />
-            Open folder
-          </div>
-          <button
-            onClick={onClose}
-            className="rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-        <div className="px-5 pb-4">
-          <div className="flex gap-2">
-            <input
-              value={path}
-              onChange={(e) => onPathChange(e.target.value)}
-              placeholder="/Users/you/Documents/case-folder"
-              className="min-w-0 flex-1 rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-800 outline-none focus:border-gray-400"
-              autoFocus
-            />
-            <button
-              type="button"
-              onClick={onPick}
-              className="rounded-lg border border-gray-200 px-3 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50"
-            >
-              Browse
-            </button>
-          </div>
-          {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
-        </div>
-        <div className="flex items-center justify-end gap-2 border-t border-gray-100 px-5 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-lg px-3 py-2 text-sm font-medium text-gray-500 hover:bg-gray-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            disabled={busy || path.trim().length === 0}
-            onClick={onSubmit}
-            className="flex items-center gap-2 rounded-lg bg-gray-900 px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:bg-gray-300"
-          >
-            {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-            Open
-          </button>
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -976,13 +896,6 @@ export function ProjectPage({ projectId }: Props) {
     tabParam === "assistant" || tabParam === "reviews" ? tabParam : "documents";
   const [documentsPanel, setDocumentsPanel] =
     useState<DocumentsPanel>("files");
-  const [addDocsOpen, setAddDocsOpen] = useState(false);
-  const [sourceFolderOpen, setSourceFolderOpen] = useState(false);
-  const [sourceFolderPath, setSourceFolderPath] = useState("");
-  const [sourceFolderBusy, setSourceFolderBusy] = useState(false);
-  const [sourceFolderError, setSourceFolderError] = useState<string | null>(
-    null,
-  );
   const [sourceFolders, setSourceFolders] = useState<DocketSourceFolder[]>([]);
   const [sourceFolderScanSummary, setSourceFolderScanSummary] = useState<
     Record<string, string>
@@ -1848,82 +1761,6 @@ export function ProjectPage({ projectId }: Props) {
   }
 
   // ── Doc/chat/review handlers ──────────────────────────────────────────────
-
-  function handleDocsSelected(newDocs: DocketDocument[]) {
-    setProject((prev) =>
-      prev
-        ? {
-            ...prev,
-            documents: [
-              ...(prev.documents || []),
-              ...newDocs.filter(
-                (d) => !prev.documents?.some((e) => e.id === d.id),
-              ),
-            ],
-          }
-        : prev,
-    );
-    setTimeout(() => void refreshIndexStatus(), 300);
-  }
-
-  async function pickSourceFolder() {
-    const bridge =
-      typeof window !== "undefined"
-        ? (window.docket as
-            | {
-                pickSourceFolder?: () => Promise<{
-                  ok: boolean;
-                  path?: string;
-                  error?: string;
-                }>;
-              }
-            | undefined)
-        : undefined;
-    if (!bridge?.pickSourceFolder) return;
-    const result = await bridge.pickSourceFolder();
-    if (result.ok && result.path) {
-      setSourceFolderPath(result.path);
-      setSourceFolderError(null);
-    } else if (result.error) {
-      setSourceFolderError(result.error);
-    }
-  }
-
-  async function submitSourceFolder() {
-    const path = sourceFolderPath.trim();
-    if (!path) return;
-    setSourceFolderBusy(true);
-    setSourceFolderError(null);
-    try {
-      const result = await addProjectSourceFolder(projectId, path);
-      setSourceFolders((prev) => [...prev, result.source_folder]);
-      setSourceFolderScanSummary((prev) => ({
-        ...prev,
-        [result.source_folder.id]: formatScanSummary(result),
-      }));
-      setProject((prev) =>
-        prev
-          ? {
-              ...prev,
-              documents: [
-                ...(prev.documents ?? []),
-                ...result.imported.filter(
-                  (d) =>
-                    !prev.documents?.some((existing) => existing.id === d.id),
-                ),
-              ],
-            }
-          : prev,
-      );
-      setSourceFolderOpen(false);
-      setSourceFolderPath("");
-      setTimeout(() => void refreshIndexStatus(), 300);
-    } catch (err) {
-      setSourceFolderError((err as Error).message || "Could not open folder.");
-    } finally {
-      setSourceFolderBusy(false);
-    }
-  }
 
   function mergeScanDocuments(result: DocketSourceFolderScanResult) {
     setProject((prev) => {
@@ -2908,23 +2745,6 @@ export function ProjectPage({ projectId }: Props) {
             <FolderPlus className="h-3.5 w-3.5" />
             Add Subfolder
           </button>
-          <button
-            onClick={() => {
-              setSourceFolderOpen(true);
-              setSourceFolderError(null);
-            }}
-            className="flex items-center gap-1 text-xs px-3 font-medium text-gray-500 hover:text-gray-700 transition-colors"
-          >
-            <FolderOpen className="h-3.5 w-3.5" />
-            Open Folder
-          </button>
-          <button
-            onClick={() => setAddDocsOpen(true)}
-            className="flex items-center gap-1 text-xs px-3 font-medium text-gray-500 hover:text-gray-700 transition-colors"
-          >
-            <Upload className="h-3.5 w-3.5" />
-            Add Documents
-          </button>
         </>
       )}
     </div>
@@ -3046,7 +2866,7 @@ export function ProjectPage({ projectId }: Props) {
             </button>
             {docs.length === 0 && (
               <div className="pointer-events-none absolute right-0 top-full mt-1.5 z-10 hidden group-hover:flex items-center whitespace-nowrap rounded-lg bg-gray-900 px-2.5 py-1.5 text-xs text-white shadow-lg">
-                Upload a document first
+                Add a document first
               </div>
             )}
           </div>
@@ -3632,13 +3452,10 @@ export function ProjectPage({ projectId }: Props) {
 
                 {/* Empty state */}
                 {docs.length === 0 && folders.length === 0 ? (
-                  <div
-                    onClick={() => setAddDocsOpen(true)}
-                    className="flex-1 flex cursor-pointer flex-col items-center justify-center py-24 text-center"
-                  >
-                    <Upload className="h-8 w-8 text-gray-200 mb-3" />
+                  <div className="flex-1 flex flex-col items-center justify-center py-24 text-center">
+                    <FolderOpen className="h-8 w-8 text-gray-200 mb-3" />
                     <p className="text-sm text-gray-400">
-                      Drop PDF or DOCX files here
+                      Add PDF or DOCX files to the project folder, then Rescan
                     </p>
                   </div>
                 ) : (
@@ -4220,29 +4037,6 @@ export function ProjectPage({ projectId }: Props) {
           )}
         </div>
       </div>
-
-      <AddDocumentsModal
-        open={addDocsOpen}
-        onClose={() => setAddDocsOpen(false)}
-        onSelect={handleDocsSelected}
-        breadcrumb={[
-          "Projects",
-          project.name + (project.cm_number ? ` (${project.cm_number})` : ""),
-          "Add Documents",
-        ]}
-        projectId={projectId}
-      />
-
-      <SourceFolderModal
-        open={sourceFolderOpen}
-        busy={sourceFolderBusy}
-        error={sourceFolderError}
-        path={sourceFolderPath}
-        onPathChange={setSourceFolderPath}
-        onPick={pickSourceFolder}
-        onClose={() => setSourceFolderOpen(false)}
-        onSubmit={submitSourceFolder}
-      />
 
       <DocViewModal
         doc={viewingDoc}

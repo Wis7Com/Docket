@@ -553,17 +553,6 @@ export async function listProjectSourceFolders(
   );
 }
 
-export async function addProjectSourceFolder(
-  projectId: string,
-  path: string,
-): Promise<DocketSourceFolderScanResult> {
-  return apiRequest(`/projects/${projectId}/source-folders`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path }),
-  });
-}
-
 export async function rescanProjectSourceFolder(
   projectId: string,
   sourceFolderId: string,

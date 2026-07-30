@@ -16,10 +16,7 @@ import {
   resolveSourceFolderPath,
   scanSourceFolder,
 } from "../lib/sourceFolders";
-import {
-  addSourceFolderToProject,
-  createProjectFromFolder,
-} from "../lib/projectFolders";
+import { createProjectFromFolder } from "../lib/projectFolders";
 import {
   displaySourceFolderPath,
   resolveStoredSourceFolderPath,
@@ -665,47 +662,6 @@ projectsRouter.get(
 // POST /projects/:projectId/source-folders
 // Open an additional local/OneDrive/Google Drive folder by reference, then scan
 // supported legal source files into project documents without copying originals.
-projectsRouter.post(
-  "/:projectId/source-folders",
-  requireAuth,
-  async (req, res) => {
-    const userId = res.locals.userId as string;
-    const userEmail = res.locals.userEmail as string | undefined;
-    const { projectId } = req.params;
-    const folderPath = typeof req.body?.path === "string" ? req.body.path : "";
-    if (!folderPath.trim())
-      return void res.status(400).json({ detail: "path is required" });
-
-    const db = createServerSupabase();
-    const access = await checkProjectAccess(projectId, userId, userEmail, db);
-    if (!access.ok)
-      return void res.status(404).json({ detail: "Project not found" });
-    if (!access.isOwner)
-      return void res
-        .status(403)
-        .json({ detail: "Only the project owner can open folders" });
-
-    let opened: Awaited<ReturnType<typeof addSourceFolderToProject>>;
-    try {
-      opened = await addSourceFolderToProject({
-        db,
-        projectId,
-        userId,
-        folderPath,
-      });
-    } catch (err) {
-      return void res.status(400).json({
-        detail: (err as Error).message || "Could not open folder",
-      });
-    }
-
-    res.status(201).json({
-      source_folder: serializeSourceFolder(opened.sourceFolder),
-      ...opened.scan,
-    });
-  },
-);
-
 // POST /projects/:projectId/source-folders/:sourceFolderId/rescan
 projectsRouter.post(
   "/:projectId/source-folders/:sourceFolderId/rescan",
