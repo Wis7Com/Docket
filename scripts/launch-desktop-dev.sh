@@ -50,6 +50,16 @@ cd "$ROOT"
 export PATH="$NODE22_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 printf '\n[%s] Starting Docket from %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$ROOT" >> "$LOG_FILE"
+
+# Same reason as the production launcher: a hardcoded :3000 turns any leftover
+# listener into a startup timeout. `next dev` takes its port from PORT, and
+# Electron takes the URL from DOCKET_FRONTEND_URL. The backend is unaffected —
+# Electron spawns it with PORT=0 explicitly, so it never inherits this one.
+FRONTEND_PORT="$(node scripts/pick-free-port.js)"
+export PORT="$FRONTEND_PORT"
+export DOCKET_FRONTEND_URL="http://127.0.0.1:$FRONTEND_PORT"
+printf '[%s] Frontend port %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$FRONTEND_PORT" >> "$LOG_FILE"
+
 npm run dev >> "$LOG_FILE" 2>&1 &
 child_pid="$!"
 wait "$child_pid"

@@ -2889,15 +2889,21 @@ async function startLocalSession(
       return { ok: false, error };
     }
     if (!frontendReady) {
-      const msg = "The frontend did not become ready in time.";
-      console.error("[session] frontend failed to become ready.");
+      // Name the URL and show the log tail, as the backend path does. Without
+      // them this dialog said only that the frontend was not ready, while the
+      // actual cause — most often the port already being in use — sat in the
+      // launcher log the user had no reason to open.
+      const detail = `The frontend did not become ready in time (${FRONTEND_URL}).`;
+      const msg = `${detail}\n\nLast log lines:\n\n${tailLogFile(50)}`;
+      console.error("[session] frontend failed to become ready:", FRONTEND_URL);
       dialog.showErrorBox("Docket couldn't start", msg);
       sessionJwt = null;
       sessionSecret = null;
       activeProjectPath = null;
       stopBackend();
       stopFrontend();
-      return { ok: false, error: msg };
+      // The dialog carries the log tail; callers get the one-line reason.
+      return { ok: false, error: detail };
     }
     if (win) loadMainApp(win);
     return { ok: true };

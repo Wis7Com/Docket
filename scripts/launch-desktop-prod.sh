@@ -113,9 +113,18 @@ fi
 server_js="$(standalone_server)"
 server_dir="$(dirname "$server_js")"
 
+# The frontend used to hardcode :3000, so anything already holding that port —
+# another project's dev server, or this app's own frontend outliving a previous
+# launch — made startup fail with a timeout that never mentioned the port. Take
+# an OS-assigned port instead and tell Electron (and, through it, the backend's
+# CORS origin) where the frontend actually is.
+FRONTEND_PORT="$(node scripts/pick-free-port.js)"
+export DOCKET_FRONTEND_URL="http://127.0.0.1:$FRONTEND_PORT"
+printf '[%s] Frontend port %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$FRONTEND_PORT" >> "$LOG_FILE"
+
 (
   cd "$server_dir"
-  PORT=3000 HOSTNAME=127.0.0.1 NODE_ENV=production exec node "$server_js"
+  PORT="$FRONTEND_PORT" HOSTNAME=127.0.0.1 NODE_ENV=production exec node "$server_js"
 ) >> "$LOG_FILE" 2>&1 &
 frontend_pid="$!"
 
@@ -123,8 +132,8 @@ frontend_pid="$!"
 node scripts/check-node-version.js >> "$LOG_FILE" 2>&1
 node scripts/ensure-dev-native-modules.js >> "$LOG_FILE" 2>&1
 
-# dev:electron waits for :3000 (our standalone server above), compiles the
-# Electron main process fresh, then launches the app.
+# dev:electron waits for DOCKET_FRONTEND_URL (our standalone server above),
+# compiles the Electron main process fresh, then launches the app.
 npm run dev:electron >> "$LOG_FILE" 2>&1 &
 electron_pid="$!"
 wait "$electron_pid"

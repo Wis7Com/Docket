@@ -14,7 +14,7 @@
     "dev": "concurrently -k -n FRONTEND,ELECTRON -c blue,magenta \"npm:dev:frontend\" \"npm:dev:electron\"",
     "dev:frontend": "npm --prefix frontend run dev",
     "dev:backend": "npm --prefix backend run dev",
-    "dev:electron": "wait-on http://localhost:3000 && npm run build:electron && cross-env NODE_ENV=development electron .",
+    "dev:electron": "node scripts/wait-frontend.js && npm run build:electron && cross-env NODE_ENV=development electron .",
     "electron:lock-only": "npm run build:electron && cross-env NODE_ENV=development electron .",
     "install:all": "npm install && npm --prefix frontend install && npm --prefix backend install",
     "build:electron": "npm run icons && node scripts/build-vision-ocr.js && tsc -p tsconfig.electron.json && node scripts/copy-electron-assets.js",
