@@ -258,6 +258,13 @@ export default function AccountPage() {
             </a>
             .
           </p>
+          <p>
+            &quot;Docket&quot; is an ordinary word in the legal field, and
+            unrelated products, companies, and trademarks share the name. This
+            project is an independent, non-commercial open-source project and is
+            not affiliated with, endorsed by, sponsored by, or otherwise
+            connected to any of them.
+          </p>
         </div>
       </div>
     </div>

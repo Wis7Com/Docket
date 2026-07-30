@@ -853,6 +853,11 @@ review UI, and the workflow system are upstream work.
 - "Mike" is the upstream project's name; Docket is an independent
   derivative and is not affiliated with or endorsed by the Mike or
   mikelocal projects.
+- "Docket" is an ordinary word in the legal field, and unrelated
+  products, companies, and trademarks share the name. This project is an
+  independent, non-commercial open-source project and is not affiliated
+  with, endorsed by, sponsored by, or otherwise connected to any of
+  them.
 
 ### Third-party components
 
