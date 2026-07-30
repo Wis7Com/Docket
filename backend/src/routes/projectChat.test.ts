@@ -160,7 +160,10 @@ test("annotation prompt requires the dedicated tool instead of document search",
         PROJECT_ANNOTATION_TOOL_PROMPT,
         /get_annotation_digest summary\.total and the number of numbered answer sections must match/,
     );
-    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /N개 중 N개를 다룬다/);
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /how many of the total annotations are covered/,
+    );
     assert.match(
         PROJECT_ANNOTATION_TOOL_PROMPT,
         /exactly one numbered section for each annotation/,
@@ -169,10 +172,25 @@ test("annotation prompt requires the dedicated tool instead of document search",
         PROJECT_ANNOTATION_TOOL_PROMPT,
         /highlight's original text followed by the opposing party's response/,
     );
-    assert.match(PROJECT_ANNOTATION_TOOL_PROMPT, /반박 미발견/);
     assert.match(
         PROJECT_ANNOTATION_TOOL_PROMPT,
-        /하이라이트는 사용자의 읽기 우선순위이고, 사실 판단은 원문 검증 인용에 근거한다/,
+        /when a search finds no response, say so explicitly/,
+    );
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /reading priorities while the factual findings rest on source-verified citations/,
+    );
+    // The contract describes what to say; dictating the sentences in one
+    // language made every answer come back in that language, whatever the
+    // user asked in.
+    assert.match(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /language of the user's most recent message/,
+    );
+    assert.doesNotMatch(
+        PROJECT_ANNOTATION_TOOL_PROMPT,
+        /N개 중 N개를 다룬다|반박 미발견|읽기 우선순위/,
+        "the contract must not mandate output sentences in a specific language",
     );
 });
 

@@ -405,6 +405,35 @@ function lexicalWords(value: string): string[] {
 }
 
 /**
+ * The claim text a marker refers to, sliced from the visible answer.
+ *
+ * A flat "200 characters before the marker" reaches across table cell
+ * boundaries and line breaks, so a marker at the start of a cell was judged
+ * against the PREVIOUS cell's text — in a claim/response table that is the
+ * opposing party's sentence. Stop at the nearest cell pipe or newline
+ * instead, and only then cap the length.
+ */
+export function claimContextBeforeMarker(
+  visibleText: string,
+  markerIndex: number,
+  maxChars = 200,
+): string {
+  let start = markerIndex;
+  while (start > 0) {
+    const char = visibleText[start - 1];
+    if (char === "\n" || char === "|") break;
+    start -= 1;
+  }
+  let context = visibleText.slice(start, markerIndex);
+  // A bullet or enumerator prefix is list markup, not claim text.
+  context = context.replace(/^\s*(?:[-*+]|\d+\.)\s+/, "");
+  if (context.length > maxChars) {
+    context = context.slice(context.length - maxChars);
+  }
+  return context.replace(/\[(?:\d+(?:,\s*\d+)*)\]/g, " ");
+}
+
+/**
  * Conservative content-word support used for both mapper acceptance and
  * duplicate-marker occurrence adjudication.
  */

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   CITATION_REPAIR_MAX_CANDIDATES,
+  claimContextBeforeMarker,
   CITATION_REPAIR_MAX_CALLS,
   CITATION_REPAIR_MAX_POOL_CANDIDATES,
   applyCitationRepairPlan,
@@ -832,4 +833,33 @@ test("evidence bounding is immutable and retains raw-read document metadata", ()
   );
   assert.equal(bounded[0].docId, "doc-0");
   assert.equal(evidence[0].content.length, 12_001);
+});
+
+test("claim context stops at table cell and line boundaries", () => {
+  const row =
+    "| Defendants targeted black neighborhoods with the black robo. [14] | The Defendant states that providing evidence of distribution is of no moment [15] because it misses the forest for the trees. |";
+  const secondMarker = row.indexOf("[15]");
+  const context = claimContextBeforeMarker(row, secondMarker);
+  assert.ok(
+    context.includes("providing evidence of distribution"),
+    "context should cover the current cell",
+  );
+  assert.ok(
+    !context.includes("black neighborhoods"),
+    "context must not leak the previous cell across the pipe",
+  );
+
+  const bullets =
+    "* The chapter used the call center to safeguard voters. [7]\n* Steinberg decided not to re-register to vote. [8]";
+  const bulletMarker = bullets.indexOf("[8]");
+  const bulletContext = claimContextBeforeMarker(bullets, bulletMarker);
+  assert.ok(bulletContext.includes("re-register"));
+  assert.ok(
+    !bulletContext.includes("call center"),
+    "context must not leak the previous bullet across the newline",
+  );
+  assert.ok(
+    !bulletContext.trimStart().startsWith("*"),
+    "list markup is stripped from the claim",
+  );
 });

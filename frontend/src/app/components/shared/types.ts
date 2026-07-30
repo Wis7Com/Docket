@@ -196,6 +196,10 @@ export type AssistantEvent =
           }[];
           citations_verified?: number;
           citations_unconfirmed?: number;
+          citations_rebound?: number;
+          citations_semantic_verified?: number;
+          highlight_quotes_cited?: number;
+          dead_markers_stripped?: number;
       handle_citations?: number;
       legacy_quote_citations?: number;
       leaked_handles_converted?: number;

@@ -277,7 +277,11 @@ export type SummarizeDocumentWithCoverageArgs = {
   pageCount: number;
   ocrStatus?: DocumentSummaryOcrStatus;
   focus?: string;
-  /** Human-readable requested output language. Defaults to Korean. */
+  /**
+   * Human-readable requested output language. Defaults to following the
+   * request itself rather than any named language, so an international
+   * install does not inherit one locale's default.
+   */
   language?: string;
   maxBatchCharacters?: number;
   maxBatchPages?: number;
@@ -666,6 +670,13 @@ function displayedSourceCharacters(
   );
 }
 
+/**
+ * Not a language name: the summariser is told to match whatever language the
+ * user wrote in, which the prompt supplies verbatim in its `Focus:` line.
+ */
+export const DEFAULT_SUMMARY_OUTPUT_LANGUAGE =
+  "the same language as the Focus request below";
+
 function buildMapUserPrompt(args: {
   filename: string;
   language: string;
@@ -713,7 +724,8 @@ export function packDocumentSummaryBatches(args: {
   maxBatchPages?: number;
 }): DocumentSummaryBatch[] {
   validateChunks(args.chunks);
-  const language = args.language?.trim() || "Korean";
+  const language =
+    args.language?.trim() || DEFAULT_SUMMARY_OUTPUT_LANGUAGE;
   const maxCharacters = Math.max(
     1,
     Math.floor(args.maxBatchCharacters ?? DEFAULT_BATCH_CHARACTERS),

@@ -33,8 +33,12 @@ import {
     validateCitationContract,
     type DocIndex,
     type DocStore,
+    rebindUnconfirmedCitationEntries,
+    attachAnnotationQuoteCitations,
+    stripEntrylessMarkers,
 } from "./chatTools";
 import { PassageRegistry } from "./citationHandles";
+import { DEFAULT_SUMMARY_OUTPUT_LANGUAGE } from "./documentSummary";
 
 test("whole-document summary routing selects the displayed indexed document", () => {
     const target = automaticWholeDocumentSummaryTarget(
@@ -62,7 +66,10 @@ test("whole-document summary routing selects the displayed indexed document", ()
     assert.deepEqual(target, {
         docId: "doc-0",
         focus: "이 문서 요약해 줘",
-        language: "Korean",
+        // Routing no longer guesses a language name: the summariser is told
+        // to follow the request it is given, so a non-Korean, non-English
+        // user is not mislabelled.
+        language: DEFAULT_SUMMARY_OUTPUT_LANGUAGE,
     });
 });
 
@@ -903,6 +910,81 @@ test("basic annotation payloads expose registered handles for indexed quotes", (
     }
 });
 
+test("annotation payloads expose citation handles whether or not they ground", () => {
+    const registry = new PassageRegistry();
+    const documentId = "11111111-1111-4111-8111-111111111111";
+    const versionId = "version-a";
+    const content =
+        "Background text provides context for this synthetic legal record. The challenged statement allegedly targeted voters in several neighborhoods.";
+    const groundedQuote =
+        "The challenged statement allegedly targeted voters in several neighborhoods.";
+    const ungroundedQuote =
+        "A highlight whose text never appears in any indexed chunk of this record.";
+    const payload = annotatePdfAnnotationPayload(
+        {
+            annotations: [
+                {
+                    id: "annotation-1",
+                    doc_id: "doc-0",
+                    document_id: documentId,
+                    version_id: versionId,
+                    page: 9,
+                    quote: groundedQuote,
+                },
+                {
+                    id: "annotation-2",
+                    doc_id: "doc-0",
+                    document_id: documentId,
+                    version_id: versionId,
+                    page: 9,
+                    quote: ungroundedQuote,
+                },
+            ],
+        },
+        registry,
+        {
+            "doc-0": {
+                document_id: documentId,
+                version_id: versionId,
+                filename: "synthetic.pdf",
+            },
+        },
+        () => [
+            {
+                chunk_id: "chunk-a",
+                chunk_index: 4,
+                page_number: 9,
+                content,
+                start_char: 800,
+                end_char: 800 + content.length,
+            },
+        ],
+    );
+
+    const items = payload.annotations as Array<Record<string, unknown>>;
+    const [grounded, ungrounded] = items;
+
+    // Grounded highlights keep both citing routes.
+    assert.equal(grounded.citation_handle, "a1");
+    assert.equal(grounded.citation_passage, "p2");
+    assert.equal(grounded.chunk_id, "chunk-a");
+
+    // Ungrounded highlights are citable via the handle alone.
+    assert.equal(ungrounded.citation_handle, "a2");
+    assert.equal("citation_passage" in ungrounded, false);
+    assert.equal("chunk_id" in ungrounded, false);
+
+    const resolved = registry.resolve("a2");
+    assert.equal(resolved.ok, true);
+    if (resolved.ok) {
+        assert.equal(resolved.citation.docId, "doc-0");
+        assert.equal(resolved.citation.documentId, documentId);
+        assert.equal(resolved.citation.page, 9);
+        assert.equal(resolved.citation.quote, ungroundedQuote);
+        assert.equal(resolved.citation.chunkId, undefined);
+    }
+});
+
 test("readAnnotationContexts caps ids and radius and prevents cross-document access", async () => {
     const rows = Array.from({ length: 25 }, (_, index) => ({
         id: `id-${index}`,
@@ -1365,6 +1447,59 @@ test("bare leaked passage handle tokens become citation markers or are stripped"
         result.citations.every((citation) => citation.protocol === "handle"),
         true,
     );
+});
+
+test("leaked annotation handle tokens convert to markers carrying the highlight", () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-0",
+        documentId: "document-a",
+        versionId: "version-a",
+        chunkId: "chunk-annotated",
+        page: 7,
+        content:
+            "First synthetic support sentence includes enough detail for conversion. Second synthetic support sentence independently supports a range.",
+    });
+    const highlightQuote =
+        "The highlighted sentence the reader marked as dispositive.";
+    assert.equal(
+        registry.registerAnnotation({
+            annotationId: "annotation-1",
+            docId: "doc-0",
+            documentId: "document-a",
+            versionId: "version-a",
+            page: 14,
+            quote: highlightQuote,
+        }),
+        "a1",
+    );
+
+    const result = convertLeakedPassageHandleTokens(
+        [
+            "The reader's own highlight supports this [a1].",
+            "Passage support still converts [p1].",
+            "Unknown highlight support [a9].",
+        ].join("\n"),
+        [],
+        registry,
+    );
+
+    assert.equal(result.converted, 2);
+    assert.equal(result.dropped, 1);
+    assert.doesNotMatch(result.text, /\[a\d/);
+    assert.match(result.text, /own highlight supports this\. \[1\]/);
+    assert.match(result.text, /still converts\. \[2\]/);
+    assert.match(result.text, /Unknown highlight support\./);
+
+    const annotationEntry = result.citations.find(
+        (citation) => citation.ref === 1,
+    );
+    assert.equal(annotationEntry?.quote, highlightQuote);
+    assert.equal(annotationEntry?.doc_id, "doc-0");
+    assert.equal(annotationEntry?.page, 14);
+    assert.equal(annotationEntry?.chunk_id, undefined);
+    assert.equal(annotationEntry?.protocol, "handle");
+    assert.equal(annotationEntry?.passage_handle, "a1");
 });
 
 test("converted handles feed duplicate enforcement and orphan counting", () => {
@@ -2072,4 +2207,264 @@ test("brief sequence workflow uses the evidence-backed novelty recipe", () => {
         /Every supported statement in every cell must carry a \[N\] marker/,
     );
     assert.match(workflow?.prompt_md ?? "", /final <CITATIONS> block/);
+});
+
+test("off-by-one citations are rebound to the passage that supports the claim", async () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-1",
+        documentId: "doc-uuid-1",
+        versionId: "v1",
+        chunkId: "chunk-rebind",
+        page: 17,
+        content:
+            "Records provided by Message Communications confirm that JMBA's check paid for the call and that Defendants sent the robocalls. The chapter used the call center to disseminate accurate information about voting to safeguard voters.",
+    });
+    const docIndex = {
+        "doc-1": {
+            document_id: "doc-uuid-1",
+            filename: "ECF-213-plaintiffs-msj.pdf",
+            version_id: "v1",
+            version_number: 1,
+        },
+    };
+    const text =
+        "| Defendants produced, paid for, and sent the robocalls. [1] | The chapter used the call center to disseminate accurate information. [2] |";
+    const citations = [
+        {
+            ref: 1,
+            doc_id: "doc-1",
+            page: 17,
+            // Off-by-one: entry 1 is bound to the call-center sentence, which
+            // supports the NEIGHBORING cell, not this claim.
+            quote: "The chapter used the call center to disseminate accurate information about voting to safeguard voters.",
+            chunk_id: "chunk-rebind",
+            protocol: "handle",
+        },
+        {
+            ref: 2,
+            doc_id: "doc-1",
+            page: 17,
+            quote: "The chapter used the call center to disseminate accurate information about voting to safeguard voters.",
+            chunk_id: "chunk-rebind",
+            protocol: "handle",
+        },
+    ];
+
+    const result = await rebindUnconfirmedCitationEntries({
+        text,
+        citations,
+        registry,
+        docIndex,
+        userId: "test-user",
+        projectId: null, // lexical-only path; no index database in unit tests
+    });
+
+    assert.equal(result.rebound, 1);
+    const first = result.citations.find((c) => c.ref === 1);
+    assert.ok(
+        String(first?.quote).includes("JMBA's check paid for the call"),
+        "ref 1 must be re-pointed at the passage supporting its own claim",
+    );
+    assert.equal(first?.filename, "ECF-213-plaintiffs-msj.pdf");
+    const second = result.citations.find((c) => c.ref === 2);
+    assert.ok(
+        String(second?.quote).includes("call center"),
+        "a correctly bound entry stays untouched",
+    );
+});
+
+test("rebinding leaves repeated refs and empty registries alone", async () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-1",
+        documentId: "doc-uuid-1",
+        chunkId: "chunk-multi",
+        content:
+            "A first synthetic sentence with plenty of shared vocabulary for testing. A second synthetic sentence that is entirely unrelated to anything.",
+    });
+    const text =
+        "First claim about shared vocabulary for testing. [1] Second claim about shared vocabulary for testing. [1]";
+    const citations = [
+        {
+            ref: 1,
+            doc_id: "doc-1",
+            page: 1,
+            quote: "A second synthetic sentence that is entirely unrelated to anything.",
+            chunk_id: "chunk-multi",
+            protocol: "handle",
+        },
+    ];
+    const repeated = await rebindUnconfirmedCitationEntries({
+        text,
+        citations,
+        registry,
+        docIndex: {
+            "doc-1": { document_id: "doc-uuid-1", filename: "a.pdf" },
+        },
+        userId: "test-user",
+        projectId: null,
+    });
+    assert.equal(
+        repeated.rebound,
+        0,
+        "repeated refs are adjudicated per occurrence by the support pass, not rebound",
+    );
+
+    const noRegistry = await rebindUnconfirmedCitationEntries({
+        text,
+        citations,
+        registry: null,
+        docIndex: {},
+        userId: "test-user",
+        projectId: null,
+    });
+    assert.equal(noRegistry.rebound, 0);
+});
+
+test("cross-language citations verify semantically instead of failing the lexical gate", async () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-1",
+        documentId: "doc-uuid-1",
+        chunkId: "chunk-korean",
+        page: 12,
+        content:
+            "Records provided by Message Communications confirm that JMBA's check paid for the call. Even assuming, arguendo, the evidence establishes that Defendants were responsible for the transmission.",
+    });
+    const docIndex = {
+        "doc-1": { document_id: "doc-uuid-1", filename: "ECF-236.pdf" },
+    };
+    const text =
+        "**원고의 주장에 대하여, 피고는 가정하더라도 요건을 충족하지 못한다고 반박합니다.** [1]";
+    const citations = [
+        {
+            ref: 1,
+            doc_id: "doc-1",
+            page: 12,
+            quote: "Even assuming, arguendo, the evidence establishes that Defendants were responsible for the transmission.",
+            chunk_id: "chunk-korean",
+            protocol: "handle",
+        },
+    ];
+
+    const confirmed = await rebindUnconfirmedCitationEntries({
+        text,
+        citations,
+        registry,
+        docIndex,
+        userId: "test-user",
+        projectId: null,
+        embedPairSimilarity: async () => 0.71, // multilingual model agrees
+    });
+    assert.equal(confirmed.semanticVerified, 1);
+    assert.equal(confirmed.rebound, 0, "cross-script entries are never rebound");
+
+    const scored = assignCitationSupportByOccurrence(text, confirmed.citations);
+    const entry = scored.citations.find((c) => c.ref === 1) as Record<
+        string,
+        unknown
+    >;
+    assert.equal(entry?.support, "verified");
+    assert.ok(
+        !("semantic_support" in entry),
+        "the transient flag must not persist",
+    );
+
+    const below = await rebindUnconfirmedCitationEntries({
+        text,
+        citations: citations.map((c) => ({ ...c })),
+        registry,
+        docIndex,
+        userId: "test-user",
+        projectId: null,
+        embedPairSimilarity: async () => 0.4, // mismatched-pair territory
+    });
+    assert.equal(below.semanticVerified, 0);
+    const scoredBelow = assignCitationSupportByOccurrence(
+        text,
+        below.citations,
+    );
+    assert.equal(
+        scoredBelow.citations.find((c) => c.ref === 1)?.support,
+        "unconfirmed",
+    );
+
+    const unavailable = await rebindUnconfirmedCitationEntries({
+        text,
+        citations: citations.map((c) => ({ ...c })),
+        registry,
+        docIndex,
+        userId: "test-user",
+        projectId: null,
+        embedPairSimilarity: async () => null, // embedding model unavailable
+    });
+    assert.equal(unavailable.semanticVerified, 0, "no signal fails closed");
+});
+
+test("uncited highlight quotes receive deterministic annotation citations", () => {
+    const registry = new PassageRegistry();
+    registry.registerAnnotation({
+        annotationId: "ann-1",
+        docId: "doc-1",
+        documentId: "doc-uuid-1",
+        page: 24,
+        quote: "They created the robocall, sent the robocall, and attempted to make it intimidating and threatening regardless of outcome.",
+    });
+    registry.registerAnnotation({
+        annotationId: "ann-2",
+        docId: "doc-1",
+        documentId: "doc-uuid-1",
+        page: 21,
+        quote: "They understood the calls to be threats of legal action if they voted by mail.",
+    });
+    const text =
+        '1. **하이라이트 원문:** "They created the robocall, sent the robocall, and attempted to make it intimidating and threatening regardless of outcome."\n' +
+        '2. **하이라이트 원문:** "They understood the calls to be threats of legal action if they voted by mail." [3]';
+    const citations = [
+        { ref: 3, doc_id: "doc-1", page: 21, quote: "irrelevant", protocol: "handle" },
+    ];
+    const result = attachAnnotationQuoteCitations(text, citations, registry);
+    assert.equal(result.attached, 1, "only the uncited listing gains a marker");
+    const added = result.citations.find((c) => c.ref !== 3);
+    assert.equal(added?.page, 24);
+    assert.match(result.text.split("\n")[0], /\[\d+\]/);
+    assert.equal(
+        (result.text.match(/\[3\]/g) ?? []).length,
+        1,
+        "the already-cited listing is untouched",
+    );
+});
+
+test("entryless markers are swept instead of rendering dead badges", () => {
+    const text =
+        "A supported claim. [1] An unsupported claim. [2] A mixed group. [1, 3]";
+    const swept = stripEntrylessMarkers(text, [{ ref: 1 }]);
+    assert.equal(swept.stripped, 2);
+    assert.ok(!swept.text.includes("[2]"));
+    assert.ok(swept.text.includes("A supported claim. [1]"));
+    assert.ok(swept.text.includes("A mixed group. [1]"));
+    assert.ok(!swept.text.includes("[1, 3]"));
+    assert.ok(!/claim\.\s+\[2\]/.test(swept.text));
+    assert.ok(!/\s[.,]/.test(swept.text), "no stray punctuation gaps");
+});
+
+test("over-broad passage ranges clamp to a resolvable span instead of dying", () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-1",
+        documentId: "doc-uuid-1",
+        chunkId: "chunk-clamp",
+        page: 5,
+        content:
+            "First sentence with sufficient length for segmentation to keep it. Second sentence also long enough to stand on its own here. Third sentence long enough to remain its own passage as well. Fourth sentence also long enough to remain separate in the list. Fifth sentence long enough to be kept as its own passage too.",
+    });
+    const clamped = registry.resolveClamped("p1-p5");
+    assert.equal(clamped.ok, true);
+    if (clamped.ok) {
+        assert.equal(clamped.clamped, true);
+        assert.match(String(clamped.citation.passage), /^p1-p3$/);
+    }
+    const unknown = registry.resolveClamped("p9-p12");
+    assert.equal(unknown.ok, false);
 });

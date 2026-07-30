@@ -33,6 +33,20 @@ import {
     type DocumentSummaryCoverage,
 } from "./documentSummary";
 import { createSqliteDocumentSummaryBatchCache } from "./documentSummaryCache";
+import { DEFAULT_SUMMARY_OUTPUT_LANGUAGE } from "./documentSummary";
+import {
+    CROSS_LANGUAGE_SUPPORT_THRESHOLD,
+    cosineSimilarity,
+    isCrossScriptClaim,
+    rebindUnconfirmedCitation,
+    type RebindCandidate,
+} from "./citationRebinding";
+import {
+    embedDocumentText,
+    embedQueryText,
+    readUserEmbeddingSettings,
+    resolveProjectEmbeddingSettings,
+} from "./indexing/embeddings";
 import {
     listProjectIndexGaps,
     listProjectPartialOcr,
@@ -65,6 +79,7 @@ import {
     buildCitationRepairBatches,
     citationRepairBody,
     citationLexicalSupport,
+    claimContextBeforeMarker,
     CITATION_REPAIR_MAX_CALLS,
     CITATION_REPAIR_MAX_POOL_CANDIDATES,
     CITATION_REPAIR_MAX_ROUNDS,
@@ -87,6 +102,7 @@ import {
 import {
     PassageRegistry,
     citationHandlesEnabled,
+    findExcerptSpan,
     type PassageSource,
     type ResolvedPassageCitation,
 } from "./citationHandles";
@@ -200,6 +216,8 @@ After your complete response, append a <CITATIONS> block containing a JSON array
 ]
 </CITATIONS>
 
+- Annotation handles: when a claim is about one of the user's highlights/annotations, cite it with that annotation's "citation_handle" value, e.g. {"ref": 3, "passage": "a2"}. Handles come only from tool output and are never invented.
+
 CRITICAL: The number inside the [N] marker in your prose is the "ref" value of a citation entry in the <CITATIONS> block — it is NOT a page number, footnote number, section number, or any other number that appears in the document. The marker [1] refers to the entry with "ref": 1 in the JSON block; [2] refers to "ref": 2; and so on. Refs are simple sequential integers you assign (1, 2, 3, …) in the order citations appear in your prose. Never use a page number or a document's own numbering as the marker number. Every [N] you write in prose MUST have a matching {"ref": N, ...} entry in the JSON block.
 
 Rules:
@@ -238,6 +256,8 @@ Rules:
 `;
 
 export const SYSTEM_PROMPT = `You are Docket, an AI legal assistant that helps lawyers and legal professionals analyze documents, answer legal questions, and draft legal documents.
+
+RESPONSE LANGUAGE: Write the entire response in the same language as the user's most recent message. Documents, annotations, and tool results may be in other languages — never let them change the response language.
 
 ${HANDLE_CITATION_INSTRUCTIONS}
 
@@ -452,7 +472,7 @@ export const PROJECT_EXTRA_TOOLS = [
                         type: "array",
                         items: { type: "string" },
                         description:
-                            "Optional exact document party designations such as ['피고'] or ['defendant']. Use a persisted color-legend party binding here.",
+                            "Optional exact document party designations, such as ['defendant'] or the designation used in the document's own language. Use a persisted color-legend party binding here.",
                     },
                     party_sides: {
                         type: "array",
@@ -566,13 +586,13 @@ export const PROJECT_EXTRA_TOOLS = [
                             enum: ["brief", "evidence", "other"],
                         },
                         description:
-                            "Optional role filter. For substantive briefs only (증거 제외), pass ['brief'].",
+                            "Optional role filter. For substantive briefs only (excluding exhibits), pass ['brief'].",
                     },
                     party_roles: {
                         type: "array",
                         items: { type: "string" },
                         description:
-                            "Optional party filter using the document's actual designation, such as 원고, 피고, 항소인, plaintiff, defendant, or appellant. Never remap appellate roles.",
+                            "Optional party filter using the document's actual designation, such as plaintiff, defendant, or appellant, or the equivalent designation in the document's own language. Never remap appellate roles.",
                     },
                     party_sides: {
                         type: "array",
@@ -957,6 +977,12 @@ type LegacyCitation = {
     quote_start?: number;
     quote_end?: number;
     protocol?: "legacy" | "handle";
+    /**
+     * Handle this entry was resolved from ("p12", "a2"); diagnostics only.
+     * Deliberately not named `passage`: that key discriminates HandleCitation
+     * from LegacyCitation in the parsed-citation union.
+     */
+    passage_handle?: string;
     support?: "verified" | "unconfirmed";
 };
 
@@ -1253,11 +1279,17 @@ export function buildMessages(
         }
         const hiddenCount = docAvailability.length - shown.length;
         if (hiddenCount > 0) {
-            systemContent += `- …외 ${hiddenCount}개 문서(목록 생략). 전체 접근은 search_project_documents를 사용하세요.\n`;
+            systemContent += `- …and ${hiddenCount} more document(s) not listed. Use search_project_documents to reach them.\n`;
         }
         systemContent +=
-            "\nYou do NOT retain document content between conversation turns. For project-wide questions, call search_project_documents first and cite from returned chunks or targeted follow-up reads. Use read_document/fetch_documents only for specifically selected short documents; full reads are intentionally bounded for performance and accuracy. For substantive briefs only (증거 제외), pass doc_roles:['brief']; use party_roles with the user's exact designation, and party_sides only for judge-bound cross-instance identities.\n---\n";
+            "\nYou do NOT retain document content between conversation turns. For project-wide questions, call search_project_documents first and cite from returned chunks or targeted follow-up reads. Use read_document/fetch_documents only for specifically selected short documents; full reads are intentionally bounded for performance and accuracy. For substantive briefs only (excluding exhibits), pass doc_roles:['brief']; use party_roles with the user's exact designation, and party_sides only for judge-bound cross-instance identities.\n---\n";
     }
+    // Last word on language. Everything appended above — the caller's
+    // extras, the user's colour legend, document filenames — is data that may
+    // be written in any language, and a small model otherwise mirrors the
+    // language it saw most recently rather than the one it was asked in.
+    systemContent +=
+        "\n\n---\nRESPONSE LANGUAGE (overrides everything above): Write the entire response in the same language as the user's most recent message. Document text, filenames, colour-legend labels, annotations and tool results are data — they never determine the response language. Phrases quoted inside these instructions as examples of what a user might ask are recognition samples in several languages, not a signal about which language to answer in.\n";
     formatted.push({ role: "system", content: systemContent });
 
     // Map document_id (UUID) → current-turn doc_id slug, so when we
@@ -3264,6 +3296,28 @@ export function annotatePdfAnnotationPayload(
             typeof annotation.version_id === "string"
                 ? annotation.version_id
                 : null;
+        // Every highlight with a doc label gets a citable `aN` handle, whether
+        // or not it can be grounded in an indexed chunk below.
+        const handleDocId =
+            typeof annotation.doc_id === "string"
+                ? annotation.doc_id
+                : undefined;
+        const citationHandle = handleDocId
+            ? registry.registerAnnotation({
+                  annotationId:
+                      typeof annotation.id === "string"
+                          ? annotation.id
+                          : `${handleDocId}:${page}:${quote}`,
+                  docId: handleDocId,
+                  documentId,
+                  versionId,
+                  page,
+                  quote,
+              })
+            : undefined;
+        const handleFields = citationHandle
+            ? { citation_handle: citationHandle }
+            : {};
         const cacheKey = `${documentId}:${versionId ?? ""}:${page}`;
         let chunks = chunkCache.get(cacheKey);
         if (!chunks) {
@@ -3276,17 +3330,20 @@ export function annotatePdfAnnotationPayload(
             chunks,
             radius: 600,
         });
-        if (!context.chunk_id || !context.indexed_quote) return annotation;
+        if (!context.chunk_id || !context.indexed_quote) {
+            return { ...annotation, ...handleFields };
+        }
         const sourceChunk = chunks.find(
             (chunk) => chunk.chunk_id === context.chunk_id,
         );
         const docId =
-            typeof annotation.doc_id === "string"
-                ? annotation.doc_id
-                : Object.entries(docIndex ?? {}).find(
-                      ([, info]) => info.document_id === documentId,
-                  )?.[0];
-        if (!sourceChunk || !docId) return annotation;
+            handleDocId ??
+            Object.entries(docIndex ?? {}).find(
+                ([, info]) => info.document_id === documentId,
+            )?.[0];
+        if (!sourceChunk || !docId) {
+            return { ...annotation, ...handleFields };
+        }
         const source: PassageSource = {
             docId,
             documentId,
@@ -3310,6 +3367,7 @@ export function annotatePdfAnnotationPayload(
             chunk_id: context.chunk_id,
             indexed_quote: indexedQuote,
             ...(citationPassage ? { citation_passage: citationPassage } : {}),
+            ...handleFields,
         };
     });
     return { ...content, annotations: groundedAnnotations };
@@ -5049,7 +5107,7 @@ export function validateCitationContract(
             continue;
         }
         if ("passage" in citation) {
-            const resolved = passageRegistry?.resolve(citation.passage);
+            const resolved = passageRegistry?.resolveClamped(citation.passage);
             if (!resolved?.ok) {
                 errors.push({
                     code: resolved?.code ?? "unknown_passage",
@@ -5069,7 +5127,9 @@ export function validateCitationContract(
                 chunk_id: resolved.citation.chunkId,
                 quote_start: resolved.citation.quoteStart,
                 quote_end: resolved.citation.quoteEnd,
+                ...(resolved.clamped ? { range_clamped: true } : {}),
                 protocol: "handle",
+                passage_handle: resolved.citation.passage,
             });
             continue;
         }
@@ -5546,7 +5606,7 @@ export function convertLeakedPassageHandleTokens(
     let text = stripCitationBlock(visibleText);
     let converted = 0;
     let dropped = 0;
-    const leakedHandleTokenRe = /[ \t]*\[(p\d[^\]\n]*)\]/i;
+    const leakedHandleTokenRe = /[ \t]*\[((?:p|a)\d[^\]\n]*)\]/i;
 
     for (;;) {
         const match = leakedHandleTokenRe.exec(text);
@@ -5579,6 +5639,7 @@ export function convertLeakedPassageHandleTokens(
                     quote_start: resolved.citation.quoteStart,
                     quote_end: resolved.citation.quoteEnd,
                     protocol: "handle",
+                    passage_handle: resolved.citation.passage,
                 });
             }
             refs.push(ref);
@@ -5592,6 +5653,308 @@ export function convertLeakedPassageHandleTokens(
     }
 
     return { text, citations: nextCitations, converted, dropped };
+}
+
+type RebindableCitationEntry = {
+    ref: number;
+    doc_id?: unknown;
+    document_id?: unknown;
+    version_id?: unknown;
+    version_number?: unknown;
+    filename?: unknown;
+    page?: unknown;
+    quote?: unknown;
+    chunk_id?: unknown;
+    quote_start?: unknown;
+    quote_end?: unknown;
+    protocol?: unknown;
+    passage_handle?: unknown;
+    range_clamped?: unknown;
+    /** Transient: set by cross-language confirmation, honored then removed
+     * by the support pass so it never persists. */
+    semantic_support?: boolean;
+};
+
+/**
+ * Re-point citations the support gate would demote, before it runs.
+ *
+ * The dominant unconfirmed-citation shape is an off-by-one: in a
+ * claim/response table the model names the passage that supports the
+ * NEIGHBORING row. The correct passage is almost always in the same
+ * turn-scoped registry — the model saw it — so the entry can be corrected
+ * deterministically. Only single-occurrence refs are considered; repeated
+ * refs are adjudicated per occurrence by the support pass afterwards.
+ *
+ * The semantic prior reuses the project search index (same embedding model,
+ * dimension policy, and vector store the retrieval tools use) rather than
+ * growing a second embedding path; when the project has no vectors or no
+ * projectId the rebind falls back to the purely lexical gate, which is what
+ * catches the off-by-one shape anyway.
+ */
+export async function rebindUnconfirmedCitationEntries(args: {
+    text: string;
+    citations: RebindableCitationEntry[];
+    registry: PassageRegistry | null | undefined;
+    docIndex: DocIndex;
+    userId: string;
+    projectId?: string | null;
+    /**
+     * Claim/quote embedding similarity, injectable for tests. The default
+     * resolves the project's own embedding settings so the check uses the
+     * same multilingual model the retrieval index uses; null means "no
+     * signal" (model unavailable, embedding failed) and fails closed.
+     */
+    embedPairSimilarity?: (
+        claim: string,
+        quote: string,
+    ) => Promise<number | null>;
+}): Promise<{
+    citations: RebindableCitationEntry[];
+    rebound: number;
+    semanticVerified: number;
+}> {
+    if (!args.registry) {
+        return { citations: args.citations, rebound: 0, semanticVerified: 0 };
+    }
+    const candidates: RebindCandidate[] = args.registry
+        .repairCandidates()
+        .map((candidate) => ({
+            passage: candidate.passage,
+            chunkId: candidate.chunk_id,
+            docId: candidate.doc_id,
+            text: String(candidate.quote ?? ""),
+        }))
+        .filter((candidate) => candidate.text.trim().length > 0);
+    if (candidates.length === 0) {
+        return { citations: args.citations, rebound: 0, semanticVerified: 0 };
+    }
+
+    const occurrenceIndexByRef = new Map<number, number[]>();
+    for (const marker of args.text.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g)) {
+        if (marker.index === undefined) continue;
+        for (const raw of marker[1].split(",")) {
+            const ref = Number.parseInt(raw.trim(), 10);
+            const indices = occurrenceIndexByRef.get(ref) ?? [];
+            indices.push(marker.index);
+            occurrenceIndexByRef.set(ref, indices);
+        }
+    }
+
+    let rebound = 0;
+    let semanticVerified = 0;
+    const embedPairSimilarity =
+        args.embedPairSimilarity ??
+        (async (claim: string, quote: string): Promise<number | null> => {
+            try {
+                const settings = args.projectId
+                    ? resolveProjectEmbeddingSettings(
+                          args.userId,
+                          args.projectId,
+                      )
+                    : readUserEmbeddingSettings(args.userId);
+                const [claimVector, quoteVector] = await Promise.all([
+                    embedQueryText(claim, settings),
+                    embedDocumentText(quote, settings),
+                ]);
+                return cosineSimilarity(claimVector.vector, quoteVector.vector);
+            } catch {
+                return null;
+            }
+        });
+    const nextCitations = args.citations.map((entry) => ({ ...entry }));
+    for (const entry of nextCitations) {
+        const occurrences = occurrenceIndexByRef.get(entry.ref);
+        if (!occurrences || occurrences.length !== 1) continue;
+        if (typeof entry.quote !== "string" || !entry.quote.trim()) continue;
+        const claimContext = claimContextBeforeMarker(
+            args.text,
+            occurrences[0],
+        );
+        const current = citationLexicalSupport(claimContext, entry.quote);
+        if (
+            current.nearVerbatim ||
+            (current.sharedWords >= 2 && current.score >= 0.3)
+        ) {
+            continue; // already verifiable — nothing to fix
+        }
+
+        // A claim written in a different script than its quote (a Korean
+        // answer citing an English source) can never pass the lexical gate,
+        // however correct the citation. Confirm it semantically instead of
+        // trying to re-point it at a different passage.
+        if (isCrossScriptClaim(claimContext, entry.quote)) {
+            const similarity = await embedPairSimilarity(
+                claimContext,
+                entry.quote,
+            );
+            if (
+                similarity !== null &&
+                similarity >= CROSS_LANGUAGE_SUPPORT_THRESHOLD
+            ) {
+                entry.semantic_support = true;
+                semanticVerified += 1;
+            }
+            continue; // never rebind across scripts on lexical evidence
+        }
+
+        let semanticScoreByChunk: Map<string, number> | undefined;
+        if (args.projectId) {
+            try {
+                const registryChunks = new Set(
+                    candidates.map((candidate) => candidate.chunkId),
+                );
+                const results = await searchProjectIndex({
+                    projectId: args.projectId,
+                    userId: args.userId,
+                    query: claimContext,
+                    limit: 12,
+                });
+                const filtered = results.filter((result) =>
+                    registryChunks.has(result.chunk_id),
+                );
+                if (filtered.length > 0) {
+                    semanticScoreByChunk = new Map(
+                        filtered.map((result, index) => [
+                            result.chunk_id,
+                            filtered.length - index,
+                        ]),
+                    );
+                }
+            } catch {
+                semanticScoreByChunk = undefined; // lexical-only fallback
+            }
+        }
+
+        const decision = rebindUnconfirmedCitation({
+            claimContext,
+            currentPassageText: entry.quote,
+            candidates,
+            semanticScoreByChunk,
+        });
+        if (!decision) continue;
+        const resolved = args.registry.resolve(decision.passage);
+        if (!resolved.ok) continue;
+        const docInfo = resolveDoc(resolved.citation.docId, args.docIndex);
+        entry.doc_id = resolved.citation.docId;
+        entry.document_id = docInfo?.document_id;
+        entry.version_id = docInfo?.version_id ?? null;
+        entry.version_number = docInfo?.version_number ?? null;
+        entry.filename = docInfo?.filename ?? resolved.citation.docId;
+        entry.page = resolved.citation.page;
+        entry.quote = resolved.citation.quote;
+        entry.chunk_id = resolved.citation.chunkId;
+        entry.quote_start = resolved.citation.quoteStart;
+        entry.quote_end = resolved.citation.quoteEnd;
+        entry.protocol = "handle";
+        rebound += 1;
+    }
+    return { citations: nextCitations, rebound, semanticVerified };
+}
+
+/**
+ * Attach citations to highlight quotes the model copied but did not cite.
+ *
+ * In highlight-review answers the model reproduces each highlighted passage
+ * verbatim ("하이라이트 원문: ...") — text whose exact source the server
+ * already knows, because the highlight is a registered annotation. A quoted
+ * highlight without a marker is a citation the user should have received,
+ * so the server attaches one deterministically: find each registered
+ * annotation's quote in the visible answer and, when no marker already
+ * covers that span, bind a fresh ref to the annotation handle. Only the
+ * first occurrence is cited — repeats of the same quote elsewhere in the
+ * answer are prose, not new listings.
+ */
+/**
+ * Remove markers whose refs have no citation entry left. Runs after leak
+ * conversion, reattachment, rebinding and repair — anything still entryless
+ * has exhausted every recovery path and would render as a badge that does
+ * nothing when clicked. Comma groups keep their surviving refs.
+ */
+export function stripEntrylessMarkers(
+    visibleText: string,
+    citations: readonly { ref: number }[],
+): { text: string; stripped: number } {
+    const known = new Set(citations.map((citation) => citation.ref));
+    let stripped = 0;
+    const text = visibleText
+        .replace(/[ \t]*\[(\d+(?:,\s*\d+)*)\]/g, (whole, group: string) => {
+            const refs = group
+                .split(",")
+                .map((raw) => Number.parseInt(raw.trim(), 10));
+            const surviving = refs.filter((ref) => known.has(ref));
+            stripped += refs.length - surviving.length;
+            if (surviving.length === refs.length) return whole;
+            if (surviving.length === 0) return "";
+            const spacing = whole.startsWith(" ") ? " " : "";
+            return `${spacing}[${surviving.join(", ")}]`;
+        })
+        .replace(/[ \t]+([.,;:!?])/g, "$1");
+    return { text, stripped };
+}
+
+export function attachAnnotationQuoteCitations(
+    visibleText: string,
+    citations: RebindableCitationEntry[],
+    registry: PassageRegistry | null | undefined,
+): {
+    text: string;
+    citations: RebindableCitationEntry[];
+    attached: number;
+} {
+    if (!registry) return { text: visibleText, citations, attached: 0 };
+    const handles = registry.annotationHandles();
+    if (handles.length === 0) {
+        return { text: visibleText, citations, attached: 0 };
+    }
+    const citedHandles = new Set(
+        citations
+            .map((entry) =>
+                typeof (entry as { passage_handle?: unknown })
+                    .passage_handle === "string"
+                    ? String(
+                          (entry as { passage_handle?: unknown })
+                              .passage_handle,
+                      )
+                    : null,
+            )
+            .filter((handle): handle is string => handle !== null),
+    );
+    let text = visibleText;
+    let attached = 0;
+    const nextCitations = [...citations];
+    let nextRef =
+        Math.max(
+            0,
+            ...citationMarkerRefs(text),
+            ...nextCitations.map((entry) => entry.ref),
+        ) + 1;
+    for (const { handle, source } of handles) {
+        if (citedHandles.has(handle)) continue;
+        if (source.quote.trim().length < 20) continue; // too short to place safely
+        const span = findExcerptSpan(text, source.quote);
+        if (!span) continue;
+        // A marker inside or just after the quoted span means the model (or a
+        // previous pass) already cited this listing.
+        const vicinity = text.slice(span.start, Math.min(text.length, span.end + 30));
+        if (/\[(?:\d+(?:,\s*\d+)*)\]/.test(vicinity)) continue;
+        const resolved = registry.resolve(handle);
+        if (!resolved.ok) continue;
+        const ref = nextRef++;
+        nextCitations.push({
+            ref,
+            doc_id: resolved.citation.docId,
+            page: resolved.citation.page,
+            quote: resolved.citation.quote,
+            chunk_id: resolved.citation.chunkId,
+            quote_start: resolved.citation.quoteStart,
+            quote_end: resolved.citation.quoteEnd,
+            protocol: "handle",
+            passage_handle: handle,
+        } as RebindableCitationEntry);
+        text = insertCitationMarker(text, span.end, ref);
+        attached += 1;
+    }
+    return { text, citations: nextCitations, attached };
 }
 
 export function assignCitationSupportByOccurrence<
@@ -5624,9 +5987,10 @@ export function assignCitationSupportByOccurrence<
             const citation = citationByRef.get(ref);
             if (!citation) continue;
             const occurrences = occurrencesByRef.get(ref) ?? [];
-            const context = visibleText
-                .slice(Math.max(0, marker.index - 200), marker.index)
-                .replace(/\[(?:\d+(?:,\s*\d+)*)\]/g, " ");
+            const context = claimContextBeforeMarker(
+                visibleText,
+                marker.index,
+            );
             const lexicalSupport =
                 typeof citation.quote === "string"
                     ? citationLexicalSupport(context, citation.quote)
@@ -5634,7 +5998,9 @@ export function assignCitationSupportByOccurrence<
             const support =
                 lexicalSupport?.nearVerbatim ||
                 ((lexicalSupport?.sharedWords ?? 0) >= 2 &&
-                    (lexicalSupport?.score ?? 0) >= 0.3)
+                    (lexicalSupport?.score ?? 0) >= 0.3) ||
+                (citation as { semantic_support?: boolean })
+                    .semantic_support === true
                     ? "verified"
                     : "unconfirmed";
             occurrences.push({
@@ -5659,9 +6025,16 @@ export function assignCitationSupportByOccurrence<
             ...citations.map((citation) => citation.ref),
         ) + 1;
     const seenByRef = new Map<number, number>();
+    // Runtime removal of the transient cross-language flag; the generic T
+    // cannot name the key, so the erasure is untyped by design.
+    const stripTransient = <U,>(entry: U): U => {
+        const rest = { ...(entry as Record<string, unknown>) };
+        delete rest.semantic_support;
+        return rest as U;
+    };
     const nextCitations = citations
         .filter((citation) => !occurrencesByRef.has(citation.ref))
-        .map((citation) => ({ ...citation }));
+        .map((citation) => stripTransient({ ...citation }));
     const text = visibleText.replace(
         /\[(\d+(?:,\s*\d+)*)\]/g,
         (_whole, group: string) => {
@@ -5675,11 +6048,13 @@ export function assignCitationSupportByOccurrence<
                 const occurrence = occurrences[ordinal];
                 if (!occurrence) return ref;
                 const occurrenceRef = ordinal === 0 ? ref : nextRef++;
-                nextCitations.push({
-                    ...citation,
-                    ref: occurrenceRef,
-                    support: occurrence.support,
-                });
+                nextCitations.push(
+                    stripTransient({
+                        ...citation,
+                        ref: occurrenceRef,
+                        support: occurrence.support,
+                    }),
+                );
                 return occurrenceRef;
             });
             return `[${refs.join(", ")}]`;
@@ -5873,8 +6248,13 @@ type AssistantEvent =
           }[];
           citations_verified: number;
           citations_unconfirmed: number;
+          citations_rebound: number;
+          citations_semantic_verified: number;
+          highlight_quotes_cited: number;
+          dead_markers_stripped: number;
           handle_citations: number;
           legacy_quote_citations: number;
+          annotation_citations: number;
           leaked_handles_converted: number;
           leaked_handles_dropped: number;
       }
@@ -5924,13 +6304,16 @@ export function automaticWholeDocumentSummaryTarget(
     return {
         docId: target[0],
         focus: request,
-        language: /[가-힣]/.test(request) ? "Korean" : "English",
+        // Deliberately not a language name. Guessing between two languages
+        // mislabels every other one, and the summariser prompt already
+        // carries the user's own words to match.
+        language: DEFAULT_SUMMARY_OUTPUT_LANGUAGE,
     };
 }
 
 export const FINAL_ANSWER_CONTINUATION_MIN_CHARS = 50;
 export const FINAL_ANSWER_CONTINUATION_PROMPT =
-    "도구 결과를 바탕으로 최종 답변을 작성하라";
+    "Write the final answer from the tool results, in the language of the user's most recent message.";
 export const DEFAULT_CITATION_REPAIR_MODEL = "ollama:qwen3.5:35b";
 
 export function resolveCitationRepairModel(repairModel?: string): string {
@@ -6625,6 +7008,10 @@ export async function runLLMStream(params: {
     let repairAddedCitationCount = 0;
     let citationsVerified = 0;
     let citationsUnconfirmed = 0;
+    let citationsRebound = 0;
+    let citationsSemanticVerified = 0;
+    let citationsHighlightAttached = 0;
+    let deadMarkersStripped = 0;
     let citationMappingDiagnosticCounts: CitationMappingDiagnosticCounts =
         citationMappingDiagnostics();
     let orphanMarkerCount = 0;
@@ -6990,6 +7377,11 @@ export async function runLLMStream(params: {
     const legacyQuoteCitationCount = verifiedCitations.filter(
         (citation) => citation.protocol !== "handle",
     ).length;
+    const annotationCitationCount = verifiedCitations.filter(
+        (citation) =>
+            typeof citation.passage_handle === "string" &&
+            citation.passage_handle.startsWith("a"),
+    ).length;
     if (hasCitationDiscards(discardedCitations)) {
         console.warn("[citations] discarded invalid citations", {
             discarded: discardedCitations,
@@ -7029,9 +7421,15 @@ export async function runLLMStream(params: {
     let sanitizedVisibleText = preSanitized;
     let citations = builtCitations;
     if (!buildCitations) {
-        const deduped = dedupeCitationEvidence(
+        const highlightCited = attachAnnotationQuoteCitations(
             preSanitized,
-            builtCitations as Array<{
+            builtCitations as RebindableCitationEntry[],
+            passageRegistry,
+        );
+        citationsHighlightAttached = highlightCited.attached;
+        const deduped = dedupeCitationEvidence(
+            highlightCited.text,
+            highlightCited.citations as Array<{
                 ref: number;
                 doc_id?: unknown;
                 document_id?: unknown;
@@ -7040,9 +7438,19 @@ export async function runLLMStream(params: {
                 chunk_id?: unknown;
             }>,
         );
+        const rebind = await rebindUnconfirmedCitationEntries({
+            text: deduped.text,
+            citations: deduped.citations,
+            registry: passageRegistry,
+            docIndex,
+            userId: params.userId,
+            projectId: params.projectId,
+        });
+        citationsRebound = rebind.rebound;
+        citationsSemanticVerified = rebind.semanticVerified;
         const scoredCitations = assignCitationSupportByOccurrence(
             deduped.text,
-            deduped.citations,
+            rebind.citations,
         );
         citationsVerified = scoredCitations.citationsVerified;
         citationsUnconfirmed = scoredCitations.citationsUnconfirmed;
@@ -7050,7 +7458,14 @@ export async function runLLMStream(params: {
             scoredCitations.text,
             scoredCitations.citations,
         );
-        sanitizedVisibleText = renumbered.text;
+        // A marker whose ref has no entry after every recovery pass can never
+        // be clicked; a permanently dead badge misleads more than it informs.
+        const swept = stripEntrylessMarkers(
+            renumbered.text,
+            renumbered.citations as { ref: number }[],
+        );
+        deadMarkersStripped = swept.stripped;
+        sanitizedVisibleText = swept.text;
         citations = renumbered.citations;
     }
     orphanMarkerCount = countOrphanCitationMarkers(
@@ -7088,8 +7503,13 @@ export async function runLLMStream(params: {
         orphan_marker_count: orphanMarkerCount,
         citations_verified: citationsVerified,
         citations_unconfirmed: citationsUnconfirmed,
+        citations_rebound: citationsRebound,
+        citations_semantic_verified: citationsSemanticVerified,
+        highlight_quotes_cited: citationsHighlightAttached,
+        dead_markers_stripped: deadMarkersStripped,
         handle_citations: handleCitationCount,
         legacy_quote_citations: legacyQuoteCitationCount,
+        annotation_citations: annotationCitationCount,
         leaked_handles_converted: leakedHandlesConverted,
         leaked_handles_dropped: leakedHandlesDropped,
         ...citationMappingDiagnosticCounts,

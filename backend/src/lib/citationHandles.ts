@@ -28,12 +28,30 @@ export type PassageRecord = Readonly<{
   source: PassageSource;
 }>;
 
+/**
+ * A user's PDF highlight registered on the turn registry. Annotation handles
+ * (`a1`, `a2`, …) let a model cite a highlight by id instead of reproducing
+ * its text; unlike passages they are not backed by an indexed chunk, so
+ * `chunkId` and the char offsets are optional.
+ */
+export type AnnotationHandleSource = Readonly<{
+  annotationId: string;
+  docId: string;
+  documentId: string;
+  versionId?: string | null;
+  page: number;
+  quote: string;
+  chunkId?: string;
+  quoteStart?: number;
+  quoteEnd?: number;
+}>;
+
 export type ResolvedPassageCitation = Readonly<{
   passage: string;
   docId: string;
   documentId: string;
   versionId?: string | null;
-  chunkId: string;
+  chunkId?: string;
   page: number | string;
   quote: string;
   quoteStart: number;
@@ -111,6 +129,15 @@ function normalizedRange(
   };
 }
 
+/**
+ * Locate an excerpt inside content, tolerating whitespace differences. Used
+ * both for annotating tool excerpts and for finding a highlight's quote
+ * inside a model answer that copied it verbatim.
+ */
+export function findExcerptSpan(content: string, excerpt: string) {
+  return exactExcerptSpan(content, excerpt);
+}
+
 function exactExcerptSpan(content: string, excerpt: string) {
   const exactStart = content.indexOf(excerpt);
   if (exactStart >= 0) {
@@ -181,7 +208,10 @@ export function measurePassageAnnotationByteOverhead(
 export class PassageRegistry {
   readonly #recordsById = new Map<string, PassageRecord>();
   readonly #recordsByChunk = new Map<string, PassageRecord[]>();
+  readonly #annotationsByHandle = new Map<string, AnnotationHandleSource>();
+  readonly #annotationHandlesById = new Map<string, string>();
   #nextId = 1;
+  #nextAnnotationId = 1;
 
   registerChunk(source: PassageSource): PassageRecord[] {
     const existing = this.#recordsByChunk.get(source.chunkId);
@@ -202,6 +232,29 @@ export class PassageRegistry {
     );
     this.#recordsByChunk.set(source.chunkId, records);
     return records;
+  }
+
+  /**
+   * Mint (or reuse) the `aN` handle for one user annotation. Registering the
+   * same `annotationId` twice returns the handle already assigned to it, so a
+   * highlight surfaced by several tool calls keeps one stable id.
+   */
+  annotationHandles(): ReadonlyArray<{
+    handle: string;
+    source: AnnotationHandleSource;
+  }> {
+    return [...this.#annotationsByHandle.entries()].map(
+      ([handle, source]) => ({ handle, source }),
+    );
+  }
+
+  registerAnnotation(source: AnnotationHandleSource): string {
+    const existing = this.#annotationHandlesById.get(source.annotationId);
+    if (existing) return existing;
+    const handle = `a${this.#nextAnnotationId++}`;
+    this.#annotationHandlesById.set(source.annotationId, handle);
+    this.#annotationsByHandle.set(handle, Object.freeze({ ...source }));
+    return handle;
   }
 
   annotateChunk(source: PassageSource): string {
@@ -246,7 +299,68 @@ export class PassageRegistry {
       : `${selected[0].id}-${selected[selected.length - 1].id}`;
   }
 
+  /**
+   * Resolve, salvaging over-broad ranges instead of discarding them.
+   *
+   * A model writing "p5-p12" has named real passages and gotten the format
+   * wrong; dropping the entry leaves a marker that can never be clicked.
+   * When the range's FIRST id resolves, clamp the span to the longest valid
+   * range starting there (same chunk, at most MAX_PASSAGE_RANGE_SENTENCES)
+   * and report `clamped` so diagnostics can count the correction. An id the
+   * registry never minted stays a hard failure — there is nothing to point
+   * at.
+   */
+  resolveClamped(
+    value: string,
+  ): PassageResolution & { clamped?: boolean } {
+    const direct = this.resolve(value);
+    if (direct.ok) return direct;
+    if (direct.code !== "invalid_passage_range") return direct;
+    const match = value.trim().match(/^(p[1-9]\d*)-(p[1-9]\d*)$/);
+    if (!match) return direct;
+    const first = this.#recordsById.get(match[1]);
+    if (!first) return direct;
+    const chunkRecords = this.#recordsByChunk.get(first.source.chunkId) ?? [];
+    const tail = chunkRecords
+      .filter(
+        (record) =>
+          record.sentenceIndex >= first.sentenceIndex &&
+          record.sentenceIndex <
+            first.sentenceIndex + MAX_PASSAGE_RANGE_SENTENCES,
+      )
+      .sort((a, b) => a.sentenceIndex - b.sentenceIndex);
+    const last = tail[tail.length - 1];
+    if (!last) return direct;
+    const clampedValue =
+      last.id === first.id ? first.id : `${first.id}-${last.id}`;
+    const salvaged = this.resolve(clampedValue);
+    return salvaged.ok ? { ...salvaged, clamped: true } : direct;
+  }
+
   resolve(value: string): PassageResolution {
+    const annotationHandle = value.trim().match(/^a[1-9]\d*$/)?.[0];
+    if (annotationHandle) {
+      const annotation = this.#annotationsByHandle.get(annotationHandle);
+      if (!annotation) return { ok: false, code: "unknown_passage" };
+      const quoteStart = annotation.quoteStart ?? 0;
+      const quoteEnd = annotation.quoteEnd ?? annotation.quote.length;
+      return {
+        ok: true,
+        citation: Object.freeze({
+          passage: annotationHandle,
+          docId: annotation.docId,
+          documentId: annotation.documentId,
+          versionId: annotation.versionId,
+          chunkId: annotation.chunkId,
+          page: annotation.page,
+          quote: annotation.quote,
+          quoteStart,
+          quoteEnd,
+          startChar: quoteStart,
+          endChar: quoteEnd,
+        }),
+      };
+    }
     const parsed = parsePassageRange(value);
     if (!parsed) return { ok: false, code: "invalid_passage_range" };
     const first = this.#recordsById.get(parsed.first);
@@ -306,7 +420,7 @@ export class PassageRegistry {
         doc_id: resolved.citation.docId,
         page: resolved.citation.page,
         quote: resolved.citation.quote,
-        chunk_id: resolved.citation.chunkId,
+        chunk_id: record.source.chunkId,
       };
     });
   }

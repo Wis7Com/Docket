@@ -92,6 +92,92 @@ test("registry rejects malformed, unknown, cross-chunk, and overlong ranges", ()
   });
 });
 
+const annotationSource = {
+  annotationId: "annotation-1",
+  docId: "doc-3",
+  documentId: "document-c",
+  versionId: "version-c",
+  page: 14,
+  quote: "The highlighted sentence the reader marked as dispositive.",
+} as const;
+
+test("annotation handles mint in order and deduplicate by annotation id", () => {
+  const registry = new PassageRegistry();
+
+  assert.equal(registry.registerAnnotation(annotationSource), "a1");
+  assert.equal(
+    registry.registerAnnotation({
+      ...annotationSource,
+      annotationId: "annotation-2",
+      quote: "A second highlight covering an unrelated proposition.",
+    }),
+    "a2",
+  );
+  assert.equal(registry.registerAnnotation(annotationSource), "a1");
+  assert.equal(
+    registry.registerAnnotation({
+      ...annotationSource,
+      quote: "Re-registration under the same id keeps the original handle.",
+    }),
+    "a1",
+  );
+});
+
+test("registry resolves an annotation handle to its stored highlight", () => {
+  const registry = new PassageRegistry();
+  registry.registerChunk(source);
+  const handle = registry.registerAnnotation(annotationSource);
+
+  const resolved = registry.resolve(handle);
+  assert.equal(resolved.ok, true);
+  if (resolved.ok) {
+    assert.equal(resolved.citation.passage, "a1");
+    assert.equal(resolved.citation.docId, "doc-3");
+    assert.equal(resolved.citation.documentId, "document-c");
+    assert.equal(resolved.citation.versionId, "version-c");
+    assert.equal(resolved.citation.chunkId, undefined);
+    assert.equal(resolved.citation.page, 14);
+    assert.equal(resolved.citation.quote, annotationSource.quote);
+    assert.equal(resolved.citation.quoteStart, 0);
+    assert.equal(resolved.citation.quoteEnd, annotationSource.quote.length);
+    assert.equal(resolved.citation.startChar, 0);
+    assert.equal(resolved.citation.endChar, annotationSource.quote.length);
+  }
+
+  // Passage resolution on the same registry is untouched by annotations.
+  const passage = registry.resolve("p1");
+  assert.equal(passage.ok, true);
+  if (passage.ok) {
+    assert.equal(passage.citation.chunkId, "chunk-a");
+    assert.match(passage.citation.quote, /^The first synthetic sentence/);
+  }
+
+  // Annotations are claim sources, not searchable sentence evidence.
+  assert.deepEqual(
+    registry.repairCandidates().map((candidate) => candidate.passage),
+    ["p1", "p2", "p3"],
+  );
+});
+
+test("registry rejects annotation ranges and unknown annotation handles", () => {
+  const registry = new PassageRegistry();
+  registry.registerAnnotation(annotationSource);
+  registry.registerAnnotation({
+    ...annotationSource,
+    annotationId: "annotation-2",
+    quote: "A second highlight covering an unrelated proposition.",
+  });
+
+  assert.deepEqual(registry.resolve("a1-a2"), {
+    ok: false,
+    code: "invalid_passage_range",
+  });
+  assert.deepEqual(registry.resolve("a9"), {
+    ok: false,
+    code: "unknown_passage",
+  });
+});
+
 test("registry derives a page range and inserts the established break sentinel", () => {
   const registry = new PassageRegistry();
   const content =
