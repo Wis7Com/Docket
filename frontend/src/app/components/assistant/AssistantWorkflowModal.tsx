@@ -8,6 +8,7 @@ import remarkGfm from "remark-gfm";
 import type { DocketWorkflow } from "../shared/types";
 import { listWorkflows } from "@/app/lib/docketApi";
 import { BUILT_IN_WORKFLOWS } from "../workflows/builtinWorkflows";
+import { WorkflowAttributionNote } from "../workflows/WorkflowAttributionNote";
 
 interface Props {
     open: boolean;
@@ -200,13 +201,17 @@ export function AssistantWorkflowModal({
                     {/* Right panel — prompt preview */}
                     {selected && (
                         <div className={`flex-1 border-l border-gray-100 flex flex-col overflow-hidden px-3 pb-3 transition-opacity duration-200 ${rightVisible ? "opacity-100" : "opacity-0"}`}>
-                            <div className="flex items-center justify-between py-3 shrink-0">
-                                <p className="text-xs font-medium text-gray-700">
+                            <div className="flex items-center justify-between gap-3 py-3 shrink-0">
+                                <p className="text-xs font-medium text-gray-700 shrink-0">
                                     Workflow Prompt
                                 </p>
+                                <WorkflowAttributionNote
+                                    attribution={selected.attribution}
+                                    className="ml-auto truncate"
+                                />
                                 <button
                                     onClick={() => setSelected(null)}
-                                    className="rounded-lg p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors"
+                                    className="rounded-lg p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 transition-colors shrink-0"
                                 >
                                     <ChevronLeft className="h-3.5 w-3.5" />
                                 </button>
