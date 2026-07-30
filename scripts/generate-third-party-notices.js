@@ -73,8 +73,29 @@ function licenseFromDisk(dir) {
   return null;
 }
 
+/**
+ * `backend/` and `frontend/` both declare `"docket-desktop": "file:.."`, so
+ * every tree walk arrives at the repository root. The root is Docket's own
+ * package rather than a third party, and it declares no production
+ * dependencies at all — the Electron shell's tooling lives entirely in
+ * devDependencies, and `build.files` ships only `dist-electron/`, the icons,
+ * and package.json.
+ *
+ * `npm ls --omit=dev` omits the dev dependencies of the tree it was pointed at,
+ * but it still descends the link and reports whatever sits in the root's
+ * node_modules — electron-builder, playwright-core, typescript and their
+ * subtrees. Walking through the link therefore did two wrong things at once:
+ * it credited 215 build-time packages as shipping inside the app, and it made
+ * the output depend on whether the root happened to be installed on the
+ * machine running this script. Two developers could regenerate the same commit
+ * and get files hundreds of packages apart, which is the failure this script
+ * exists to make impossible.
+ */
+const SELF_LINK = "docket-desktop";
+
 function walk(node, packages) {
   for (const [name, dep] of Object.entries(node.dependencies || {})) {
+    if (name === SELF_LINK) continue;
     if (!packages.has(name)) {
       packages.set(name, {
         version: dep.version || null,
@@ -90,6 +111,31 @@ function walk(node, packages) {
 }
 
 /**
+ * Skipping the self-link is only correct while the root has nothing to
+ * contribute. The moment it gains a real production dependency, that package
+ * ships — `extraResources` already carries backend and frontend bundles out of
+ * this tree — and silently skipping it would under-report in exactly the
+ * direction this file refuses to under-report in. Cheaper to assert than to
+ * discover in an audit.
+ */
+function assertRootShipsNothing() {
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(ROOT, "package.json"), "utf8"),
+  );
+  const declared = Object.keys(manifest.dependencies || {});
+  if (declared.length === 0) return;
+
+  const err = new Error(
+    `The root package now declares production dependencies ` +
+      `(${declared.join(", ")}), which this script skips as part of the ` +
+      `\`${SELF_LINK}\` self-link and would therefore leave undisclosed.\n` +
+      `Teach walk() to descend the link for those packages before continuing.`,
+  );
+  err.expected = true;
+  throw err;
+}
+
+/**
  * `npm ls` exits non-zero for benign reasons — a peer-dep warning is enough —
  * so its exit code cannot gate this script. But it *also* exits non-zero when
  * packages are simply not installed, and in that case it still prints a tree:
@@ -98,9 +144,11 @@ function walk(node, packages) {
  *
  * That is not hypothetical. A frontend/ whose node_modules npm could no longer
  * reconcile — every declared dependency reported missing while all 592 were
- * present on disk, fixed by reinstalling — took this file from 866 packages to
- * 504. The LGPL-3.0 libvips paragraph and the CC-BY-4.0 caniuse-lite entry went
- * with them. Nothing failed; the file just got shorter.
+ * present on disk, fixed by reinstalling — cut this file by 362 packages, from
+ * the 866 it then reported down to 504. The LGPL-3.0 libvips paragraph and the
+ * CC-BY-4.0 caniuse-lite entry went with them. Nothing failed; the file just
+ * got shorter. (Those totals are historical: the walk no longer descends the
+ * `docket-desktop` self-link, so a healthy run reports fewer packages now.)
  *
  * A notices file that quietly drops disclosures is worse than one that refuses
  * to build, so an unresolved tree is a hard error. Only top-level dependencies
@@ -133,6 +181,7 @@ function assertTreeResolved(tree, parsed) {
 }
 
 function collect() {
+  assertRootShipsNothing();
   const packages = new Map();
   for (const tree of TREES) {
     const prefix = path.join(ROOT, tree);
@@ -161,8 +210,6 @@ function collect() {
     assertTreeResolved(tree, parsed);
     walk(parsed, packages);
   }
-  // Docket's own workspace package is not a third party.
-  packages.delete("docket-desktop");
   return packages;
 }
 
@@ -339,9 +386,10 @@ function render(packages) {
   let md = PREAMBLE;
   md += `\n## npm dependencies\n\n`;
   md += `${total} production packages ship inside the app across the \`backend/\`\n`;
-  md += `and \`frontend/\` trees (development-only dependencies are excluded — they\n`;
-  md += `are not redistributed). Every package's own license text is preserved in\n`;
-  md += `its directory under \`node_modules/\`.\n\n`;
+  md += `and \`frontend/\` trees. Development-only dependencies are excluded, as is\n`;
+  md += `the Electron shell's own build tooling at the repository root — none of\n`;
+  md += `it is redistributed. Every package's own license text is preserved in its\n`;
+  md += `directory under \`node_modules/\`.\n\n`;
   md += `| License | Packages |\n| --- | ---: |\n`;
   for (const [license, list] of groups) {
     md += `| ${license} | ${list.length} |\n`;
