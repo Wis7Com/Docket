@@ -62,10 +62,18 @@ import {
     applyCitationRepairPlan,
     boundCitationRepairEvidence,
     buildCitationRepairRequest,
+    buildCitationRepairBatches,
     citationRepairBody,
+    citationLexicalSupport,
+    CITATION_REPAIR_MAX_CALLS,
+    CITATION_REPAIR_MAX_POOL_CANDIDATES,
+    CITATION_REPAIR_MAX_ROUNDS,
+    buildQuoteCandidatePool,
+    insertCitationMarker,
     isCitationRepairDocumentTool,
     parseCitationRepairResponse,
     reattachOrphanCitationEntries,
+    shouldContinueCitationRepairRounds,
     shouldAttemptCitationRepair,
     type CitationRepairEvidence,
 } from "./citationRepair";
@@ -76,6 +84,13 @@ import {
     type CitationDiscardCounts,
     type CitationMappingDiagnosticCounts,
 } from "./citationDiagnostics";
+import {
+    PassageRegistry,
+    citationHandlesEnabled,
+    type PassageSource,
+    type ResolvedPassageCitation,
+} from "./citationHandles";
+import { escapeRegExp } from "./regex";
 
 export { recoverNamedQuotedCitation, recoverNamedQuotedCitations };
 
@@ -173,33 +188,58 @@ export function filterToolsByDisabled(
 // Constants
 // ---------------------------------------------------------------------------
 
-export const SYSTEM_PROMPT = `You are Docket, an AI legal assistant that helps lawyers and legal professionals analyze documents, answer legal questions, and draft legal documents.
-
-DOCUMENT CITATION INSTRUCTIONS:
+const HANDLE_CITATION_INSTRUCTIONS = `DOCUMENT CITATION INSTRUCTIONS:
 When you reference specific content from a document, place a numbered marker [1], [2], etc. inline in your prose at the point of reference.
 
 After your complete response, append a <CITATIONS> block containing a JSON array with one entry per marker:
 
 <CITATIONS>
 [
-  {"ref": 1, "doc_id": "doc-0", "page": 3, "quote": "exact verbatim text from the document", "chunk_id": "copy only the exact chunk_id returned by indexed search/read"},
-  {"ref": 2, "doc_id": "doc-1", "page": "41-42", "quote": "Section 4.2 describes the procedure [[PAGE_BREAK]] in all material respects."}
+  {"ref": 1, "passage": "p12"},
+  {"ref": 2, "passage": "p18-p19"}
 ]
 </CITATIONS>
 
 CRITICAL: The number inside the [N] marker in your prose is the "ref" value of a citation entry in the <CITATIONS> block — it is NOT a page number, footnote number, section number, or any other number that appears in the document. The marker [1] refers to the entry with "ref": 1 in the JSON block; [2] refers to "ref": 2; and so on. Refs are simple sequential integers you assign (1, 2, 3, …) in the order citations appear in your prose. Never use a page number or a document's own numbering as the marker number. Every [N] you write in prose MUST have a matching {"ref": N, ...} entry in the JSON block.
 
 Rules:
-- Only cite text that appears verbatim in the provided documents
-- In every <CITATIONS> entry, "doc_id" MUST be the exact chat-local document label you were given (for example "doc-0"). Never use a filename, document UUID, or any other identifier in "doc_id"
-- Keep quotes short (ideally ≤ 25 words) and narrowly scoped to the specific claim. Don't reuse one quote to support multiple different claims — give each its own citation
-- "page" refers to the sequential [Page N] marker in the text you were given (1-indexed from the first page). IGNORE any page numbers printed inside the document itself (footers, roman numerals, etc.)
-- For a single-page quote, set "page" to an integer. If a quote is one continuous sentence that spans two pages, set "page" to "N-M" and insert [[PAGE_BREAK]] in the quote at the page break. Otherwise, use separate citations for text on different pages
+- Every factual claim about a document must end with a numeric [N] marker whose citation entry names the supporting passage handle.
+- Passage handles appear only in document tool output as [pN]. Copy those short handles into the "passage" field; never invent one.
+- Passage ids never appear in the answer text; prose carries only numeric [N] markers, and each entry maps that marker to a passage id.
+- A passage handle is NOT a page number: page 32 does not imply handle p32. When tool output provides a "citation_passage" field, copy that exact value.
+- A passage may be one handle ("p12") or a contiguous range of at most three sentences from the same indexed chunk ("p12-p14").
+- If no displayed passage supports a claim, omit the claim or leave it uncited. Never guess a handle.
 - Put the <CITATIONS> block at the very end of the response. Omit it entirely if there are no citations
 - A citation marker and a citation entry are a one-to-one relationship. Never reuse a ref, omit a ref, or add an unused entry. If you cannot supply a complete, exact citation, omit that marker instead.
 - Never cite as [filename] or [filename, p. N] in prose. Those are dead text, not citation links. Every document citation in prose must be a numeric [N] marker with a matching <CITATIONS> entry.
-- When an indexed search/read result includes a chunk_id, copy that exact chunk_id into the citation entry. Never invent a chunk_id, page, or quote. The server verifies citations against the indexed source text and will discard any mismatch.
 - In Markdown tables, place each [N] marker at the end of the supported claim inside the relevant cell. A table does not waive or replace the citation contract.
+`;
+
+const LEGACY_CITATION_INSTRUCTIONS = `DOCUMENT CITATION INSTRUCTIONS:
+When you reference specific content from a document, place a numbered marker [1], [2], etc. inline in your prose at the point of reference.
+
+After your complete response, append a <CITATIONS> block containing a JSON array with one entry per marker:
+
+<CITATIONS>
+[
+  {"ref": 1, "doc_id": "doc-0", "page": 3, "quote": "exact verbatim text from the document", "chunk_id": "copy only the exact chunk_id returned by indexed search/read"}
+]
+</CITATIONS>
+
+Refs are sequential integers in prose order. Every marker and entry have a one-to-one relationship.
+
+Rules:
+- Only cite text that appears verbatim in the provided documents.
+- "doc_id" must be the exact chat-local label.
+- Keep quotes short and copy chunk_id exactly when supplied.
+- Put the block at the very end and omit it when there are no citations.
+- Never cite as [filename] or [filename, p. N] in prose.
+- In Markdown tables, put each [N] marker inside the supported cell. A table does not waive or replace the citation contract.
+`;
+
+export const SYSTEM_PROMPT = `You are Docket, an AI legal assistant that helps lawyers and legal professionals analyze documents, answer legal questions, and draft legal documents.
+
+${HANDLE_CITATION_INSTRUCTIONS}
 
 DOCX GENERATION:
 If asked to draft or generate a document, use the generate_docx tool to produce a downloadable Word document. Always use this tool rather than just displaying the document content inline when the user asks for a document to be created.
@@ -207,7 +247,7 @@ If the user follows up on a document you just generated and asks for changes (e.
 After calling generate_docx, do NOT include any download links, URLs, or markdown links to the document in your prose response — the download card is presented automatically by the UI. Do not describe formatting choices such as orientation or layout.
 After calling generate_docx, you MUST call read_document on the returned doc_id before writing your prose response. Base your description on the generated document's actual text, not on memory of what you intended to generate.
 Your prose response MUST include a short description of the generated document: what it is, its structure (key sections/clauses), and — if the draft was informed by any provided source documents — which sources you drew from and how. Keep it concise (typically 3–8 sentences or a short bulleted list). Refer to the document by filename, never by a download link.
-When the description makes factual claims about the contents of the newly generated document, cite the generated document with [N] markers and a <CITATIONS> block exactly as specified in the DOCUMENT CITATION INSTRUCTIONS above. If you also make factual claims about provided source documents, cite those source documents separately. In every citation entry, use the exact chat-local doc_id label for the cited document. Omit the <CITATIONS> block if the description makes no such claims.
+When the description makes factual claims about provided indexed source documents, cite those sources with [N] markers and a <CITATIONS> block exactly as specified in the DOCUMENT CITATION INSTRUCTIONS above. Omit the <CITATIONS> block if the description makes no such claims.
 Heading hierarchy: always use Heading 1 before introducing Heading 2, Heading 2 before Heading 3, and so on. Never skip levels (e.g. do not jump from Heading 1 to Heading 3).
 Numbering: all numbering MUST start from 1, never 0. This applies at every level of the hierarchy — use 1., 1.1, 1.1.1, 1.1.1.1, etc. Never produce 0., 0.1, 1.0, 1.0.1, or any other sequence that begins a level with 0.
 Never duplicate the numbering prefix in heading text. The heading's own numbering is applied automatically by the document generator, so the heading text must contain the title only — do NOT prepend "1.", "1.1", "2.", etc. into the heading text itself. For example, a Heading 1 titled "Introduction" must be passed as "Introduction", never as "1. Introduction" (which would render as "1. 1. Introduction"). The same rule applies at every level.
@@ -226,21 +266,43 @@ WORKFLOWS:
 When a user message begins with a [Workflow: <title> (id: <id>)] marker, the user has selected a workflow and you MUST apply it. Immediately call the read_workflow tool with that exact id to load the workflow's full prompt, then follow those instructions for the current turn. Do this before producing any other output or calling any other tools (aside from any document reads the workflow requires). Do not ask the user to confirm — the selection itself is the instruction to apply the workflow.
 
 DOCUMENT NAMING IN PROSE:
-The chat-local labels ("doc-0", "doc-1", "doc-N", …) are internal handles for tool calls and citation JSON ONLY. NEVER write them in your prose response or in any text the user reads — not in body text, not in headings, not in lists, not in tool-activity descriptions. The user does not know what "doc-0" means and seeing it is jarring. When referring to a document in prose, always use its filename (e.g. "the NDA draft" or "nda_v1.docx"). This rule applies to every word streamed back to the user; the only places "doc-N" identifiers are allowed are inside tool-call arguments and inside the <CITATIONS> JSON block's "doc_id" field.
+The chat-local labels ("doc-0", "doc-1", "doc-N", …) are internal handles for tool calls only. NEVER write them in your prose response or in any text the user reads — not in body text, not in headings, not in lists, not in tool-activity descriptions. The user does not know what "doc-0" means and seeing it is jarring. When referring to a document in prose, always use its filename (e.g. "the NDA draft" or "nda_v1.docx").
 
 ANNOTATION COVERAGE:
 When the user asks for a per-highlight or per-annotation review (for example "each highlighted argument", "pair each highlight", or "analyze my marked passages"), you MUST account for every retrieved highlight or annotation. Each item must either be mapped to a row or section, explicitly grouped with named siblings (for example "p.12 and p.17 are treated together as the targeting argument"), or explicitly excluded with a short reason (for example "p.4 and p.8 are table-of-authorities lines, not arguments"). Silent merges and omissions are prohibited; all highlights are accounted for or explicitly grouped.
 
 GENERAL GUIDANCE:
 - Be precise and professional
-- Cite the specific document and quote when making claims about document content
+- Cite the specific indexed passage handle when making claims about document content
 - When no documents are provided, answer based on your legal knowledge
 - Do not fabricate document content
 - Do not use emojis in your responses.
 `;
 
-const LOCAL_MODEL_CITATION_REMINDER = `FINAL RESPONSE CITATION CHECK:
+const LOCAL_MODEL_HANDLE_CITATION_REMINDER = `FINAL RESPONSE CITATION CHECK:
+Before finishing an answer that uses document content, add a sequential [N] marker immediately after every supported claim and append the required <CITATIONS> JSON block at the very end. For each ref, copy only a passage handle shown in tool output, preferably the exact "citation_passage" value, for example {"ref":1,"passage":"p12"}. A page number is not a passage handle: page 32 does not mean p32. Never write [pN] in prose or inside a quotation. Do not invent handles or merely name a source document in prose.`;
+
+const LOCAL_MODEL_LEGACY_CITATION_REMINDER = `FINAL RESPONSE CITATION CHECK:
 Before finishing an answer that uses document content, add a sequential [N] marker immediately after every supported claim and append the required <CITATIONS> JSON block at the very end. Copy the exact chat-local doc_id and a short exact quote from the tool result. Do not merely name a source document in prose without a verified marker. Omit a claim rather than inventing a citation.`;
+
+export function citationSystemPrompt(
+    envValue = process.env.DOCKET_CITATION_HANDLES,
+) {
+    return citationHandlesEnabled(envValue)
+        ? SYSTEM_PROMPT
+        : SYSTEM_PROMPT.replace(
+              HANDLE_CITATION_INSTRUCTIONS,
+              LEGACY_CITATION_INSTRUCTIONS,
+          )
+              .replace(
+                  "are internal handles for tool calls only.",
+                  "are internal handles for tool calls and legacy citation JSON only.",
+              )
+              .replace(
+                  "Cite the specific indexed passage handle when making claims about document content",
+                  "Cite the specific document and exact quote when making claims about document content",
+              );
+}
 
 export function systemPromptForModel(
     systemPrompt: string,
@@ -250,7 +312,11 @@ export function systemPromptForModel(
         model.startsWith("ollama/") ||
         model.startsWith("free-router:") ||
         model.startsWith("free-router/")
-        ? `${systemPrompt}\n\n${LOCAL_MODEL_CITATION_REMINDER}`
+        ? `${systemPrompt}\n\n${
+              systemPrompt.includes('"passage"')
+                  ? LOCAL_MODEL_HANDLE_CITATION_REMINDER
+                  : LOCAL_MODEL_LEGACY_CITATION_REMINDER
+          }`
         : systemPrompt;
 }
 
@@ -882,7 +948,7 @@ export const TOOLS = [
     },
 ];
 
-type ParsedCitation = {
+type LegacyCitation = {
     ref: number;
     doc_id: string;
     page: number | string;
@@ -890,12 +956,37 @@ type ParsedCitation = {
     chunk_id?: string;
     quote_start?: number;
     quote_end?: number;
+    protocol?: "legacy" | "handle";
+    support?: "verified" | "unconfirmed";
 };
+
+type HandleCitation = {
+    ref: number;
+    passage: string;
+};
+
+type ParsedCitation = LegacyCitation | HandleCitation;
+
+function isLegacyCitation(
+    citation: ParsedCitation,
+): citation is LegacyCitation {
+    return "doc_id" in citation;
+}
 
 function normalizeCitation(raw: unknown): ParsedCitation | null {
     if (!raw || typeof raw !== "object") return null;
     const c = raw as Record<string, unknown>;
-    if (typeof c.ref !== "number" || typeof c.doc_id !== "string") return null;
+    if (
+        typeof c.ref !== "number" ||
+        !Number.isSafeInteger(c.ref) ||
+        c.ref < 1
+    ) {
+        return null;
+    }
+    if (typeof c.passage === "string" && c.passage.trim()) {
+        return { ref: c.ref, passage: c.passage.trim() };
+    }
+    if (typeof c.doc_id !== "string") return null;
     if (typeof c.quote !== "string" || !c.quote) return null;
     let page: number | string;
     if (typeof c.page === "number") {
@@ -1138,7 +1229,7 @@ export function buildMessages(
     docIndex?: DocIndex,
 ) {
     const formatted: unknown[] = [];
-    let systemContent = SYSTEM_PROMPT;
+    let systemContent = citationSystemPrompt();
 
     if (systemPromptExtra) {
         systemContent += `\n\n${systemPromptExtra.trim()}`;
@@ -2731,13 +2822,32 @@ export type AnnotationContextChunk = {
 export type AnnotationContextLoader = (
     documentId: string,
     versionId: string | null,
+    page?: number,
 ) => AnnotationContextChunk[] | Promise<AnnotationContextChunk[]>;
 
 function defaultAnnotationContextLoader(
     documentId: string,
     versionId: string | null,
+    page?: number,
 ): AnnotationContextChunk[] {
     try {
+        if (page !== undefined) {
+            return getDb()
+                .prepare(
+                    `SELECT id AS chunk_id, chunk_index, page_number, content, start_char, end_char
+                 FROM document_index_chunks
+                 WHERE document_id = ? AND (? IS NULL OR version_id = ?)
+                   AND page_number BETWEEN ? AND ?
+                 ORDER BY chunk_index ASC`,
+                )
+                .all(
+                    documentId,
+                    versionId,
+                    versionId,
+                    Math.max(1, page - 1),
+                    page + 1,
+                ) as AnnotationContextChunk[];
+        }
         return getDb()
             .prepare(
                 `SELECT id AS chunk_id, chunk_index, page_number, content, start_char, end_char
@@ -2988,11 +3098,11 @@ export async function readAnnotationContexts(args: {
         const row = byId.get(annotationId);
         if (!row) continue;
         const info = infoByDocumentId.get(row.document_id);
-        const cacheKey = `${row.document_id}:${row.version_id ?? ""}`;
+        const cacheKey = `${row.document_id}:${row.version_id ?? ""}:${row.page_number}`;
         let chunksPromise = chunkCache.get(cacheKey);
         if (!chunksPromise) {
             chunksPromise = Promise.resolve(
-                loadChunks(row.document_id, row.version_id),
+                loadChunks(row.document_id, row.version_id, row.page_number),
             );
             chunkCache.set(cacheKey, chunksPromise);
         }
@@ -3018,6 +3128,311 @@ export async function readAnnotationContexts(args: {
     };
 }
 
+type IndexedPassageRow = {
+    chunk_id: string;
+    document_id: string;
+    version_id: string | null;
+    content: string;
+    page_number: number | null;
+    start_char: number;
+    end_char: number;
+};
+
+function indexedPassageSource(
+    chunkId: string,
+    docIndex: DocIndex | undefined,
+    fallback?: Partial<PassageSource>,
+): PassageSource | null {
+    let row: IndexedPassageRow | undefined;
+    try {
+        row = getDb()
+            .prepare(
+                `SELECT id AS chunk_id, document_id, version_id, content,
+                        page_number, start_char, end_char
+                 FROM document_index_chunks
+                 WHERE id = ?`,
+            )
+            .get(chunkId) as IndexedPassageRow | undefined;
+    } catch {
+        row = undefined;
+    }
+    const documentId = row?.document_id ?? fallback?.documentId;
+    if (!documentId) return null;
+    const docId =
+        fallback?.docId ??
+        Object.entries(docIndex ?? {}).find(
+            ([, info]) => info.document_id === documentId,
+        )?.[0];
+    const content = row?.content ?? fallback?.content;
+    if (!docId || !content) return null;
+    return {
+        docId,
+        documentId,
+        versionId: row?.version_id ?? fallback?.versionId,
+        chunkId,
+        content,
+        page: row?.page_number ?? fallback?.page,
+        pageEnd: fallback?.pageEnd,
+        startChar: row?.start_char ?? fallback?.startChar,
+        endChar: row?.end_char ?? fallback?.endChar,
+        pageBreakOffsets: fallback?.pageBreakOffsets,
+    };
+}
+
+function annotateIndexedEvidencePayload(
+    value: unknown,
+    registry: PassageRegistry,
+    docIndex: DocIndex | undefined,
+    inherited: { docId?: string; documentId?: string } = {},
+): unknown {
+    if (Array.isArray(value)) {
+        return value.map((item) =>
+            annotateIndexedEvidencePayload(item, registry, docIndex, inherited),
+        );
+    }
+    if (!value || typeof value !== "object") return value;
+    const record = value as Record<string, unknown>;
+    const docId =
+        typeof record.doc_id === "string" ? record.doc_id : inherited.docId;
+    const documentId =
+        typeof record.document_id === "string"
+            ? record.document_id
+            : inherited.documentId;
+    const chunkId =
+        typeof record.chunk_id === "string" ? record.chunk_id : undefined;
+    const source = chunkId
+        ? indexedPassageSource(chunkId, docIndex, {
+              ...(docId ? { docId } : {}),
+              ...(documentId ? { documentId } : {}),
+              ...(typeof record.version_id === "string"
+                  ? { versionId: record.version_id }
+                  : {}),
+              ...(typeof record.page === "number" ? { page: record.page } : {}),
+              ...(typeof record.page_end === "number"
+                  ? { pageEnd: record.page_end }
+                  : {}),
+          })
+        : null;
+    const annotated: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(record)) {
+        if (source && key === "indexed_quote" && typeof nested === "string") {
+            annotated[key] = registry.annotateExcerpt(source, nested);
+        } else {
+            annotated[key] = annotateIndexedEvidencePayload(
+                nested,
+                registry,
+                docIndex,
+                { docId, documentId },
+            );
+        }
+    }
+    if (source && typeof record.indexed_quote === "string") {
+        const citationPassage = registry.passageForQuote(
+            source,
+            record.indexed_quote,
+        );
+        if (citationPassage) annotated.citation_passage = citationPassage;
+    }
+    return annotated;
+}
+
+export function annotatePdfAnnotationPayload(
+    content: Record<string, unknown>,
+    registry: PassageRegistry,
+    docIndex: DocIndex | undefined,
+    loadChunks: (
+        documentId: string,
+        versionId: string | null,
+        page: number,
+    ) => AnnotationContextChunk[] = defaultAnnotationContextLoader,
+): Record<string, unknown> {
+    const annotations = Array.isArray(content.annotations)
+        ? (content.annotations as Array<Record<string, unknown>>)
+        : [];
+    const chunkCache = new Map<string, AnnotationContextChunk[]>();
+    const groundedAnnotations = annotations.map((annotation) => {
+        const documentId =
+            typeof annotation.document_id === "string"
+                ? annotation.document_id
+                : undefined;
+        const page =
+            typeof annotation.page === "number" ? annotation.page : undefined;
+        const quote =
+            typeof annotation.quote === "string" ? annotation.quote : undefined;
+        if (!documentId || page === undefined || !quote) return annotation;
+        const versionId =
+            typeof annotation.version_id === "string"
+                ? annotation.version_id
+                : null;
+        const cacheKey = `${documentId}:${versionId ?? ""}:${page}`;
+        let chunks = chunkCache.get(cacheKey);
+        if (!chunks) {
+            chunks = loadChunks(documentId, versionId, page);
+            chunkCache.set(cacheKey, chunks);
+        }
+        const context = extractAnnotationContext({
+            quote,
+            page,
+            chunks,
+            radius: 600,
+        });
+        if (!context.chunk_id || !context.indexed_quote) return annotation;
+        const sourceChunk = chunks.find(
+            (chunk) => chunk.chunk_id === context.chunk_id,
+        );
+        const docId =
+            typeof annotation.doc_id === "string"
+                ? annotation.doc_id
+                : Object.entries(docIndex ?? {}).find(
+                      ([, info]) => info.document_id === documentId,
+                  )?.[0];
+        if (!sourceChunk || !docId) return annotation;
+        const source: PassageSource = {
+            docId,
+            documentId,
+            versionId,
+            chunkId: context.chunk_id,
+            content: sourceChunk.content,
+            page: sourceChunk.page_number,
+            startChar: sourceChunk.start_char,
+            endChar: sourceChunk.end_char,
+        };
+        const indexedQuote = registry.annotateExcerpt(
+            source,
+            context.indexed_quote,
+        );
+        const citationPassage = registry.passageForQuote(
+            source,
+            context.indexed_quote,
+        );
+        return {
+            ...annotation,
+            chunk_id: context.chunk_id,
+            indexed_quote: indexedQuote,
+            ...(citationPassage ? { citation_passage: citationPassage } : {}),
+        };
+    });
+    return { ...content, annotations: groundedAnnotations };
+}
+
+function rewritePreparedSummaryWithHandles(
+    preparedText: string,
+    rows: readonly DocumentSummaryChunk[],
+    docId: string,
+    documentId: string,
+    versionId: string,
+    registry: PassageRegistry,
+): string {
+    return preparedText.replace(
+        /<CITATIONS>\s*([\s\S]*?)\s*<\/CITATIONS>/,
+        (block, json: string) => {
+            try {
+                const citations = JSON.parse(json);
+                if (!Array.isArray(citations)) return block;
+                const rewritten = citations.map(
+                    (citation: Record<string, unknown>) => {
+                        if (
+                            typeof citation.chunk_id !== "string" ||
+                            typeof citation.quote !== "string"
+                        ) {
+                            return citation;
+                        }
+                        const row = rows.find(
+                            (candidate) =>
+                                candidate.chunk_id === citation.chunk_id,
+                        );
+                        if (!row) return citation;
+                        const source: PassageSource = {
+                            docId,
+                            documentId,
+                            versionId,
+                            chunkId: row.chunk_id,
+                            content: row.content,
+                            page: row.page_number,
+                            pageEnd: row.page_end,
+                            startChar: row.start_char,
+                            endChar: row.end_char,
+                        };
+                        const passage = registry.passageForQuote(
+                            source,
+                            citation.quote,
+                        );
+                        return passage
+                            ? { ref: citation.ref, passage }
+                            : citation;
+                    },
+                );
+                return `<CITATIONS>\n${JSON.stringify(rewritten, null, 2)}\n</CITATIONS>`;
+            } catch {
+                return block;
+            }
+        },
+    );
+}
+
+function indexedFindResult(args: {
+    docId: string;
+    info: NonNullable<DocIndex[string]>;
+    query: string;
+    maxResults: number;
+    registry: PassageRegistry;
+}): string | null {
+    if (!args.info.version_id) return null;
+    let rows: IndexedPassageRow[] = [];
+    try {
+        rows = getDb()
+            .prepare(
+                `SELECT id AS chunk_id, document_id, version_id, content,
+                        page_number, start_char, end_char
+                 FROM document_index_chunks
+                 WHERE document_id = ? AND version_id = ?
+                 ORDER BY chunk_index ASC`,
+            )
+            .all(
+                args.info.document_id,
+                args.info.version_id,
+            ) as IndexedPassageRow[];
+    } catch {
+        return null;
+    }
+    const needle = args.query.trim().replace(/\s+/g, " ").toLocaleLowerCase();
+    const matches = rows.filter((row) =>
+        row.content.replace(/\s+/g, " ").toLocaleLowerCase().includes(needle),
+    );
+    if (!matches.length) return null;
+    const hits = matches.slice(0, args.maxResults).map((row, index) => {
+        const source: PassageSource = {
+            docId: args.docId,
+            documentId: row.document_id,
+            versionId: row.version_id,
+            chunkId: row.chunk_id,
+            content: row.content,
+            page: row.page_number,
+            startChar: row.start_char,
+            endChar: row.end_char,
+        };
+        return {
+            index,
+            doc_id: args.docId,
+            document_id: row.document_id,
+            version_id: row.version_id,
+            chunk_id: row.chunk_id,
+            page: row.page_number,
+            excerpt: args.query,
+            context: args.registry.annotateChunk(source),
+        };
+    });
+    return JSON.stringify({
+        ok: true,
+        filename: args.info.filename,
+        query: args.query,
+        total_matches: matches.length,
+        returned: hits.length,
+        truncated: matches.length > hits.length,
+        hits,
+    });
+}
+
 export async function runToolCalls(
     toolCalls: ToolCall[],
     docStore: DocStore,
@@ -3036,6 +3451,7 @@ export async function runToolCalls(
         apiKeys?: UserApiKeys;
         signal?: AbortSignal;
     },
+    passageRegistry?: PassageRegistry,
 ): Promise<{
     toolResults: unknown[];
     docsRead: { filename: string; document_id?: string }[];
@@ -3216,17 +3632,27 @@ export async function runToolCalls(
                     coverage: summary.coverage,
                 })}\n\n`,
             );
+            const preparedText = passageRegistry
+                ? rewritePreparedSummaryWithHandles(
+                      summary.preparedText,
+                      rows,
+                      docId,
+                      info.document_id,
+                      versionId,
+                      passageRegistry,
+                  )
+                : summary.preparedText;
             documentSummaries.push({
                 filename,
                 document_id: info.document_id,
-                prepared_text: summary.preparedText,
+                prepared_text: preparedText,
                 coverage: summary.coverage,
             });
             toolResults.push({
                 role: "tool",
                 tool_call_id: tc.id,
                 content: JSON.stringify({
-                    prepared_summary: summary.preparedText,
+                    prepared_summary: preparedText,
                     coverage: summary.coverage,
                     instruction:
                         "Return prepared_summary verbatim. Do not replace, shorten, or renumber its citations.",
@@ -3243,7 +3669,7 @@ export async function runToolCalls(
                 "purple",
                 "gray",
             ]);
-            const content = await collectProjectAnnotations({
+            const rawContent = await collectProjectAnnotations({
                 userId,
                 db,
                 docIndex: docIndex ?? {},
@@ -3285,6 +3711,34 @@ export async function runToolCalls(
                 cursor:
                     typeof args.cursor === "number" ? args.cursor : undefined,
             });
+            const content = passageRegistry
+                ? (annotateIndexedEvidencePayload(
+                      rawContent,
+                      passageRegistry,
+                      docIndex,
+                  ) as Record<string, unknown>)
+                : rawContent;
+            const items = Array.isArray(content.items)
+                ? (content.items as Array<Record<string, unknown>>)
+                : [];
+            annotationReads.push({
+                returned: items.length,
+                total:
+                    typeof content.total === "number"
+                        ? content.total
+                        : items.length,
+                filenames: [
+                    ...new Set(
+                        items
+                            .map((item) => item.filename)
+                            .filter(
+                                (filename): filename is string =>
+                                    typeof filename === "string" &&
+                                    filename.length > 0,
+                            ),
+                    ),
+                ],
+            });
             toolResults.push({
                 role: "tool",
                 tool_call_id: tc.id,
@@ -3301,7 +3755,7 @@ export async function runToolCalls(
                 "purple",
                 "gray",
             ]);
-            const content = await fetchUserPdfAnnotations({
+            const rawContent = await fetchUserPdfAnnotations({
                 userId,
                 db,
                 docIndex: docIndex ?? {},
@@ -3350,6 +3804,13 @@ export async function runToolCalls(
                         : undefined,
                 limit: typeof args.limit === "number" ? args.limit : undefined,
             });
+            const content = passageRegistry
+                ? annotatePdfAnnotationPayload(
+                      rawContent,
+                      passageRegistry,
+                      docIndex,
+                  )
+                : rawContent;
             const annotations = Array.isArray(content.annotations)
                 ? (content.annotations as Array<Record<string, unknown>>)
                 : [];
@@ -3380,7 +3841,7 @@ export async function runToolCalls(
                 content: JSON.stringify(content),
             });
         } else if (tc.function.name === "read_annotation_context") {
-            const content = await readAnnotationContexts({
+            const rawContent = await readAnnotationContexts({
                 userId,
                 db,
                 docIndex: docIndex ?? {},
@@ -3392,6 +3853,13 @@ export async function runToolCalls(
                 radius:
                     typeof args.radius === "number" ? args.radius : undefined,
             });
+            const content = passageRegistry
+                ? annotateIndexedEvidencePayload(
+                      rawContent,
+                      passageRegistry,
+                      docIndex,
+                  )
+                : rawContent;
             toolResults.push({
                 role: "tool",
                 tool_call_id: tc.id,
@@ -3436,7 +3904,7 @@ export async function runToolCalls(
                 typeof args.context_chars === "number"
                     ? args.context_chars
                     : undefined;
-            const content = await findInDocumentContent({
+            let content = await findInDocumentContent({
                 docLabel: docId,
                 query,
                 maxResults,
@@ -3446,6 +3914,19 @@ export async function runToolCalls(
                 docIndex,
                 db,
             });
+            if (passageRegistry && docIndex?.[docId]) {
+                content =
+                    indexedFindResult({
+                        docId,
+                        info: docIndex[docId],
+                        query,
+                        maxResults: Math.max(
+                            1,
+                            Math.min(100, Math.floor(maxResults ?? 20)),
+                        ),
+                        registry: passageRegistry,
+                    }) ?? content;
+            }
             const filename = docStore.get(docId)?.filename;
             if (filename) {
                 let totalMatches = 0;
@@ -3558,28 +4039,43 @@ export async function runToolCalls(
                     partySides,
                     group: groupByDocument ? "documents" : "chunks",
                 })
-            ).map((result) => ({
-                doc_id:
+            ).map((result) => {
+                const docId =
                     labelByDocumentId.get(result.document_id) ??
-                    result.document_id,
-                document_id: result.document_id,
-                version_id: result.version_id,
-                chunk_id: result.chunk_id,
-                filename: result.filename,
-                file_type: result.file_type,
-                page: result.page_number,
-                page_end: result.page_end,
-                location_hint: result.location_hint,
-                quote: result.quote,
-                chunk_index: result.chunk_index,
-                snippet: result.snippet,
-                content: result.content,
-                score: result.score,
-                rank_score: result.rank_score,
-                semantic_score: result.semantic_score,
-                match_reasons: result.match_reasons,
-                basic_match: result.basic_match,
-            }));
+                    result.document_id;
+                const source: PassageSource = {
+                    docId,
+                    documentId: result.document_id,
+                    versionId: result.version_id,
+                    chunkId: result.chunk_id,
+                    content: result.content,
+                    page: result.page_number,
+                    pageEnd: result.page_end,
+                };
+                const indexedContent = passageRegistry
+                    ? passageRegistry.annotateChunk(source)
+                    : result.content;
+                return {
+                    doc_id: docId,
+                    document_id: result.document_id,
+                    version_id: result.version_id,
+                    chunk_id: result.chunk_id,
+                    filename: result.filename,
+                    file_type: result.file_type,
+                    page: result.page_number,
+                    page_end: result.page_end,
+                    location_hint: result.location_hint,
+                    quote: indexedContent,
+                    chunk_index: result.chunk_index,
+                    snippet: result.snippet,
+                    content: indexedContent,
+                    score: result.score,
+                    rank_score: result.rank_score,
+                    semantic_score: result.semantic_score,
+                    match_reasons: result.match_reasons,
+                    basic_match: result.basic_match,
+                };
+            });
             const unindexed_documents = listProjectIndexGaps(projectId, {
                 documentIds: searchScope.documentIds,
             }).map((doc) => ({
@@ -3665,22 +4161,37 @@ export async function runToolCalls(
                           versionId,
                           chunkIndex,
                           neighbors,
-                      }).map((chunk) => ({
-                          doc_id:
+                      }).map((chunk) => {
+                          const docId =
                               labelByDocumentId.get(chunk.document_id) ??
-                              chunk.document_id,
-                          document_id: chunk.document_id,
-                          version_id: chunk.version_id,
-                          chunk_id: chunk.chunk_id,
-                          filename: chunk.filename,
-                          file_type: chunk.file_type,
-                          page: chunk.page_number,
-                          page_end: chunk.page_end,
-                          location_hint: chunk.location_hint,
-                          quote: chunk.quote,
-                          chunk_index: chunk.chunk_index,
-                          content: chunk.content,
-                      }))
+                              chunk.document_id;
+                          const source: PassageSource = {
+                              docId,
+                              documentId: chunk.document_id,
+                              versionId: chunk.version_id,
+                              chunkId: chunk.chunk_id,
+                              content: chunk.content,
+                              page: chunk.page_number,
+                              pageEnd: chunk.page_end,
+                          };
+                          const indexedContent = passageRegistry
+                              ? passageRegistry.annotateChunk(source)
+                              : chunk.content;
+                          return {
+                              doc_id: docId,
+                              document_id: chunk.document_id,
+                              version_id: chunk.version_id,
+                              chunk_id: chunk.chunk_id,
+                              filename: chunk.filename,
+                              file_type: chunk.file_type,
+                              page: chunk.page_number,
+                              page_end: chunk.page_end,
+                              location_hint: chunk.location_hint,
+                              quote: indexedContent,
+                              chunk_index: chunk.chunk_index,
+                              content: indexedContent,
+                          };
+                      })
                     : [];
             toolResults.push({
                 role: "tool",
@@ -4407,7 +4918,7 @@ type CitationForDisplay = {
     filename?: string;
 };
 
-function parseCitations(text: string): ParsedCitation[] {
+export function parseCitations(text: string): ParsedCitation[] {
     const match = text.match(CITATIONS_BLOCK_RE);
     if (!match) return [];
     try {
@@ -4421,13 +4932,74 @@ function parseCitations(text: string): ParsedCitation[] {
     }
 }
 
+export function recoverLeakedPassageHandleCitations(
+    text: string,
+    passageRegistry: PassageRegistry,
+    docIndex: DocIndex,
+): { text: string; recovered: number } {
+    const parsed = parseCitations(text);
+    const unusedRefsByPassage = new Map<string, number[]>();
+    for (const citation of parsed) {
+        if ("passage" in citation) {
+            unusedRefsByPassage.set(citation.passage, [
+                ...(unusedRefsByPassage.get(citation.passage) ?? []),
+                citation.ref,
+            ]);
+        }
+    }
+    let nextRef =
+        Math.max(0, ...markerRefs(text), ...parsed.map(({ ref }) => ref)) + 1;
+    const additions: HandleCitation[] = [];
+    let recovered = 0;
+    const body = stripCitationBlock(text).replace(
+        /\[([^\]\n]*\bp[1-9]\d*(?:-p[1-9]\d*)?[^\]\n]*)\]/g,
+        (whole, inside: string) => {
+            const passages = [
+                ...inside.matchAll(/\bp[1-9]\d*(?:-p[1-9]\d*)?\b/g),
+            ].map((match) => match[0]);
+            const valid = passages.filter((passage) => {
+                const resolved = passageRegistry.resolve(passage);
+                if (!resolved.ok) return false;
+                const filename =
+                    docIndex[resolved.citation.docId]?.filename ?? "";
+                return (
+                    inside.includes(resolved.citation.docId) ||
+                    (filename.length > 0 && inside.includes(filename))
+                );
+            });
+            if (valid.length === 0) return whole;
+            const refs = valid.map((passage) => {
+                const existing = unusedRefsByPassage.get(passage)?.shift();
+                if (existing !== undefined) return existing;
+                const ref = nextRef;
+                nextRef += 1;
+                additions.push({ ref, passage });
+                return ref;
+            });
+            recovered += refs.length;
+            return `[${refs.join(", ")}]`;
+        },
+    );
+    if (recovered === 0) return { text, recovered: 0 };
+    return {
+        text: `${body.trimEnd()}\n\n<CITATIONS>\n${JSON.stringify(
+            [...parsed, ...additions],
+            null,
+            2,
+        )}\n</CITATIONS>`,
+        recovered,
+    };
+}
+
 type CitationValidationError = {
     code:
         | "duplicate_ref"
         | "orphan_citation"
         | "unknown_document"
         | "quote_not_found"
-        | "invalid_chunk_span";
+        | "invalid_chunk_span"
+        | "unknown_passage"
+        | "invalid_passage_range";
     ref?: number;
 };
 
@@ -4453,7 +5025,8 @@ export function validateCitationContract(
     text: string,
     citations: ParsedCitation[],
     docIndex: DocIndex,
-): { citations: ParsedCitation[]; errors: CitationValidationError[] } {
+    passageRegistry?: PassageRegistry,
+): { citations: LegacyCitation[]; errors: CitationValidationError[] } {
     const errors: CitationValidationError[] = [];
     const markerRefSet = new Set(markerRefs(text));
     const refCounts = new Map<number, number>();
@@ -4461,7 +5034,7 @@ export function validateCitationContract(
         refCounts.set(citation.ref, (refCounts.get(citation.ref) ?? 0) + 1);
     }
 
-    const kept: ParsedCitation[] = [];
+    const kept: LegacyCitation[] = [];
     const reportedDuplicate = new Set<number>();
     for (const citation of citations) {
         if ((refCounts.get(citation.ref) ?? 0) > 1) {
@@ -4471,12 +5044,37 @@ export function validateCitationContract(
             }
             continue;
         }
-        if (!resolveDoc(citation.doc_id, docIndex)) {
-            errors.push({ code: "unknown_document", ref: citation.ref });
-            continue;
-        }
         if (!markerRefSet.has(citation.ref)) {
             errors.push({ code: "orphan_citation", ref: citation.ref });
+            continue;
+        }
+        if ("passage" in citation) {
+            const resolved = passageRegistry?.resolve(citation.passage);
+            if (!resolved?.ok) {
+                errors.push({
+                    code: resolved?.code ?? "unknown_passage",
+                    ref: citation.ref,
+                });
+                continue;
+            }
+            if (!resolveDoc(resolved.citation.docId, docIndex)) {
+                errors.push({ code: "unknown_document", ref: citation.ref });
+                continue;
+            }
+            kept.push({
+                ref: citation.ref,
+                doc_id: resolved.citation.docId,
+                page: resolved.citation.page,
+                quote: resolved.citation.quote,
+                chunk_id: resolved.citation.chunkId,
+                quote_start: resolved.citation.quoteStart,
+                quote_end: resolved.citation.quoteEnd,
+                protocol: "handle",
+            });
+            continue;
+        }
+        if (!resolveDoc(citation.doc_id, docIndex)) {
+            errors.push({ code: "unknown_document", ref: citation.ref });
             continue;
         }
         kept.push(citation);
@@ -4539,7 +5137,7 @@ type CitationEvidenceMatch = CitationEvidenceRow & {
 };
 
 function mergedCitationEvidenceMatch(
-    citation: ParsedCitation,
+    citation: LegacyCitation,
     rows: CitationEvidenceRow[],
     expectedQuote: string,
 ): CitationEvidenceMatch | undefined {
@@ -4629,14 +5227,18 @@ function mergedCitationEvidenceMatch(
  * is derived from the matching source chunk rather than trusted from a model.
  */
 export function validateCitationEvidence(
-    citations: ParsedCitation[],
+    citations: LegacyCitation[],
     docIndex: DocIndex,
-): { citations: ParsedCitation[]; errors: CitationValidationError[] } {
-    const verified: ParsedCitation[] = [];
+): { citations: LegacyCitation[]; errors: CitationValidationError[] } {
+    const verified: LegacyCitation[] = [];
     const errors: CitationValidationError[] = [];
     const rowsByDocument = new Map<string, CitationEvidenceRow[]>();
 
     for (const citation of citations) {
+        if (citation.protocol === "handle") {
+            verified.push(citation);
+            continue;
+        }
         const doc = resolveDoc(citation.doc_id, docIndex);
         if (!doc) {
             errors.push({ code: "unknown_document", ref: citation.ref });
@@ -4757,10 +5359,6 @@ function stripLeakedModelReasoning(text: string): string {
         .trimStart();
 }
 
-function escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 export function sanitizeAssistantVisibleText(
     text: string,
     citations: CitationForDisplay[],
@@ -4792,21 +5390,27 @@ export function sanitizeAssistantVisibleText(
         );
     }
 
-    return cleaned
-        // Local models occasionally emit simple LaTeX wrappers in ordinary
-        // prose. They are not useful math and render literally in chat.
-        .replace(/\$\s*\\text\{([^{}]*)\}\s*\$/g, "$1")
-        .replace(/\$\s*\\dots\s*\$/g, "…")
-        // Some models place a citation marker after repeated punctuation. Keep
-        // the marker, but reduce the punctuation run to its final character:
-        // "$160,, [2]" -> "$160, [2]", "Robocall,. [2]" -> "Robocall. [2]".
-        .replace(/[,.;:!?—-](?:\s*[,.;:!?—-])+(?=\s*\[\d)/g, (run) =>
-            run.match(/[,.;:!?—-](?=\s*\[\d)/)?.[0] ?? run.at(-1) ?? run,
-        )
-        .replace(/[ \t]{2,}/g, " ")
-        .replace(/[ \t]+\n/g, "\n")
-        .replace(/\n{3,}/g, "\n\n")
-        .trimEnd();
+    return (
+        cleaned
+            // Local models occasionally emit simple LaTeX wrappers in ordinary
+            // prose. They are not useful math and render literally in chat.
+            .replace(/\$\s*\\text\{([^{}]*)\}\s*\$/g, "$1")
+            .replace(/\$\s*\\dots\s*\$/g, "…")
+            // Some models place a citation marker after repeated punctuation. Keep
+            // the marker, but reduce the punctuation run to its final character:
+            // "$160,, [2]" -> "$160, [2]", "Robocall,. [2]" -> "Robocall. [2]".
+            .replace(
+                /[,.;:!?—-](?:\s*[,.;:!?—-])+(?=\s*\[\d)/g,
+                (run) =>
+                    run.match(/[,.;:!?—-](?=\s*\[\d)/)?.[0] ??
+                    run.at(-1) ??
+                    run,
+            )
+            .replace(/[ \t]{2,}/g, " ")
+            .replace(/[ \t]+\n/g, "\n")
+            .replace(/\n{3,}/g, "\n\n")
+            .trimEnd()
+    );
 }
 
 /**
@@ -4863,13 +5467,12 @@ export function renumberCitations<T extends { ref: number }>(
 export function citationMarkerRefs(text: string): number[] {
     return [
         ...new Set(
-            Array.from(
-                text.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g),
-            ).flatMap((match) =>
-                match[1]
-                    .split(",")
-                    .map((raw) => Number.parseInt(raw.trim(), 10))
-                    .filter((ref) => Number.isFinite(ref)),
+            Array.from(text.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g)).flatMap(
+                (match) =>
+                    match[1]
+                        .split(",")
+                        .map((raw) => Number.parseInt(raw.trim(), 10))
+                        .filter((ref) => Number.isFinite(ref)),
             ),
         ),
     ];
@@ -4882,6 +5485,248 @@ export function countOrphanCitationMarkers(
     const verifiedRefs = new Set(citations.map((citation) => citation.ref));
     return citationMarkerRefs(text).filter((ref) => !verifiedRefs.has(ref))
         .length;
+}
+
+function resolvedPassageEvidenceKey(
+    citation: Pick<
+        ResolvedPassageCitation,
+        "docId" | "chunkId" | "quoteStart" | "quoteEnd"
+    >,
+): string {
+    return JSON.stringify([
+        citation.docId,
+        citation.chunkId,
+        citation.quoteStart,
+        citation.quoteEnd,
+    ]);
+}
+
+function legacyCitationEvidenceKey(citation: LegacyCitation): string | null {
+    if (
+        citation.chunk_id === undefined ||
+        citation.quote_start === undefined ||
+        citation.quote_end === undefined
+    ) {
+        return null;
+    }
+    return JSON.stringify([
+        citation.doc_id,
+        citation.chunk_id,
+        citation.quote_start,
+        citation.quote_end,
+    ]);
+}
+
+export function convertLeakedPassageHandleTokens(
+    visibleText: string,
+    citations: readonly LegacyCitation[],
+    passageRegistry: PassageRegistry,
+): {
+    text: string;
+    citations: LegacyCitation[];
+    converted: number;
+    dropped: number;
+} {
+    const refByEvidence = new Map<string, number>();
+    for (const citation of citations) {
+        const key = legacyCitationEvidenceKey(citation);
+        if (key !== null && !refByEvidence.has(key)) {
+            refByEvidence.set(key, citation.ref);
+        }
+    }
+
+    let nextRef =
+        Math.max(
+            0,
+            ...citationMarkerRefs(visibleText),
+            ...citations.map((citation) => citation.ref),
+        ) + 1;
+    const nextCitations = [...citations];
+    const refByPassage = new Map<string, number>();
+    let text = stripCitationBlock(visibleText);
+    let converted = 0;
+    let dropped = 0;
+    const leakedHandleTokenRe = /[ \t]*\[(p\d[^\]\n]*)\]/i;
+
+    for (;;) {
+        const match = leakedHandleTokenRe.exec(text);
+        if (match?.index === undefined) break;
+        const before = text.slice(0, match.index);
+        const after = text.slice(match.index + match[0].length);
+        const withoutToken = before + after;
+        const refs: number[] = [];
+        for (const passage of match[1].split(",").map((item) => item.trim())) {
+            const resolved = passageRegistry.resolve(passage);
+            if (!resolved.ok) {
+                dropped += 1;
+                continue;
+            }
+
+            const evidenceKey = resolvedPassageEvidenceKey(resolved.citation);
+            let ref =
+                refByEvidence.get(evidenceKey) ?? refByPassage.get(passage);
+            if (ref === undefined) {
+                ref = nextRef;
+                nextRef += 1;
+                refByEvidence.set(evidenceKey, ref);
+                refByPassage.set(passage, ref);
+                nextCitations.push({
+                    ref,
+                    doc_id: resolved.citation.docId,
+                    page: resolved.citation.page,
+                    quote: resolved.citation.quote,
+                    chunk_id: resolved.citation.chunkId,
+                    quote_start: resolved.citation.quoteStart,
+                    quote_end: resolved.citation.quoteEnd,
+                    protocol: "handle",
+                });
+            }
+            refs.push(ref);
+            converted += 1;
+        }
+
+        text =
+            refs.length > 0
+                ? insertCitationMarker(withoutToken, match.index, refs)
+                : withoutToken;
+    }
+
+    return { text, citations: nextCitations, converted, dropped };
+}
+
+export function assignCitationSupportByOccurrence<
+    T extends {
+        ref: number;
+        quote?: unknown;
+        support?: "verified" | "unconfirmed";
+    },
+>(
+    visibleText: string,
+    citations: T[],
+): {
+    text: string;
+    citations: Array<T & { support?: "verified" | "unconfirmed" }>;
+    citationsVerified: number;
+    citationsUnconfirmed: number;
+} {
+    type Occurrence = {
+        ordinal: number;
+        support: "verified" | "unconfirmed";
+    };
+    const citationByRef = new Map(
+        citations.map((citation) => [citation.ref, citation]),
+    );
+    const occurrencesByRef = new Map<number, Occurrence[]>();
+    for (const marker of visibleText.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g)) {
+        if (marker.index === undefined) continue;
+        for (const raw of marker[1].split(",")) {
+            const ref = Number.parseInt(raw.trim(), 10);
+            const citation = citationByRef.get(ref);
+            if (!citation) continue;
+            const occurrences = occurrencesByRef.get(ref) ?? [];
+            const context = visibleText
+                .slice(Math.max(0, marker.index - 200), marker.index)
+                .replace(/\[(?:\d+(?:,\s*\d+)*)\]/g, " ");
+            const lexicalSupport =
+                typeof citation.quote === "string"
+                    ? citationLexicalSupport(context, citation.quote)
+                    : null;
+            const support =
+                lexicalSupport?.nearVerbatim ||
+                ((lexicalSupport?.sharedWords ?? 0) >= 2 &&
+                    (lexicalSupport?.score ?? 0) >= 0.3)
+                    ? "verified"
+                    : "unconfirmed";
+            occurrences.push({
+                ordinal: occurrences.length,
+                support,
+            });
+            occurrencesByRef.set(ref, occurrences);
+        }
+    }
+
+    const allOccurrences = [...occurrencesByRef.values()].flat();
+    const citationsVerified = allOccurrences.filter(
+        (occurrence) => occurrence.support === "verified",
+    ).length;
+    const citationsUnconfirmed = allOccurrences.filter(
+        (occurrence) => occurrence.support === "unconfirmed",
+    ).length;
+    let nextRef =
+        Math.max(
+            0,
+            ...citationMarkerRefs(visibleText),
+            ...citations.map((citation) => citation.ref),
+        ) + 1;
+    const seenByRef = new Map<number, number>();
+    const nextCitations = citations
+        .filter((citation) => !occurrencesByRef.has(citation.ref))
+        .map((citation) => ({ ...citation }));
+    const text = visibleText.replace(
+        /\[(\d+(?:,\s*\d+)*)\]/g,
+        (_whole, group: string) => {
+            const refs = group.split(",").map((raw) => {
+                const ref = Number.parseInt(raw.trim(), 10);
+                const occurrences = occurrencesByRef.get(ref);
+                const citation = citationByRef.get(ref);
+                if (!occurrences || !citation) return ref;
+                const ordinal = seenByRef.get(ref) ?? 0;
+                seenByRef.set(ref, ordinal + 1);
+                const occurrence = occurrences[ordinal];
+                if (!occurrence) return ref;
+                const occurrenceRef = ordinal === 0 ? ref : nextRef++;
+                nextCitations.push({
+                    ...citation,
+                    ref: occurrenceRef,
+                    support: occurrence.support,
+                });
+                return occurrenceRef;
+            });
+            return `[${refs.join(", ")}]`;
+        },
+    );
+    return {
+        text,
+        citations: nextCitations.sort((a, b) => a.ref - b.ref),
+        citationsVerified,
+        citationsUnconfirmed,
+    };
+}
+
+export function countDistinctCitationSources(
+    citations: readonly {
+        ref: number;
+        doc_id?: unknown;
+        document_id?: unknown;
+        chunk_id?: unknown;
+        quote_start?: unknown;
+        quote_end?: unknown;
+        support?: unknown;
+    }[],
+): number {
+    const distinct = new Set<string>();
+    citations.forEach((citation, index) => {
+        if (citation.support === "unconfirmed") return;
+        const documentId = citation.document_id ?? citation.doc_id;
+        const completeSource =
+            typeof documentId === "string" &&
+            typeof citation.chunk_id === "string" &&
+            typeof citation.quote_start === "number" &&
+            Number.isFinite(citation.quote_start) &&
+            typeof citation.quote_end === "number" &&
+            Number.isFinite(citation.quote_end);
+        distinct.add(
+            completeSource
+                ? JSON.stringify([
+                      documentId,
+                      citation.chunk_id,
+                      citation.quote_start,
+                      citation.quote_end,
+                  ])
+                : JSON.stringify(["entry", index, citation.ref]),
+        );
+    });
+    return distinct.size;
 }
 
 export function dedupeCitationEvidence<
@@ -5013,11 +5858,30 @@ type AssistantEvent =
           mappings_proposed: number;
           mappings_accepted: number;
           mappings_ambiguous: number;
+          mappings_rejected: number;
+          mappings_unsafe_anchor: number;
+          mappings_unsupported: number;
+          mappings_duplicate_evidence: number;
           mapper_unavailable: boolean;
+          repair_rounds: readonly {
+              round: number;
+              calls: number;
+              menu_candidates: number;
+              mappings_proposed: number;
+              mappings_accepted: number;
+              mappings_rejected: number;
+          }[];
+          citations_verified: number;
+          citations_unconfirmed: number;
+          handle_citations: number;
+          legacy_quote_citations: number;
+          leaked_handles_converted: number;
+          leaked_handles_dropped: number;
       }
     | {
           type: "citation_summary";
           verified_count: number;
+          verified_distinct_sources: number;
           used_document_tools: boolean;
       }
     | { type: "content"; text: string };
@@ -5140,6 +6004,14 @@ export async function runLLMStream(params: {
             input: unknown;
         }[];
     }) => void | Promise<void>;
+    onToolResults?: (batch: {
+        iteration: number;
+        results: readonly {
+            id: string;
+            name: string;
+            content: string;
+        }[];
+    }) => void | Promise<void>;
 }): Promise<{
     fullText: string;
     events: AssistantEvent[];
@@ -5196,6 +6068,11 @@ export async function runLLMStream(params: {
     // across batches to let subsequent edit_document calls overwrite the
     // turn's existing version instead of creating a new one.
     const turnEditState: TurnEditState = new Map();
+    const passageRegistry = citationHandlesEnabled(
+        process.env.DOCKET_CITATION_HANDLES,
+    )
+        ? new PassageRegistry()
+        : undefined;
     let fullText = "";
     let iterText = "";
     let iterVisibleText = "";
@@ -5311,6 +6188,7 @@ export async function runLLMStream(params: {
                 scopedDocumentIds,
                 documentResultMaxChars,
                 { model: selectedModel, apiKeys, signal: params.signal },
+                passageRegistry,
             ),
         );
         const summary = summaryRun.documentSummaries.at(-1);
@@ -5477,6 +6355,7 @@ export async function runLLMStream(params: {
                             apiKeys,
                             signal: params.signal,
                         },
+                        passageRegistry,
                     );
                     if (documentSummaries.length > 0) {
                         preparedDocumentSummary =
@@ -5575,7 +6454,9 @@ export async function runLLMStream(params: {
                             resultByCallId.set(callId, content);
                         }
                     }
-                    const callById = new Map(calls.map((call) => [call.id, call]));
+                    const callById = new Map(
+                        calls.map((call) => [call.id, call]),
+                    );
                     for (const toolCall of freshToolCalls) {
                         const call = callById.get(toolCall.id);
                         if (!call) continue;
@@ -5596,7 +6477,7 @@ export async function runLLMStream(params: {
                             });
                         }
                     }
-                    return toolCalls.map((c) => ({
+                    const deliveredResults = toolCalls.map((c) => ({
                         tool_use_id: c.id,
                         content:
                             resultByCallId.get(c.id) ??
@@ -5604,6 +6485,29 @@ export async function runLLMStream(params: {
                                 error: `Tool '${c.function.name}' is not available.`,
                             }),
                     }));
+                    try {
+                        await params.onToolResults?.({
+                            iteration: toolIteration,
+                            results: deliveredResults.map((result) => ({
+                                id: result.tool_use_id,
+                                name:
+                                    callById.get(result.tool_use_id)?.name ??
+                                    "unknown",
+                                content: result.content,
+                            })),
+                        });
+                    } catch (error) {
+                        console.warn(
+                            "[runLLMStream/tool-result-audit] hook failed",
+                            {
+                                error:
+                                    error instanceof Error
+                                        ? error.message
+                                        : String(error),
+                            },
+                        );
+                    }
+                    return deliveredResults;
                 },
             }),
         );
@@ -5690,14 +6594,23 @@ export async function runLLMStream(params: {
         flushText();
     }
 
-    const answerText = stripLeakedModelReasoning(
+    const rawAnswerText = stripLeakedModelReasoning(
         preparedDocumentSummary ?? fullText,
     );
+    const qualifiedLeakedHandleRecovery = passageRegistry
+        ? recoverLeakedPassageHandleCitations(
+              rawAnswerText,
+              passageRegistry,
+              docIndex,
+          )
+        : { text: rawAnswerText, recovered: 0 };
+    const answerText = qualifiedLeakedHandleRecovery.text;
     const parsedCitations = parseCitations(answerText);
     const contract = validateCitationContract(
         answerText,
         parsedCitations,
         docIndex,
+        passageRegistry,
     );
     const evidence = validateCitationEvidence(contract.citations, docIndex);
     const citationErrorGroups: CitationValidationError[][] = [
@@ -5706,12 +6619,27 @@ export async function runLLMStream(params: {
     ];
     let citationText = answerText;
     let verifiedCitations = evidence.citations;
-    let recoveredCitationCount = 0;
+    let recoveredCitationCount = qualifiedLeakedHandleRecovery.recovered;
+    let leakedHandlesConverted = 0;
+    let leakedHandlesDropped = 0;
     let repairAddedCitationCount = 0;
+    let citationsVerified = 0;
+    let citationsUnconfirmed = 0;
     let citationMappingDiagnosticCounts: CitationMappingDiagnosticCounts =
         citationMappingDiagnostics();
     let orphanMarkerCount = 0;
     if (!buildCitations) {
+        if (passageRegistry) {
+            const converted = convertLeakedPassageHandleTokens(
+                citationText,
+                verifiedCitations,
+                passageRegistry,
+            );
+            citationText = converted.text;
+            verifiedCitations = converted.citations;
+            leakedHandlesConverted = converted.converted;
+            leakedHandlesDropped = converted.dropped;
+        }
         const supportsLocalRecovery =
             selectedModel.startsWith("ollama:") ||
             selectedModel.startsWith("ollama/") ||
@@ -5719,9 +6647,9 @@ export async function runLLMStream(params: {
             selectedModel.startsWith("free-router/");
         if (supportsLocalRecovery) {
             const recovered = recoverNamedQuotedCitations(
-                answerText,
+                citationText,
                 docIndex,
-                parsedCitations,
+                parsedCitations.filter(isLegacyCitation),
             );
             const recoveredEvidence = validateCitationEvidence(
                 recovered.recoveredCitations,
@@ -5734,7 +6662,7 @@ export async function runLLMStream(params: {
                     ...verifiedCitations,
                     ...recoveredEvidence.citations,
                 ];
-                recoveredCitationCount = recoveredEvidence.citations.length;
+                recoveredCitationCount += recoveredEvidence.citations.length;
             }
         }
 
@@ -5745,9 +6673,9 @@ export async function runLLMStream(params: {
                 .filter((ref): ref is number => ref !== undefined),
         );
         const orphanCitationEvidence = validateCitationEvidence(
-            parsedCitations.filter((citation) =>
-                orphanCitationRefs.has(citation.ref),
-            ),
+            parsedCitations
+                .filter(isLegacyCitation)
+                .filter((citation) => orphanCitationRefs.has(citation.ref)),
             docIndex,
         );
         citationErrorGroups.push(orphanCitationEvidence.errors);
@@ -5761,10 +6689,9 @@ export async function runLLMStream(params: {
                 ]),
             ),
             Object.fromEntries(
-                parsedCitations.map((citation) => [
-                    citation.ref,
-                    citation.page,
-                ]),
+                parsedCitations
+                    .filter(isLegacyCitation)
+                    .map((citation) => [citation.ref, citation.page]),
             ),
         );
         if (deterministicReattachment.text) {
@@ -5787,6 +6714,7 @@ export async function runLLMStream(params: {
             citationText,
             parsedCitations,
             docIndex,
+            passageRegistry,
         );
         const remainingEvidence = validateCitationEvidence(
             remainingContract.citations,
@@ -5823,45 +6751,131 @@ export async function runLLMStream(params: {
         ) {
             citationRepairAttempted = true;
             try {
-                const request = buildCitationRepairRequest({
-                    answerText: citationText,
-                    evidence: citationRepairEvidence,
-                });
+                const rawCandidatePool = passageRegistry
+                    ? passageRegistry
+                          .repairCandidates()
+                          .slice(0, CITATION_REPAIR_MAX_POOL_CANDIDATES)
+                    : buildQuoteCandidatePool(citationRepairEvidence);
+                const candidatePool = passageRegistry
+                    ? rawCandidatePool
+                    : rawCandidatePool.filter((candidate) => {
+                          const verified = validateCitationEvidence(
+                              [
+                                  {
+                                      ref: candidate.index,
+                                      doc_id: candidate.doc_id,
+                                      page: candidate.page,
+                                      quote: candidate.quote,
+                                      chunk_id: candidate.chunk_id,
+                                  },
+                              ],
+                              docIndex,
+                          );
+                          return verified.citations.length > 0;
+                      });
                 citationMappingDiagnosticCounts = citationMappingDiagnostics({
-                    menuCandidates: request.candidates.length,
+                    menuCandidates: candidatePool.length,
                 });
-                if (request.candidates.length > 0) {
-                    const repairResponse = await completeText({
-                        model: selectedRepairModel,
-                        systemPrompt: request.systemPrompt,
-                        user: request.userPrompt,
-                        maxTokens: 4_096,
-                        think: false,
-                        signal: params.signal,
-                        apiKeys,
-                    });
-                    const repairPlan = parseCitationRepairResponse(
-                        repairResponse,
-                        request.candidates,
-                    );
-                    const repairResult = repairPlan
-                        ? applyCitationRepairPlan(
+                const batchingEnabled = !/^(0|false|no|off)$/i.test(
+                    process.env.DOCKET_CITATION_REPAIR_BATCHING?.trim() ?? "",
+                );
+                const filenameByDocId = Object.fromEntries(
+                    Object.entries(docIndex).map(([docId, info]) => [
+                        docId,
+                        info.filename,
+                    ]),
+                );
+                let repairCalls = 0;
+                let mappingsProposed = 0;
+                let mappingsAccepted = 0;
+                let mappingsAmbiguous = 0;
+                let mappingsUnsafeAnchor = 0;
+                let mappingsUnsupported = 0;
+                let mappingsDuplicateEvidence = 0;
+                const repairRounds: Array<{
+                    round: number;
+                    calls: number;
+                    menu_candidates: number;
+                    mappings_proposed: number;
+                    mappings_accepted: number;
+                    mappings_rejected: number;
+                }> = [];
+                for (
+                    let round = 1;
+                    round <= CITATION_REPAIR_MAX_ROUNDS &&
+                    repairCalls < CITATION_REPAIR_MAX_CALLS;
+                    round += 1
+                ) {
+                    const batches = batchingEnabled
+                        ? buildCitationRepairBatches(
                               citationText,
-                              repairPlan,
-                              request.candidates,
+                              candidatePool,
+                              filenameByDocId,
+                              new Set(
+                                  verifiedCitations.map(
+                                      (citation) => citation.ref,
+                                  ),
+                              ),
                           )
-                        : null;
-                    if (repairResult) {
-                        citationMappingDiagnosticCounts =
-                            citationMappingDiagnostics(
-                                repairResult.diagnostics,
-                            );
-                    }
-                    if (repairResult?.text) {
+                        : [
+                              {
+                                  answerText: citationText,
+                                  candidates: candidatePool,
+                              },
+                          ];
+                    let roundCalls = 0;
+                    let roundMenuCandidates = 0;
+                    let roundProposed = 0;
+                    let roundAccepted = 0;
+                    for (const batch of batches) {
+                        if (repairCalls >= CITATION_REPAIR_MAX_CALLS) break;
+                        const request = buildCitationRepairRequest({
+                            answerText: batch.answerText,
+                            evidence: [],
+                            candidates: batch.candidates,
+                        });
+                        if (request.candidates.length === 0) continue;
+                        repairCalls += 1;
+                        roundCalls += 1;
+                        roundMenuCandidates += request.candidates.length;
+                        const repairResponse = await completeText({
+                            model: selectedRepairModel,
+                            systemPrompt: request.systemPrompt,
+                            user: request.userPrompt,
+                            maxTokens: 4_096,
+                            think: false,
+                            signal: params.signal,
+                            apiKeys,
+                        });
+                        const repairPlan = parseCitationRepairResponse(
+                            repairResponse,
+                            request.candidates,
+                        );
+                        if (!repairPlan) continue;
+                        const repairResult = applyCitationRepairPlan(
+                            citationText,
+                            repairPlan,
+                            request.candidates,
+                            { existingCitations: verifiedCitations },
+                        );
+                        mappingsProposed +=
+                            repairResult.diagnostics.mappingsProposed;
+                        roundProposed +=
+                            repairResult.diagnostics.mappingsProposed;
+                        mappingsAmbiguous +=
+                            repairResult.diagnostics.mappingsAmbiguous;
+                        mappingsUnsafeAnchor +=
+                            repairResult.diagnostics.mappingsUnsafeAnchor;
+                        mappingsUnsupported +=
+                            repairResult.diagnostics.mappingsUnsupported;
+                        mappingsDuplicateEvidence +=
+                            repairResult.diagnostics.mappingsDuplicateEvidence;
+                        if (!repairResult.text) continue;
                         const repairContract = validateCitationContract(
                             repairResult.text,
                             parseCitations(repairResult.text),
                             docIndex,
+                            passageRegistry,
                         );
                         const repairEvidence = validateCitationEvidence(
                             repairContract.citations,
@@ -5885,11 +6899,48 @@ export async function runLLMStream(params: {
                             verifiedCitations = Array.from(
                                 citationsByRef.values(),
                             );
-                            repairAddedCitationCount =
+                            mappingsAccepted += repairEvidence.citations.length;
+                            roundAccepted += repairEvidence.citations.length;
+                            repairAddedCitationCount +=
                                 repairEvidence.citations.length;
                         }
                     }
+                    repairRounds.push({
+                        round,
+                        calls: roundCalls,
+                        menu_candidates: roundMenuCandidates,
+                        mappings_proposed: roundProposed,
+                        mappings_accepted: roundAccepted,
+                        mappings_rejected: Math.max(
+                            0,
+                            roundProposed - roundAccepted,
+                        ),
+                    });
+                    if (
+                        !shouldContinueCitationRepairRounds({
+                            round,
+                            calls: repairCalls,
+                            acceptedInRound: roundAccepted,
+                            batchingEnabled,
+                        })
+                    ) {
+                        break;
+                    }
                 }
+                citationMappingDiagnosticCounts = citationMappingDiagnostics({
+                    menuCandidates: candidatePool.length,
+                    mappingsProposed,
+                    mappingsAccepted,
+                    mappingsAmbiguous,
+                    mappingsRejected: Math.max(
+                        0,
+                        mappingsProposed - mappingsAccepted,
+                    ),
+                    mappingsUnsafeAnchor,
+                    mappingsUnsupported,
+                    mappingsDuplicateEvidence,
+                    repairRounds,
+                });
             } catch (error) {
                 if (params.signal?.aborted) throw error;
                 if (
@@ -5909,6 +6960,16 @@ export async function runLLMStream(params: {
                                 citationMappingDiagnosticCounts.mappings_accepted,
                             mappingsAmbiguous:
                                 citationMappingDiagnosticCounts.mappings_ambiguous,
+                            mappingsRejected:
+                                citationMappingDiagnosticCounts.mappings_rejected,
+                            mappingsUnsafeAnchor:
+                                citationMappingDiagnosticCounts.mappings_unsafe_anchor,
+                            mappingsUnsupported:
+                                citationMappingDiagnosticCounts.mappings_unsupported,
+                            mappingsDuplicateEvidence:
+                                citationMappingDiagnosticCounts.mappings_duplicate_evidence,
+                            repairRounds:
+                                citationMappingDiagnosticCounts.repair_rounds,
                             mapperUnavailable: true,
                         });
                 } else {
@@ -5923,10 +6984,18 @@ export async function runLLMStream(params: {
         }
     }
     const discardedCitations = countCitationDiscards(citationErrorGroups);
+    const handleCitationCount = verifiedCitations.filter(
+        (citation) => citation.protocol === "handle",
+    ).length;
+    const legacyQuoteCitationCount = verifiedCitations.filter(
+        (citation) => citation.protocol !== "handle",
+    ).length;
     if (hasCitationDiscards(discardedCitations)) {
         console.warn("[citations] discarded invalid citations", {
             discarded: discardedCitations,
             recovered: recoveredCitationCount,
+            leakedHandlesConverted,
+            leakedHandlesDropped,
             repairAttempted: citationRepairAttempted,
             repairAdded: repairAddedCitationCount,
             orphanMarkerCount,
@@ -5949,6 +7018,7 @@ export async function runLLMStream(params: {
                   chunk_id: c.chunk_id,
                   quote_start: c.quote_start,
                   quote_end: c.quote_end,
+                  support: c.support,
               };
           });
     const preSanitized = sanitizeAssistantVisibleText(
@@ -5970,10 +7040,23 @@ export async function runLLMStream(params: {
                 chunk_id?: unknown;
             }>,
         );
-        const renumbered = renumberCitations(deduped.text, deduped.citations);
+        const scoredCitations = assignCitationSupportByOccurrence(
+            deduped.text,
+            deduped.citations,
+        );
+        citationsVerified = scoredCitations.citationsVerified;
+        citationsUnconfirmed = scoredCitations.citationsUnconfirmed;
+        const renumbered = renumberCitations(
+            scoredCitations.text,
+            scoredCitations.citations,
+        );
         sanitizedVisibleText = renumbered.text;
         citations = renumbered.citations;
     }
+    orphanMarkerCount = countOrphanCitationMarkers(
+        sanitizedVisibleText,
+        citations as { ref: number }[],
+    );
     const currentVisibleText = events
         .filter(
             (event): event is Extract<AssistantEvent, { type: "content" }> =>
@@ -6003,6 +7086,12 @@ export async function runLLMStream(params: {
         repair_attempted: citationRepairAttempted,
         repair_added: repairAddedCitationCount,
         orphan_marker_count: orphanMarkerCount,
+        citations_verified: citationsVerified,
+        citations_unconfirmed: citationsUnconfirmed,
+        handle_citations: handleCitationCount,
+        legacy_quote_citations: legacyQuoteCitationCount,
+        leaked_handles_converted: leakedHandlesConverted,
+        leaked_handles_dropped: leakedHandlesDropped,
         ...citationMappingDiagnosticCounts,
     };
     events.push(citationDiagnostics);
@@ -6013,7 +7102,21 @@ export async function runLLMStream(params: {
         { type: "citation_summary" }
     > = {
         type: "citation_summary",
-        verified_count: citations.length,
+        verified_count: citations.filter(
+            (citation) =>
+                (citation as { support?: unknown }).support !== "unconfirmed",
+        ).length,
+        verified_distinct_sources: countDistinctCitationSources(
+            citations as Array<{
+                ref: number;
+                doc_id?: unknown;
+                document_id?: unknown;
+                chunk_id?: unknown;
+                quote_start?: unknown;
+                quote_end?: unknown;
+                support?: unknown;
+            }>,
+        ),
         used_document_tools: citationRepairToolNames.length > 0,
     };
     events.push(citationSummary);
@@ -6035,9 +7138,14 @@ export function extractAnnotations(
     events?: ({ type: string } & Record<string, unknown>[]) | unknown[],
     validatedCitations?: unknown[],
 ): unknown[] {
-    const sourceCitations = validatedCitations ?? parseCitations(fullText);
+    const sourceCitations = (
+        validatedCitations ?? parseCitations(fullText)
+    ).filter((raw) => {
+        const citation = raw as ParsedCitation;
+        return isLegacyCitation(citation);
+    });
     const out: unknown[] = sourceCitations.map((raw) => {
-        const c = raw as ParsedCitation;
+        const c = raw as LegacyCitation;
         const docInfo = resolveDoc(c.doc_id, docIndex);
         return {
             type: "citation_data",
@@ -6054,6 +7162,7 @@ export function extractAnnotations(
                 ? { quote_start: c.quote_start }
                 : {}),
             ...(c.quote_end !== undefined ? { quote_end: c.quote_end } : {}),
+            ...(c.support !== undefined ? { support: c.support } : {}),
         };
     });
     if (Array.isArray(events)) {

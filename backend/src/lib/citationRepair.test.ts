@@ -2,14 +2,20 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   CITATION_REPAIR_MAX_CANDIDATES,
+  CITATION_REPAIR_MAX_CALLS,
+  CITATION_REPAIR_MAX_POOL_CANDIDATES,
   applyCitationRepairPlan,
   boundCitationRepairEvidence,
+  buildCitationRepairBatches,
   buildCitationRepairRequest,
   buildQuoteCandidateMenu,
+  buildQuoteCandidatePool,
   citationRepairBody,
   citationRepairEnabled,
+  insertCitationMarker,
   parseCitationRepairResponse,
   reattachOrphanCitationEntries,
+  shouldContinueCitationRepairRounds,
   shouldAttemptCitationRepair,
   type CitationRepairCitation,
   type CitationRepairPlan,
@@ -97,15 +103,21 @@ test("deterministic repair reattaches verified marker-less citation entries", ()
   );
   const pseudoCitations = Array.from(
     { length: 18 },
-    (_, index) => `| Issue ${index + 1} | Supported claim [${filename}, p. ${index + 1}] |`,
+    (_, index) =>
+      `| Issue ${index + 1} | Supported claim [${filename}, p. ${index + 1}] |`,
   ).join("\n");
   const answer = `| Issue | Analysis |\n| --- | --- |\n${pseudoCitations}\n\n<CITATIONS>\n${JSON.stringify(citations)}\n</CITATIONS>`;
 
-  const result = reattachOrphanCitationEntries(answer, citations, {
-    "doc-0": filename,
-  }, Object.fromEntries(
-    Array.from({ length: 16 }, (_, index) => [index + 1, index + 1]),
-  ));
+  const result = reattachOrphanCitationEntries(
+    answer,
+    citations,
+    {
+      "doc-0": filename,
+    },
+    Object.fromEntries(
+      Array.from({ length: 16 }, (_, index) => [index + 1, index + 1]),
+    ),
+  );
 
   assert.equal(result.citations.length, 16);
   assert.deepEqual(
@@ -122,6 +134,24 @@ test("deterministic repair reattaches verified marker-less citation entries", ()
     ).length,
     2,
   );
+});
+
+test("deterministic repair survives regex metacharacters in filenames", () => {
+  const result = reattachOrphanCitationEntries(
+    "Supported claim [synthetic(appeal)+.pdf, p. 7].",
+    [
+      {
+        ref: 3,
+        doc_id: "doc-0",
+        page: 7,
+        quote: "Supported claim",
+      },
+    ],
+    { "doc-0": "synthetic(appeal)+.pdf" },
+  );
+
+  assert.match(result.text ?? "", /Supported claim \[3\]\./);
+  assert.equal(result.citations.length, 1);
 });
 
 test("deterministic repair falls back to the sentence containing the quote", () => {
@@ -231,6 +261,37 @@ test("candidate menu deduplicates, rejects unsafe metadata, and caps with page d
   );
 });
 
+test("multi-batch candidate pool reaches beyond the former first-60 cutoff", () => {
+  const results = Array.from({ length: 90 }, (_, index) => ({
+    doc_id: `doc-${index % 3}`,
+    page: (index % 5) + 1,
+    content: `Unique registration evidence number ${index} supports voter ${index}.`,
+  }));
+  const evidence = [
+    {
+      toolName: "search_project_documents",
+      content: JSON.stringify({ results }),
+    },
+  ];
+  const menu = buildQuoteCandidateMenu(evidence);
+  const pool = buildQuoteCandidatePool(evidence);
+  assert.equal(menu.length, CITATION_REPAIR_MAX_CANDIDATES);
+  assert.equal(pool.length, 90);
+  assert.ok(pool.length <= CITATION_REPAIR_MAX_POOL_CANDIDATES);
+  const batches = buildCitationRepairBatches(
+    "Unique registration evidence number 89 supports voter 89.",
+    pool,
+  );
+  assert.equal(
+    batches.some((batch) =>
+      batch.candidates.some((candidate) =>
+        candidate.quote.includes("number 89"),
+      ),
+    ),
+    true,
+  );
+});
+
 test("candidate menu reads embedded prepared-summary citations verbatim", () => {
   const prepared = `Summary text.\n<CITATIONS>\n[{"ref":1,"doc_id":"doc-4","page":9,"quote":"Embedded exact quote contains enough source words.","chunk_id":"chunk-4"}]\n</CITATIONS>`;
   const menu = buildQuoteCandidateMenu([
@@ -302,6 +363,10 @@ test("repair request exposes only answer body and numbered menu", () => {
     request.systemPrompt,
     /never include the pseudo-citation itself/,
   );
+  assert.match(
+    request.systemPrompt,
+    /must include the closing delimiter and any immediately trailing sentence punctuation/,
+  );
   assert.match(request.userPrompt, /quote_candidate_menu/);
   assert.doesNotMatch(request.userPrompt, /"doc_id":"bad"/);
   assert.deepEqual(request.candidates, candidates);
@@ -341,9 +406,7 @@ test("mapping parser enforces schema, anchor bounds, and candidate range", () =>
   assert.deepEqual(
     parseCitationRepairResponse(
       JSON.stringify({
-        mappings: [
-          { anchor_text: longButBoundedAnchor, candidate_index: 1 },
-        ],
+        mappings: [{ anchor_text: longButBoundedAnchor, candidate_index: 1 }],
       }),
       candidates,
     ),
@@ -354,9 +417,7 @@ test("mapping parser enforces schema, anchor bounds, and candidate range", () =>
   assert.equal(
     parseCitationRepairResponse(
       JSON.stringify({
-        mappings: [
-          { anchor_text: "x".repeat(501), candidate_index: 1 },
-        ],
+        mappings: [{ anchor_text: "x".repeat(501), candidate_index: 1 }],
       }),
       candidates,
     ),
@@ -368,6 +429,39 @@ test("mapping parser enforces schema, anchor bounds, and candidate range", () =>
   );
 });
 
+test("handle repair asks for and assembles passage mappings without copied quotes", () => {
+  const answer = "The indexed deadline applies to every synthetic request.";
+  const candidates: QuoteCandidate[] = [
+    {
+      index: 1,
+      passage: "p12",
+      doc_id: "doc-0",
+      page: 6,
+      quote:
+        "The indexed deadline applies to every synthetic request submitted after notice.",
+      chunk_id: "chunk-12",
+    },
+  ];
+  const request = buildCitationRepairRequest({
+    answerText: answer,
+    evidence: [],
+    candidates,
+  });
+  assert.match(request.userPrompt, /passage_candidate_menu/);
+  assert.match(request.systemPrompt, /"passage":"p12"/);
+  assert.doesNotMatch(request.systemPrompt, /candidate_index values/);
+
+  const response = JSON.stringify({
+    mappings: [{ anchor_text: answer, passage: "p12" }],
+  });
+  const plan = parseCitationRepairResponse(response, candidates);
+  assert.ok(plan);
+  const result = applyCitationRepairPlan(answer, plan, candidates);
+  assert.match(result.text ?? "", /"ref": 1,\s+"passage": "p12"/);
+  assert.doesNotMatch(result.text ?? "", /chunk-12/);
+  assert.equal(result.citations[0]?.quote, candidates[0].quote);
+});
+
 test("server assembly inserts mapped menu citations and preserves answer text", () => {
   const answer =
     "First supported claim appears only once.\n\n| Issue | Result |\n|---|---|\n| Scope | Second supported claim appears only once. |";
@@ -376,13 +470,13 @@ test("server assembly inserts mapped menu citations and preserves answer text", 
       index: 1,
       doc_id: "doc-0",
       page: 2,
-      quote: "Exact first source text has five words",
+      quote: "First supported claim appears only once in the source.",
     },
     {
       index: 2,
       doc_id: "doc-1",
       page: "4-5",
-      quote: "Exact second source text has five words",
+      quote: "Second supported claim appears only once in the source.",
       chunk_id: "chunk-2",
     },
   ];
@@ -416,6 +510,10 @@ test("server assembly inserts mapped menu citations and preserves answer text", 
     mappingsProposed: 2,
     mappingsAccepted: 2,
     mappingsAmbiguous: 0,
+    mappingsRejected: 0,
+    mappingsUnsafeAnchor: 0,
+    mappingsUnsupported: 0,
+    mappingsDuplicateEvidence: 0,
   });
   assert.equal(
     (result.text ?? "").replace(/ \[\d+\]/g, "").split("\n\n<CITATIONS>")[0],
@@ -436,7 +534,7 @@ test("assembly skips ambiguous anchors and allocates after invalid existing refs
       index: 2,
       doc_id: "doc-1",
       page: 2,
-      quote: "Second exact source quote has enough words",
+      quote: "The unique supported claim appears exactly once.",
     },
   ];
   const result = applyCitationRepairPlan(
@@ -465,7 +563,259 @@ test("assembly skips ambiguous anchors and allocates after invalid existing refs
     mappingsProposed: 2,
     mappingsAccepted: 1,
     mappingsAmbiguous: 1,
+    mappingsRejected: 1,
+    mappingsUnsafeAnchor: 0,
+    mappingsUnsupported: 0,
+    mappingsDuplicateEvidence: 0,
   });
+});
+
+test("deterministic and mapper repair never insert inside closing quotes", () => {
+  const first = reattachOrphanCitationEntries(
+    'The record confirms no demographic tags on these phone lists". Next.',
+    [
+      {
+        ref: 15,
+        doc_id: "doc-0",
+        page: 2,
+        quote: "no demographic tags on these phone lists",
+      },
+    ],
+    {},
+  );
+  assert.match(first.text ?? "", /phone lists"\. \[15\] Next/);
+
+  const second = reattachOrphanCitationEntries(
+    'The testimony shows the call did not deter or suppress his ability to vote." Next.',
+    [
+      {
+        ref: 16,
+        doc_id: "doc-1",
+        page: 9,
+        quote: "did not deter or suppress his ability to vote",
+      },
+    ],
+    {},
+  );
+  assert.match(second.text ?? "", /ability to vote\." \[16\] Next/);
+
+  const rejected = applyCitationRepairPlan(
+    'The testimony says "the call did not deter or suppress his ability to vote."',
+    {
+      mappings: [
+        {
+          anchor_text:
+            "the call did not deter or suppress his ability to vote.",
+          candidate_index: 1,
+        },
+      ],
+    },
+    [
+      {
+        index: 1,
+        doc_id: "doc-1",
+        page: 9,
+        quote: "The call did not deter or suppress his ability to vote.",
+      },
+    ],
+  );
+  assert.equal(rejected.text, null);
+  assert.equal(rejected.diagnostics.mappingsUnsafeAnchor, 1);
+});
+
+test("citation insertion advances past an enclosing quote with nested single quotes", () => {
+  const body =
+    "| Defendant says Plaintiffs conflate \"dissuasion or deterrence from mail-in voting with 'threatening,' 'intimidating,' or 'coercing'\". |";
+  const result = insertCitationMarker(body, body.indexOf("threatening"), 16);
+
+  assert.match(
+    result,
+    /mail-in voting with 'threatening,' 'intimidating,' or 'coercing'"\. \[16\] \|$/,
+  );
+  assert.doesNotMatch(result, /'\s*\[16\]threatening/);
+});
+
+test("word-internal apostrophes do not create a false quoted span", () => {
+  const body =
+    "NCBCP's position supports the cited passage before Defendant's response.";
+  const insertionIndex = body.indexOf(" before");
+
+  assert.equal(
+    insertCitationMarker(body, insertionIndex, 17),
+    "NCBCP's position supports the cited passage [17] before Defendant's response.",
+  );
+});
+
+test("mapper rejects unsupported and already-verified evidence", () => {
+  const answer =
+    "Defendant testified that he voted and the robocall did not suppress his vote.";
+  const unsupported = applyCitationRepairPlan(
+    answer,
+    {
+      mappings: [
+        {
+          anchor_text: answer,
+          candidate_index: 1,
+        },
+      ],
+    },
+    [
+      {
+        index: 1,
+        doc_id: "doc-0",
+        page: 3,
+        quote:
+          "Plaintiff received a different message concerning registration deadlines.",
+      },
+    ],
+  );
+  assert.equal(unsupported.text, null);
+  assert.equal(unsupported.diagnostics.mappingsUnsupported, 1);
+  assert.equal(unsupported.diagnostics.mappingsRejected, 1);
+
+  const candidate: QuoteCandidate = {
+    index: 1,
+    doc_id: "doc-1",
+    page: 8,
+    quote:
+      "Defendant testified that he voted and the robocall did not suppress his vote.",
+  };
+  const duplicate = applyCitationRepairPlan(
+    answer,
+    {
+      mappings: [{ anchor_text: answer, candidate_index: 1 }],
+    },
+    [candidate],
+    {
+      existingCitations: [
+        {
+          ref: 2,
+          doc_id: candidate.doc_id,
+          page: candidate.page,
+          quote: candidate.quote,
+        },
+      ],
+    },
+  );
+  assert.equal(duplicate.text, null);
+  assert.equal(duplicate.diagnostics.mappingsDuplicateEvidence, 1);
+});
+
+test("long mapper anchors require a sentence or table-cell boundary", () => {
+  const anchor =
+    "This unusually long supported claim repeats registration robocall evidence and voter suppression details without ending at a claim boundary";
+  const answer = `${anchor} before the sentence continues.`;
+  const result = applyCitationRepairPlan(
+    answer,
+    { mappings: [{ anchor_text: anchor, candidate_index: 1 }] },
+    [
+      {
+        index: 1,
+        doc_id: "doc-0",
+        page: 1,
+        quote:
+          "Registration robocall evidence described voter suppression details.",
+      },
+    ],
+  );
+  assert.equal(result.text, null);
+  assert.equal(result.diagnostics.mappingsUnsafeAnchor, 1);
+});
+
+test("deterministic repair advances markers past emphasis and backticks", () => {
+  const emphasized = reattachOrphanCitationEntries(
+    "The record **contains exact supported language**.",
+    [
+      {
+        ref: 4,
+        doc_id: "doc-0",
+        page: 1,
+        quote: "contains exact supported language",
+      },
+    ],
+    {},
+  );
+  assert.match(emphasized.text ?? "", /\*\*\. \[4\]/);
+
+  const code = reattachOrphanCitationEntries(
+    "The command `contains exact supported language`.",
+    [
+      {
+        ref: 5,
+        doc_id: "doc-0",
+        page: 1,
+        quote: "contains exact supported language",
+      },
+    ],
+    {},
+  );
+  assert.match(code.text ?? "", /`\. \[5\]/);
+});
+
+test("repair batches are claim-sized, plausible, and bounded", () => {
+  const answer = Array.from(
+    { length: 12 },
+    (_, index) =>
+      `- Claim ${index + 1} says the registration robocall affected voter ${index + 1}.`,
+  ).join("\n");
+  const candidates: QuoteCandidate[] = Array.from(
+    { length: 70 },
+    (_, index) => ({
+      index: index + 1,
+      doc_id: `doc-${index % 2}`,
+      page: (index % 10) + 1,
+      quote: `The registration robocall affected voter ${index + 1}.`,
+    }),
+  );
+  const batches = buildCitationRepairBatches(answer, candidates);
+  assert.ok(batches.length > 1);
+  assert.ok(batches.length <= 4);
+  assert.ok(
+    batches.every(
+      (batch) => batch.candidates.length > 0 && batch.candidates.length <= 60,
+    ),
+  );
+
+  const remaining = buildCitationRepairBatches(
+    `${answer}\nAlready repaired registration claim [91].`,
+    candidates,
+    {},
+    new Set([91]),
+  );
+  assert.equal(
+    remaining.some((batch) => batch.answerText.includes("Already repaired")),
+    false,
+  );
+});
+
+test("repair round controller stops on zero additions and hard call caps", () => {
+  assert.equal(
+    shouldContinueCitationRepairRounds({
+      round: 1,
+      calls: 4,
+      acceptedInRound: 1,
+      batchingEnabled: true,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldContinueCitationRepairRounds({
+      round: 1,
+      calls: 4,
+      acceptedInRound: 0,
+      batchingEnabled: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldContinueCitationRepairRounds({
+      round: 1,
+      calls: CITATION_REPAIR_MAX_CALLS,
+      acceptedInRound: 2,
+      batchingEnabled: true,
+    }),
+    false,
+  );
 });
 
 test("evidence bounding is immutable and retains raw-read document metadata", () => {

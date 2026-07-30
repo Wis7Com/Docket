@@ -181,11 +181,30 @@ export type AssistantEvent =
           mappings_proposed?: number;
           mappings_accepted?: number;
           mappings_ambiguous?: number;
+          mappings_rejected?: number;
+          mappings_unsafe_anchor?: number;
+          mappings_unsupported?: number;
+          mappings_duplicate_evidence?: number;
           mapper_unavailable?: boolean;
+          repair_rounds?: {
+              round: number;
+              calls: number;
+              menu_candidates: number;
+              mappings_proposed: number;
+              mappings_accepted: number;
+              mappings_rejected: number;
+          }[];
+          citations_verified?: number;
+          citations_unconfirmed?: number;
+      handle_citations?: number;
+      legacy_quote_citations?: number;
+      leaked_handles_converted?: number;
+      leaked_handles_dropped?: number;
       }
     | {
           type: "citation_summary";
           verified_count: number;
+          verified_distinct_sources?: number;
           used_document_tools: boolean;
       }
     | { type: "content"; text: string; isStreaming?: boolean };
@@ -308,6 +327,11 @@ export interface DocketCitationAnnotation {
     chunk_id?: string;
     quote_start?: number;
     quote_end?: number;
+    /**
+     * Missing on older persisted messages, where an entry was historically
+     * presented as verified.
+     */
+    support?: "verified" | "unconfirmed";
 }
 
 const PAGE_BREAK_SENTINEL = "[[PAGE_BREAK]]";

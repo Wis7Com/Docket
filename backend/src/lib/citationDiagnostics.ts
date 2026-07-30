@@ -4,6 +4,8 @@ export const CITATION_DISCARD_CODES = [
   "unknown_document",
   "quote_not_found",
   "invalid_chunk_span",
+  "unknown_passage",
+  "invalid_passage_range",
 ] as const;
 
 export type CitationDiscardCode = (typeof CITATION_DISCARD_CODES)[number];
@@ -19,7 +21,21 @@ export type CitationMappingDiagnosticCounts = Readonly<{
   mappings_proposed: number;
   mappings_accepted: number;
   mappings_ambiguous: number;
+  mappings_rejected: number;
+  mappings_unsafe_anchor: number;
+  mappings_unsupported: number;
+  mappings_duplicate_evidence: number;
   mapper_unavailable: boolean;
+  repair_rounds: readonly CitationRepairRoundDiagnosticCounts[];
+}>;
+
+export type CitationRepairRoundDiagnosticCounts = Readonly<{
+  round: number;
+  calls: number;
+  menu_candidates: number;
+  mappings_proposed: number;
+  mappings_accepted: number;
+  mappings_rejected: number;
 }>;
 
 export type CitationMappingDiagnosticInput = Readonly<{
@@ -27,7 +43,12 @@ export type CitationMappingDiagnosticInput = Readonly<{
   mappingsProposed?: number;
   mappingsAccepted?: number;
   mappingsAmbiguous?: number;
+  mappingsRejected?: number;
+  mappingsUnsafeAnchor?: number;
+  mappingsUnsupported?: number;
+  mappingsDuplicateEvidence?: number;
   mapperUnavailable?: boolean;
+  repairRounds?: readonly Partial<CitationRepairRoundDiagnosticCounts>[];
 }>;
 
 function diagnosticCount(value: number | undefined): number {
@@ -51,12 +72,48 @@ export function citationMappingDiagnostics(
     diagnosticCount(input.mappingsAmbiguous),
     proposed - accepted,
   );
+  const rejected = Math.min(
+    diagnosticCount(input.mappingsRejected),
+    proposed - accepted,
+  );
+  const repairRounds = (input.repairRounds ?? []).map((item, index) => {
+    const roundProposed = diagnosticCount(item.mappings_proposed);
+    const roundAccepted = Math.min(
+      diagnosticCount(item.mappings_accepted),
+      roundProposed,
+    );
+    return Object.freeze({
+      round: diagnosticCount(item.round) || index + 1,
+      calls: diagnosticCount(item.calls),
+      menu_candidates: diagnosticCount(item.menu_candidates),
+      mappings_proposed: roundProposed,
+      mappings_accepted: roundAccepted,
+      mappings_rejected: Math.min(
+        diagnosticCount(item.mappings_rejected),
+        roundProposed - roundAccepted,
+      ),
+    });
+  });
   return Object.freeze({
     menu_candidates: diagnosticCount(input.menuCandidates),
     mappings_proposed: proposed,
     mappings_accepted: accepted,
     mappings_ambiguous: ambiguous,
+    mappings_rejected: rejected,
+    mappings_unsafe_anchor: Math.min(
+      diagnosticCount(input.mappingsUnsafeAnchor),
+      rejected,
+    ),
+    mappings_unsupported: Math.min(
+      diagnosticCount(input.mappingsUnsupported),
+      rejected,
+    ),
+    mappings_duplicate_evidence: Math.min(
+      diagnosticCount(input.mappingsDuplicateEvidence),
+      rejected,
+    ),
     mapper_unavailable: input.mapperUnavailable === true,
+    repair_rounds: Object.freeze(repairRounds),
   });
 }
 

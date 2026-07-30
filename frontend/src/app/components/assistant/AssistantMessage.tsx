@@ -18,7 +18,11 @@ import { EditCard, applyOptimisticResolution } from "./EditCard";
 import { PreResponseWrapper } from "../shared/PreResponseWrapper";
 import { supabase } from "@/lib/supabase";
 import { getApiBase } from "@/app/lib/docketApi";
-import { citationSummaryChip, preprocessCitations } from "./citations";
+import {
+    citationButtonPresentation,
+    citationSummaryChip,
+    preprocessCitations,
+} from "./citations";
 import {
     shouldActivateCitationOnClick,
     shouldActivateCitationOnPointerDown,
@@ -1005,7 +1009,10 @@ function MarkdownContent({
                             const idx = parseInt(citMatch[1]);
                             const annotation = citationsList[idx];
                             if (annotation) {
-                                const tooltipText = `${formatCitationPage(annotation)}: "${displayCitationQuote(annotation)}"`;
+                                const presentation = citationButtonPresentation(
+                                    annotation,
+                                    `${formatCitationPage(annotation)}: "${displayCitationQuote(annotation)}"`,
+                                );
                                 return (
                                     <button
                                         type="button"
@@ -1013,6 +1020,9 @@ function MarkdownContent({
                                         data-citation-index={idx}
                                         data-citation-ref={annotation.ref}
                                         data-document-id={annotation.document_id}
+                                        data-citation-support={
+                                            presentation.kind
+                                        }
                                         onPointerDown={(event) => {
                                             if (
                                                 !shouldActivateCitationOnPointerDown(
@@ -1043,10 +1053,14 @@ function MarkdownContent({
                                                 onCitationClick?.(annotation);
                                             }
                                         }}
-                                        className="mx-0.5 inline-flex items-center justify-center rounded-full w-4 h-4 text-[10px] font-medium transition-colors align-super bg-gray-100 text-gray-900 hover:bg-gray-200"
-                                        title={tooltipText}
+                                        className={`mx-0.5 inline-flex items-center justify-center rounded-full w-4 h-4 text-[10px] font-medium transition-colors align-super ${
+                                            presentation.kind === "unconfirmed"
+                                                ? "bg-amber-100 text-amber-900 hover:bg-amber-200"
+                                                : "bg-gray-100 text-gray-900 hover:bg-gray-200"
+                                        }`}
+                                        title={presentation.title}
                                     >
-                                        {annotation.ref}
+                                        {presentation.label}
                                     </button>
                                 );
                             }

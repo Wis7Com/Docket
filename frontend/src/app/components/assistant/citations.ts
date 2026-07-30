@@ -2,6 +2,7 @@ import type { DocketCitationAnnotation } from "../shared/types";
 
 export type CitationSummary = Readonly<{
     verified_count: number;
+    verified_distinct_sources?: number;
     used_document_tools: boolean;
 }>;
 
@@ -10,16 +11,41 @@ export type CitationSummaryChip = Readonly<{
     text: string;
 }>;
 
+export type CitationButtonPresentation = Readonly<{
+    kind: "verified" | "unconfirmed";
+    label: string;
+    title: string;
+}>;
+
+export function citationButtonPresentation(
+    annotation: Pick<DocketCitationAnnotation, "ref" | "support">,
+    sourceDescription: string,
+): CitationButtonPresentation {
+    if (annotation.support === "unconfirmed") {
+        return {
+            kind: "unconfirmed",
+            label: "?",
+            title: `The model cited this passage, but it was not verified that the passage supports this specific claim. ${sourceDescription}`,
+        };
+    }
+    return {
+        kind: "verified",
+        label: String(annotation.ref),
+        title: sourceDescription,
+    };
+}
+
 export function citationSummaryChip(
     summary: CitationSummary | null | undefined,
     language = "en",
 ): CitationSummaryChip | null {
     if (!summary) return null;
 
+    const countForChip =
+        summary.verified_distinct_sources ?? summary.verified_count;
     const verifiedCount =
-        Number.isSafeInteger(summary.verified_count) &&
-        summary.verified_count > 0
-            ? summary.verified_count
+        Number.isSafeInteger(countForChip) && countForChip > 0
+            ? countForChip
             : 0;
     const isKorean = language.trim().toLowerCase().startsWith("ko");
 

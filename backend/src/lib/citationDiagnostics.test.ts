@@ -18,6 +18,8 @@ test("counts citation discard reasons across validation passes", () => {
     unknown_document: 0,
     quote_not_found: 2,
     invalid_chunk_span: 0,
+    unknown_passage: 0,
+    invalid_passage_range: 0,
   });
   assert.equal(hasCitationDiscards(counts), true);
 });
@@ -40,7 +42,12 @@ test("builds additive menu-repair diagnostics without changing discard counts", 
     mappings_proposed: 7,
     mappings_accepted: 5,
     mappings_ambiguous: 1,
+    mappings_rejected: 0,
+    mappings_unsafe_anchor: 0,
+    mappings_unsupported: 0,
+    mappings_duplicate_evidence: 0,
     mapper_unavailable: false,
+    repair_rounds: [],
   });
   assert.equal(Object.isFrozen(mappings), true);
 
@@ -57,6 +64,8 @@ test("builds additive menu-repair diagnostics without changing discard counts", 
       unknown_document: 0,
       quote_not_found: 0,
       invalid_chunk_span: 0,
+      unknown_passage: 0,
+      invalid_passage_range: 0,
     },
     recovered: 0,
     repair_attempted: true,
@@ -70,7 +79,12 @@ test("menu-repair diagnostics default safely and clamp impossible subsets", () =
     mappings_proposed: 0,
     mappings_accepted: 0,
     mappings_ambiguous: 0,
+    mappings_rejected: 0,
+    mappings_unsafe_anchor: 0,
+    mappings_unsupported: 0,
+    mappings_duplicate_evidence: 0,
     mapper_unavailable: false,
+    repair_rounds: [],
   });
   assert.deepEqual(
     citationMappingDiagnostics({
@@ -84,7 +98,12 @@ test("menu-repair diagnostics default safely and clamp impossible subsets", () =
       mappings_proposed: 3,
       mappings_accepted: 3,
       mappings_ambiguous: 0,
+      mappings_rejected: 0,
+      mappings_unsafe_anchor: 0,
+      mappings_unsupported: 0,
+      mappings_duplicate_evidence: 0,
       mapper_unavailable: false,
+      repair_rounds: [],
     },
   );
 });
@@ -95,6 +114,54 @@ test("menu-repair diagnostics record mapper availability", () => {
     mappings_proposed: 0,
     mappings_accepted: 0,
     mappings_ambiguous: 0,
+    mappings_rejected: 0,
+    mappings_unsafe_anchor: 0,
+    mappings_unsupported: 0,
+    mappings_duplicate_evidence: 0,
     mapper_unavailable: true,
+    repair_rounds: [],
   });
+});
+
+test("menu-repair diagnostics clamp rejected counts and preserve rounds", () => {
+  assert.deepEqual(
+    citationMappingDiagnostics({
+      mappingsProposed: 3,
+      mappingsAccepted: 1,
+      mappingsRejected: 9,
+      mappingsUnsafeAnchor: 3,
+      mappingsUnsupported: 1,
+      repairRounds: [
+        {
+          round: 1,
+          calls: 4,
+          menu_candidates: 80,
+          mappings_proposed: 3,
+          mappings_accepted: 1,
+          mappings_rejected: 9,
+        },
+      ],
+    }),
+    {
+      menu_candidates: 0,
+      mappings_proposed: 3,
+      mappings_accepted: 1,
+      mappings_ambiguous: 0,
+      mappings_rejected: 2,
+      mappings_unsafe_anchor: 2,
+      mappings_unsupported: 1,
+      mappings_duplicate_evidence: 0,
+      mapper_unavailable: false,
+      repair_rounds: [
+        {
+          round: 1,
+          calls: 4,
+          menu_candidates: 80,
+          mappings_proposed: 3,
+          mappings_accepted: 1,
+          mappings_rejected: 2,
+        },
+      ],
+    },
+  );
 });

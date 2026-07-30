@@ -172,6 +172,7 @@ test("runLLMStream continues a short document-tool answer exactly once", async (
         assert.deepEqual(summary, {
             type: "citation_summary",
             verified_count: 0,
+            verified_distinct_sources: 0,
             used_document_tools: true,
         });
         const diagnostics = result.events.find(
@@ -186,7 +187,7 @@ test("runLLMStream continues a short document-tool answer exactly once", async (
         assert.equal(
             writes.some((value) =>
                 value.includes(
-                    '"type":"citation_summary","verified_count":0,"used_document_tools":true',
+                    '"type":"citation_summary","verified_count":0,"verified_distinct_sources":0,"used_document_tools":true',
                 ),
             ),
             true,

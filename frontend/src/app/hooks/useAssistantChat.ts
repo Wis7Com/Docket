@@ -1098,9 +1098,28 @@ export function useAssistantChat({
                                           Math.floor(data.verified_count),
                                       )
                                     : 0;
+                            const verifiedDistinctSources =
+                                typeof data.verified_distinct_sources ===
+                                    "number" &&
+                                Number.isFinite(
+                                    data.verified_distinct_sources,
+                                )
+                                    ? Math.max(
+                                          0,
+                                          Math.floor(
+                                              data.verified_distinct_sources,
+                                          ),
+                                      )
+                                    : undefined;
                             pushEvent({
                                 type: "citation_summary",
                                 verified_count: verifiedCount,
+                                ...(verifiedDistinctSources === undefined
+                                    ? {}
+                                    : {
+                                          verified_distinct_sources:
+                                              verifiedDistinctSources,
+                                      }),
                                 used_document_tools:
                                     data.used_document_tools === true,
                             });

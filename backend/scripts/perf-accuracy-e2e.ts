@@ -20,6 +20,8 @@ import {
   runLLMStream,
   type ChatMessage,
 } from "../src/lib/chatTools";
+import { measurePassageAnnotationByteOverhead } from "../src/lib/citationHandles";
+import { citationLexicalSupport } from "../src/lib/citationRepair";
 import { getProjectIndexCorpusStats } from "../src/lib/indexing/search";
 import {
   assertRetrievalResultCoversEvaluationSet,
@@ -75,13 +77,48 @@ type ToolBatch = {
   }[];
 };
 
+type ToolResultBatch = {
+  iteration: number;
+  results: {
+    id: string;
+    name: string;
+    content_bytes: number;
+    controlled_bytes_with_passage_annotations: number;
+    controlled_bytes_without_passage_annotations: number;
+    controlled_passage_annotation_byte_delta: number;
+  }[];
+  content_bytes: number;
+  controlled_bytes_with_passage_annotations: number;
+  controlled_bytes_without_passage_annotations: number;
+  controlled_passage_annotation_byte_delta: number;
+};
+
 type ConversationCapture = {
   answer: string;
+  raw_answer: string;
   wall_time_ms: number;
   emitted_citations: number;
   valid_citations: number;
+  raw_numeric_marker_occurrences: number;
+  raw_leaked_handle_tokens: number;
+  final_numeric_marker_occurrences: number;
+  final_resolved_marker_occurrences: number;
+  final_unresolved_marker_occurrences: number;
+  final_tier_a_marker_occurrences: number;
+  final_tier_b_marker_occurrences: number;
+  final_dead_marker_occurrences: number;
+  final_leaked_handle_tokens: number;
+  tier_a_support_failures: number;
+  marker_occurrences_inside_quotes: number;
+  repeated_ref_marker_occurrences: number;
   citations: unknown[];
   tool_batches: ToolBatch[];
+  tool_result_batches: ToolResultBatch[];
+  tool_output_bytes: number;
+  controlled_tool_output_bytes_with_passage_annotations: number;
+  controlled_tool_output_bytes_without_passage_annotations: number;
+  controlled_passage_annotation_byte_delta: number;
+  controlled_passage_annotation_percent_delta: number;
   tool_calls: number;
   sse_events: unknown[];
   error?: string;
@@ -214,8 +251,137 @@ function visibleAnswer(
     .trim();
 }
 
-function countRawCitations(text: string): number {
-  return text.match(/<CITATION>/g)?.length ?? 0;
+function visibleCitationMarkerRefs(text: string): number[] {
+  const visible = text.replace(
+    /<CITATIONS>\s*[\s\S]*?\s*<\/CITATIONS>/gi,
+    "",
+  );
+  return Array.from(
+    visible.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g),
+  ).flatMap((match) =>
+    match[1]
+      .split(",")
+      .map((value) => Number.parseInt(value.trim(), 10))
+      .filter(Number.isFinite),
+  );
+}
+
+function countLeakedHandleTokens(text: string): number {
+  const visible = text.replace(
+    /<CITATIONS>\s*[\s\S]*?\s*<\/CITATIONS>/gi,
+    "",
+  );
+  return Array.from(visible.matchAll(/\[[^\]\n]*\bp\d[^\]\n]*\]/gi)).reduce(
+    (count, bracket) =>
+      count +
+      Array.from(bracket[0].matchAll(/\bp\d+(?:-p[^\s,\]]+)?/gi)).length,
+    0,
+  );
+}
+
+function citationRefs(
+  citations: readonly unknown[],
+  support: "verified" | "unconfirmed" | "any",
+): Set<number> {
+  return new Set(
+    citations.flatMap((citation) => {
+      if (!citation || typeof citation !== "object") return [];
+      const item = citation as { ref?: unknown; support?: unknown };
+      if (
+        support !== "any" &&
+        (support === "unconfirmed"
+          ? item.support !== "unconfirmed"
+          : item.support === "unconfirmed")
+      ) {
+        return [];
+      }
+      const ref = item.ref;
+      return typeof ref === "number" && Number.isSafeInteger(ref) ? [ref] : [];
+    }),
+  );
+}
+
+function countRepeatedMarkerRefs(refs: readonly number[]): number {
+  const seen = new Set<number>();
+  let repeated = 0;
+  for (const ref of refs) {
+    if (seen.has(ref)) repeated += 1;
+    else seen.add(ref);
+  }
+  return repeated;
+}
+
+function countMarkersInsideQuotes(text: string): number {
+  const spans = [
+    ...text.matchAll(/“[^”\n]+”/g),
+    ...text.matchAll(/‘[^’\n]+’/g),
+    ...text.matchAll(/"[^"\n]+"/g),
+    ...text.matchAll(/(?<![\p{L}\p{N}])'[^'\n]+'(?![\p{L}\p{N}])/gu),
+  ].flatMap((match) =>
+    match.index === undefined
+      ? []
+      : [{ start: match.index, end: match.index + match[0].length }],
+  );
+  return Array.from(text.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g)).filter(
+    (marker) =>
+      marker.index !== undefined &&
+      spans.some(
+        (span) =>
+          span.start < (marker.index as number) &&
+          (marker.index as number) < span.end,
+      ),
+  ).length;
+}
+
+function countTierASupportFailures(
+  text: string,
+  citations: readonly unknown[],
+): number {
+  const citationByRef = new Map<number, { quote: string }>();
+  for (const raw of citations) {
+    if (!raw || typeof raw !== "object") continue;
+    const citation = raw as {
+      ref?: unknown;
+      quote?: unknown;
+      support?: unknown;
+    };
+    if (
+      typeof citation.ref === "number" &&
+      typeof citation.quote === "string" &&
+      citation.support !== "unconfirmed"
+    ) {
+      citationByRef.set(citation.ref, { quote: citation.quote });
+    }
+  }
+  let failures = 0;
+  for (const marker of text.matchAll(/\[(\d+(?:,\s*\d+)*)\]/g)) {
+    if (marker.index === undefined) continue;
+    const context = text
+      .slice(Math.max(0, marker.index - 200), marker.index)
+      .replace(/\[(?:\d+(?:,\s*\d+)*)\]/g, " ");
+    for (const rawRef of marker[1].split(",")) {
+      const citation = citationByRef.get(
+        Number.parseInt(rawRef.trim(), 10),
+      );
+      if (!citation) continue;
+      const support = citationLexicalSupport(context, citation.quote);
+      if (
+        !support.nearVerbatim &&
+        (support.sharedWords < 2 || support.score < 0.3)
+      ) {
+        failures += 1;
+      }
+    }
+  }
+  return failures;
+}
+
+function parsedToolPayload(content: string): unknown {
+  try {
+    return JSON.parse(content) as unknown;
+  } catch {
+    return content;
+  }
 }
 
 async function writeExclusive(file: string, content: string): Promise<void> {
@@ -337,6 +503,7 @@ async function runLiveOnce(
       );
       const sseEvents: unknown[] = [];
       const toolBatches: ToolBatch[] = [];
+      const toolResultBatches: ToolResultBatch[] = [];
       const started = performance.now();
       const originalLog = console.log;
       console.log = (message?: unknown, ...args: unknown[]) => {
@@ -369,22 +536,124 @@ async function runLiveOnce(
               calls: batch.calls.map((call) => ({ ...call })),
             });
           },
+          onToolResults: (batch) => {
+            const results = batch.results.map((result) => {
+              const controlled = measurePassageAnnotationByteOverhead(
+                parsedToolPayload(result.content),
+              );
+              return {
+                id: result.id,
+                name: result.name,
+                content_bytes: Buffer.byteLength(result.content, "utf8"),
+                controlled_bytes_with_passage_annotations:
+                  controlled.serializedBytesWithAnnotations,
+                controlled_bytes_without_passage_annotations:
+                  controlled.serializedBytesWithoutAnnotations,
+                controlled_passage_annotation_byte_delta: controlled.byteDelta,
+              };
+            });
+            toolResultBatches.push({
+              iteration: batch.iteration,
+              results,
+              content_bytes: results.reduce(
+                (total, result) => total + result.content_bytes,
+                0,
+              ),
+              controlled_bytes_with_passage_annotations: results.reduce(
+                (total, result) =>
+                  total + result.controlled_bytes_with_passage_annotations,
+                0,
+              ),
+              controlled_bytes_without_passage_annotations: results.reduce(
+                (total, result) =>
+                  total + result.controlled_bytes_without_passage_annotations,
+                0,
+              ),
+              controlled_passage_annotation_byte_delta: results.reduce(
+                (total, result) =>
+                  total + result.controlled_passage_annotation_byte_delta,
+                0,
+              ),
+            });
+          },
         });
         const citations = stream.citations as unknown[];
         const answer = visibleAnswer(
           stream.events as { type: string; text?: string }[],
         );
-        const emitted = Math.max(
-          countRawCitations(stream.fullText),
-          citations.length,
+        const rawMarkerRefs = visibleCitationMarkerRefs(stream.fullText);
+        const finalMarkerRefs = visibleCitationMarkerRefs(answer);
+        const resolvedRefs = citationRefs(citations, "any");
+        const tierARefs = citationRefs(citations, "verified");
+        const tierBRefs = citationRefs(citations, "unconfirmed");
+        const resolvedFinalMarkers = finalMarkerRefs.filter((ref) =>
+          resolvedRefs.has(ref),
+        ).length;
+        const tierAFinalMarkers = finalMarkerRefs.filter((ref) =>
+          tierARefs.has(ref),
+        ).length;
+        const tierBFinalMarkers = finalMarkerRefs.filter((ref) =>
+          tierBRefs.has(ref),
+        ).length;
+        const emitted = Math.max(finalMarkerRefs.length, citations.length);
+        const toolOutputBytes = toolResultBatches.reduce(
+          (total, batch) => total + batch.content_bytes,
+          0,
+        );
+        const controlledToolOutputBytesWithoutPassageAnnotations =
+          toolResultBatches.reduce(
+            (total, batch) =>
+              total + batch.controlled_bytes_without_passage_annotations,
+            0,
+          );
+        const controlledToolOutputBytesWithPassageAnnotations =
+          toolResultBatches.reduce(
+            (total, batch) =>
+              total + batch.controlled_bytes_with_passage_annotations,
+            0,
+          );
+        const controlledPassageAnnotationByteDelta = toolResultBatches.reduce(
+          (total, batch) =>
+            total + batch.controlled_passage_annotation_byte_delta,
+          0,
         );
         const capture: ConversationCapture = {
           answer,
+          raw_answer: stream.fullText,
           wall_time_ms: performance.now() - started,
           emitted_citations: emitted,
           valid_citations: citations.length,
+          raw_numeric_marker_occurrences: rawMarkerRefs.length,
+          raw_leaked_handle_tokens: countLeakedHandleTokens(stream.fullText),
+          final_numeric_marker_occurrences: finalMarkerRefs.length,
+          final_resolved_marker_occurrences: resolvedFinalMarkers,
+          final_unresolved_marker_occurrences:
+            finalMarkerRefs.length - resolvedFinalMarkers,
+          final_tier_a_marker_occurrences: tierAFinalMarkers,
+          final_tier_b_marker_occurrences: tierBFinalMarkers,
+          final_dead_marker_occurrences:
+            finalMarkerRefs.length - tierAFinalMarkers - tierBFinalMarkers,
+          final_leaked_handle_tokens: countLeakedHandleTokens(answer),
+          tier_a_support_failures: countTierASupportFailures(answer, citations),
+          marker_occurrences_inside_quotes: countMarkersInsideQuotes(answer),
+          repeated_ref_marker_occurrences:
+            countRepeatedMarkerRefs(finalMarkerRefs),
           citations,
           tool_batches: toolBatches,
+          tool_result_batches: toolResultBatches,
+          tool_output_bytes: toolOutputBytes,
+          controlled_tool_output_bytes_with_passage_annotations:
+            controlledToolOutputBytesWithPassageAnnotations,
+          controlled_tool_output_bytes_without_passage_annotations:
+            controlledToolOutputBytesWithoutPassageAnnotations,
+          controlled_passage_annotation_byte_delta:
+            controlledPassageAnnotationByteDelta,
+          controlled_passage_annotation_percent_delta:
+            controlledToolOutputBytesWithoutPassageAnnotations > 0
+              ? (controlledPassageAnnotationByteDelta /
+                  controlledToolOutputBytesWithoutPassageAnnotations) *
+                100
+              : 0,
           tool_calls: toolBatches.reduce(
             (sum, batch) => sum + batch.calls.length,
             0,
@@ -394,13 +663,59 @@ async function runLiveOnce(
         transcriptRuns[id] = capture;
         return capture;
       } catch (error) {
+        const controlledBytesWithoutPassageAnnotations =
+          toolResultBatches.reduce(
+            (total, batch) =>
+              total + batch.controlled_bytes_without_passage_annotations,
+            0,
+          );
+        const controlledBytesWithPassageAnnotations = toolResultBatches.reduce(
+          (total, batch) =>
+            total + batch.controlled_bytes_with_passage_annotations,
+          0,
+        );
+        const controlledPassageAnnotationByteDelta = toolResultBatches.reduce(
+          (total, batch) =>
+            total + batch.controlled_passage_annotation_byte_delta,
+          0,
+        );
         const capture: ConversationCapture = {
           answer: "",
+          raw_answer: "",
           wall_time_ms: performance.now() - started,
           emitted_citations: 0,
           valid_citations: 0,
+          raw_numeric_marker_occurrences: 0,
+          raw_leaked_handle_tokens: 0,
+          final_numeric_marker_occurrences: 0,
+          final_resolved_marker_occurrences: 0,
+          final_unresolved_marker_occurrences: 0,
+          final_tier_a_marker_occurrences: 0,
+          final_tier_b_marker_occurrences: 0,
+          final_dead_marker_occurrences: 0,
+          final_leaked_handle_tokens: 0,
+          tier_a_support_failures: 0,
+          marker_occurrences_inside_quotes: 0,
+          repeated_ref_marker_occurrences: 0,
           citations: [],
           tool_batches: toolBatches,
+          tool_result_batches: toolResultBatches,
+          tool_output_bytes: toolResultBatches.reduce(
+            (total, batch) => total + batch.content_bytes,
+            0,
+          ),
+          controlled_tool_output_bytes_with_passage_annotations:
+            controlledBytesWithPassageAnnotations,
+          controlled_tool_output_bytes_without_passage_annotations:
+            controlledBytesWithoutPassageAnnotations,
+          controlled_passage_annotation_byte_delta:
+            controlledPassageAnnotationByteDelta,
+          controlled_passage_annotation_percent_delta:
+            controlledBytesWithoutPassageAnnotations > 0
+              ? (controlledPassageAnnotationByteDelta /
+                  controlledBytesWithoutPassageAnnotations) *
+                100
+              : 0,
           tool_calls: toolBatches.reduce(
             (sum, batch) => sum + batch.calls.length,
             0,
@@ -512,9 +827,13 @@ async function runLiveOnce(
       path.join(outputDir, `${stem}-transcript.json`),
       `${JSON.stringify(
         {
-          schema_version: 1,
+          schema_version: 3,
           run_id: result.run_id,
           model: result.model,
+          citation_handles:
+            process.env.DOCKET_CITATION_HANDLES?.trim() === "0"
+              ? "disabled"
+              : "enabled",
           runs: transcriptRuns,
         },
         null,
@@ -562,11 +881,40 @@ function selfTest(): void {
     [{ type: "tool_call_start", name: "x" }],
   );
   assert.deepEqual(parseSseWrite("data: [DONE]\n\n"), []);
-  assert.equal(countRawCitations("<CITATION></CITATION><CITATION>"), 2);
+  assert.deepEqual(visibleCitationMarkerRefs("Alpha [1]. Both [2, 3]."), [
+    1, 2, 3,
+  ]);
+  assert.equal(countLeakedHandleTokens("Both [p8, p24] and [p51-p5ern]."), 3);
+  assert.equal(
+    countRepeatedMarkerRefs(
+      visibleCitationMarkerRefs("A [1]. B [2, 3]. C [2]."),
+    ),
+    1,
+  );
+  assert.equal(countMarkersInsideQuotes('Outside [1]. "Inside [2]."'), 1);
+  assert.equal(
+    countMarkersInsideQuotes(
+      "NCBCP's response [1]. Defendant's reply [2].",
+    ),
+    0,
+  );
   assert.equal(
     visibleAnswer([{ type: "content", text: " answer " }]),
     "answer",
   );
+  const controlledMeasurement = measurePassageAnnotationByteOverhead(
+    parsedToolPayload(
+      JSON.stringify({
+        indexed_quote: "[p1] Exact source text.",
+        citation_passage: "p1",
+      }),
+    ),
+  );
+  assert.equal(
+    controlledMeasurement.serializedBytesWithoutAnnotations,
+    Buffer.byteLength(JSON.stringify({ indexed_quote: "Exact source text." })),
+  );
+  assert.ok(controlledMeasurement.byteDelta > 0);
   assert.equal(parseCli([]).runs, 1);
   assert.equal(parseCli(["--runs", "3"]).runs, 3);
   assert.deepEqual(

@@ -8,9 +8,14 @@ import {
     boundDocumentToolResult,
     documentToolResultMaxCharsForModel,
     buildWorkflowStore,
+    citationSystemPrompt,
     citationMarkerRefs,
+    convertLeakedPassageHandleTokens,
+    countDistinctCitationSources,
     countOrphanCitationMarkers,
     dedupeCitationEvidence,
+    assignCitationSupportByOccurrence,
+    annotatePdfAnnotationPayload,
     extractAnnotations,
     filterDocContext,
     filterToolsByDisabled,
@@ -18,6 +23,8 @@ import {
     extractAnnotationContext,
     fetchUserPdfAnnotations,
     readAnnotationContexts,
+    parseCitations,
+    recoverLeakedPassageHandleCitations,
     recoverNamedQuotedCitation,
     renumberCitations,
     resolveSearchDocumentIds,
@@ -27,6 +34,7 @@ import {
     type DocIndex,
     type DocStore,
 } from "./chatTools";
+import { PassageRegistry } from "./citationHandles";
 
 test("whole-document summary routing selects the displayed indexed document", () => {
     const target = automaticWholeDocumentSummaryTarget(
@@ -114,6 +122,8 @@ test("local Ollama models receive a final citation-format reminder", () => {
 });
 
 test("document citation instructions require markers inside Markdown tables", () => {
+    assert.match(SYSTEM_PROMPT, /\{"ref": 1, "passage": "p12"\}/);
+    assert.doesNotMatch(SYSTEM_PROMPT, /copy only the exact chunk_id/);
     assert.match(
         SYSTEM_PROMPT,
         /In Markdown tables, place each \[N\] marker at the end of the supported claim inside the relevant cell/,
@@ -124,6 +134,17 @@ test("document citation instructions require markers inside Markdown tables", ()
         /Never cite as \[filename\] or \[filename, p\. N\] in prose/,
     );
     assert.match(SYSTEM_PROMPT, /Those are dead text, not citation links/);
+    assert.match(
+        SYSTEM_PROMPT,
+        /Passage ids never appear in the answer text; prose carries only numeric \[N\] markers/,
+    );
+});
+
+test("citation handle kill switch restores the pure legacy prompt", () => {
+    const legacy = citationSystemPrompt("0");
+    assert.match(legacy, /"doc_id": "doc-0"/);
+    assert.match(legacy, /exact verbatim text/);
+    assert.doesNotMatch(legacy, /"passage": "p12"/);
 });
 
 test("annotation prompt requires explicit per-highlight coverage", () => {
@@ -350,8 +371,14 @@ test("project chat exposes a dedicated annotation retrieval tool", () => {
     assert.ok(annotationTool);
     assert.match(annotationTool.function.description, /hilighted/i);
     assert.match(annotationTool.function.description, /하이라이트/);
-    assert.match(annotationTool.function.description, /independent annotations/i);
-    assert.match(annotationTool.function.description, /annotation_type='comment'/);
+    assert.match(
+        annotationTool.function.description,
+        /independent annotations/i,
+    );
+    assert.match(
+        annotationTool.function.description,
+        /annotation_type='comment'/,
+    );
     assert.match(annotationTool.function.description, /Do not substitute/i);
     const properties = annotationTool.function.parameters.properties;
     assert.ok(properties.annotation_type);
@@ -819,6 +846,63 @@ test("annotation context returns bounded page text when a quote is absent", () =
     assert.equal("indexed_quote" in context, false);
 });
 
+test("basic annotation payloads expose registered handles for indexed quotes", () => {
+    const registry = new PassageRegistry();
+    const documentId = "11111111-1111-4111-8111-111111111111";
+    const versionId = "version-a";
+    const content =
+        "Background text provides context for this synthetic legal record. The challenged statement allegedly targeted voters in several neighborhoods.";
+    const payload = annotatePdfAnnotationPayload(
+        {
+            annotations: [
+                {
+                    id: "annotation-1",
+                    doc_id: "doc-0",
+                    document_id: documentId,
+                    version_id: versionId,
+                    page: 9,
+                    quote: "The challenged statement allegedly targeted voters in several neighborhoods.",
+                },
+            ],
+        },
+        registry,
+        {
+            "doc-0": {
+                document_id: documentId,
+                version_id: versionId,
+                filename: "synthetic.pdf",
+            },
+        },
+        () => [
+            {
+                chunk_id: "chunk-a",
+                chunk_index: 4,
+                page_number: 9,
+                content,
+                start_char: 800,
+                end_char: 800 + content.length,
+            },
+        ],
+    );
+
+    const annotation = (
+        payload.annotations as Array<Record<string, unknown>>
+    )[0];
+    assert.equal(annotation.chunk_id, "chunk-a");
+    assert.match(String(annotation.indexed_quote), /^\[p2\] /);
+    assert.equal(annotation.citation_passage, "p2");
+    const resolved = registry.resolve("p2");
+    assert.equal(resolved.ok, true);
+    if (resolved.ok) {
+        assert.equal(resolved.citation.documentId, documentId);
+        assert.equal(resolved.citation.page, 9);
+        assert.equal(
+            resolved.citation.quote,
+            "The challenged statement allegedly targeted voters in several neighborhoods.",
+        );
+    }
+});
+
 test("readAnnotationContexts caps ids and radius and prevents cross-document access", async () => {
     const rows = Array.from({ length: 25 }, (_, index) => ({
         id: `id-${index}`,
@@ -1039,6 +1123,353 @@ test("citation contract drops only an orphan citation", () => {
     assert.deepEqual(result.errors, [{ code: "orphan_citation", ref: 2 }]);
 });
 
+test("handle citations resolve to the unchanged persisted annotation shape", () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-0",
+        documentId: "document-a",
+        versionId: "version-a",
+        chunkId: "chunk-handle",
+        page: 9,
+        content:
+            "The borrower must deliver every synthetic condition precedent before the first utilization date.",
+    });
+    const text = `The conditions must be delivered before utilization [1].
+
+<CITATIONS>
+[{"ref":1,"passage":"p1"}]
+</CITATIONS>`;
+    const contract = validateCitationContract(
+        text,
+        parseCitations(text),
+        docIndex,
+        registry,
+    );
+
+    assert.deepEqual(contract.errors, []);
+    assert.deepEqual(
+        extractAnnotations(text, docIndex, [], contract.citations),
+        [
+            {
+                type: "citation_data",
+                ref: 1,
+                doc_id: "doc-0",
+                document_id: "document-a",
+                version_id: "version-a",
+                version_number: 3,
+                filename: "credit-agreement.pdf",
+                page: 9,
+                quote: "The borrower must deliver every synthetic condition precedent before the first utilization date.",
+                chunk_id: "chunk-handle",
+                quote_start: 0,
+                quote_end: 96,
+            },
+        ],
+    );
+});
+
+test("extractAnnotations persists an unconfirmed support tier", () => {
+    assert.deepEqual(
+        extractAnnotations(
+            "",
+            docIndex,
+            [],
+            [
+                {
+                    ref: 1,
+                    doc_id: "doc-0",
+                    page: 9,
+                    quote: "Named source passage.",
+                    support: "unconfirmed",
+                },
+            ],
+        ),
+        [
+            {
+                type: "citation_data",
+                ref: 1,
+                doc_id: "doc-0",
+                document_id: "document-a",
+                version_id: "version-a",
+                version_number: 3,
+                filename: "credit-agreement.pdf",
+                page: 9,
+                quote: "Named source passage.",
+                support: "unconfirmed",
+            },
+        ],
+    );
+});
+
+test("citation contract dual-accepts handles and legacy quote entries", () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-0",
+        documentId: "document-a",
+        versionId: "version-a",
+        chunkId: "chunk-handle",
+        page: 4,
+        content:
+            "The first synthetic proposition is supported by indexed source text with adequate detail.",
+    });
+    const text = `Indexed claim [1]. Legacy claim [2].
+
+<CITATIONS>
+[
+  {"ref":1,"passage":"p1"},
+  {"ref":2,"doc_id":"doc-1","page":12,"quote":"legacy source words"}
+]
+</CITATIONS>`;
+    const result = validateCitationContract(
+        text,
+        parseCitations(text),
+        docIndex,
+        registry,
+    );
+
+    assert.deepEqual(result.errors, []);
+    assert.equal(result.citations[0].protocol, "handle");
+    assert.equal(result.citations[1].protocol, undefined);
+    assert.equal(result.citations[1].quote, "legacy source words");
+});
+
+test("citation contract reports malformed and unknown passage handles", () => {
+    const registry = new PassageRegistry();
+    const text = `Malformed [1]. Unknown [2].
+
+<CITATIONS>
+[
+  {"ref":1,"passage":"chunk-a"},
+  {"ref":2,"passage":"p99"}
+]
+</CITATIONS>`;
+    const result = validateCitationContract(
+        text,
+        parseCitations(text),
+        docIndex,
+        registry,
+    );
+
+    assert.deepEqual(result.citations, []);
+    assert.deepEqual(result.errors, [
+        { code: "invalid_passage_range", ref: 1 },
+        { code: "unknown_passage", ref: 2 },
+    ]);
+});
+
+test("leaked passage handles beside matching filenames become verified markers", () => {
+    const registry = new PassageRegistry();
+    const documentId = "11111111-1111-4111-8111-111111111111";
+    const sourceText =
+        "The synthetic indexed statement provides enough detail to support the asserted proposition.";
+    registry.registerChunk({
+        docId: "doc-0",
+        documentId,
+        versionId: "version-a",
+        chunkId: "chunk-a",
+        content: sourceText,
+        page: 7,
+        startChar: 200,
+        endChar: 200 + sourceText.length,
+    });
+    const index: DocIndex = {
+        "doc-0": {
+            document_id: documentId,
+            version_id: "version-a",
+            filename: "synthetic.pdf",
+        },
+    };
+
+    const recovered = recoverLeakedPassageHandleCitations(
+        "Supported claim [doc-0, p1].",
+        registry,
+        index,
+    );
+    assert.equal(recovered.recovered, 1);
+    assert.match(recovered.text, /Supported claim \[1\]\./);
+    assert.deepEqual(parseCitations(recovered.text), [
+        { ref: 1, passage: "p1" },
+    ]);
+    const contract = validateCitationContract(
+        recovered.text,
+        parseCitations(recovered.text),
+        index,
+        registry,
+    );
+    assert.equal(contract.errors.length, 0);
+    assert.equal(contract.citations[0].quote, sourceText);
+
+    assert.deepEqual(
+        recoverLeakedPassageHandleCitations(
+            "Wrong source [doc-1, p1].",
+            registry,
+            index,
+        ),
+        { text: "Wrong source [doc-1, p1].", recovered: 0 },
+    );
+});
+
+test("bare leaked passage handle tokens become citation markers or are stripped", () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-0",
+        documentId: "document-a",
+        versionId: "version-a",
+        chunkId: "chunk-round2",
+        page: 7,
+        content:
+            "First synthetic support sentence includes enough detail for conversion. Second synthetic support sentence independently supports a range. Third synthetic support sentence completes that range.",
+    });
+    const p1 = registry.resolve("p1");
+    assert.equal(p1.ok, true);
+    if (!p1.ok) throw new Error("expected p1 to resolve");
+    const existing = {
+        ref: 4,
+        doc_id: p1.citation.docId,
+        page: p1.citation.page,
+        quote: p1.citation.quote,
+        chunk_id: p1.citation.chunkId,
+        quote_start: p1.citation.quoteStart,
+        quote_end: p1.citation.quoteEnd,
+        protocol: "handle" as const,
+    };
+
+    const result = convertLeakedPassageHandleTokens(
+        [
+            "Existing citation reuses the verified ref [p1].",
+            "Repeated support [p2] and again [p2].",
+            "Range support [p2-p3].",
+            "Unknown support [p99].",
+            '"Quoted support [p3]" stays outside the quote.',
+            "Already marked [1] [p3].",
+        ].join("\n"),
+        [existing],
+        registry,
+    );
+
+    assert.equal(result.converted, 6);
+    assert.equal(result.dropped, 1);
+    assert.doesNotMatch(result.text, /\[p\d/);
+    assert.match(result.text, /verified ref\. \[4\]/);
+    assert.match(result.text, /Repeated support \[5\] and again\. \[5\]/);
+    assert.match(result.text, /Range support\. \[6\]/);
+    assert.match(result.text, /Unknown support\./);
+    assert.match(result.text, /"Quoted support" \[\d+\] stays outside/);
+    assert.match(result.text, /Already marked \[1\]\. \[\d+\]/);
+    assert.equal(result.citations.length, 4);
+    assert.deepEqual(
+        result.citations.map((citation) => citation.ref),
+        [4, 5, 6, 7],
+    );
+    assert.equal(
+        result.citations.every((citation) => citation.protocol === "handle"),
+        true,
+    );
+});
+
+test("converted handles feed duplicate enforcement and orphan counting", () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-0",
+        documentId: "document-a",
+        versionId: "version-a",
+        chunkId: "chunk-ordering",
+        page: 2,
+        content:
+            "The exact supported statement appears in indexed text. Another sentence has unrelated support.",
+    });
+
+    const converted = convertLeakedPassageHandleTokens(
+        [
+            "The exact supported statement [p1].",
+            "Registration records concern a different dispute whose unrelated procedural history, filing dates, docket management, scheduling orders, discovery deadlines, witness lists, exhibit numbering, hearing logistics, and administrative notices do not repeat the verified proposition [p1].",
+            "Missing marker [9].",
+        ].join("\n"),
+        [],
+        registry,
+    );
+    const singleOccurrence = assignCitationSupportByOccurrence(
+        converted.text,
+        converted.citations,
+    );
+
+    assert.equal(converted.converted, 2);
+    assert.equal(singleOccurrence.citationsVerified, 1);
+    assert.equal(singleOccurrence.citationsUnconfirmed, 1);
+    assert.equal(
+        countOrphanCitationMarkers(
+            singleOccurrence.text,
+            singleOccurrence.citations,
+        ),
+        1,
+    );
+});
+
+test("comma-separated passage handles convert individually and malformed handles are dropped", () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-0",
+        documentId: "document-a",
+        versionId: "version-a",
+        chunkId: "chunk-list",
+        page: 3,
+        content:
+            "First source sentence supports the combined claim. Second source sentence also supports the combined claim.",
+    });
+
+    const result = convertLeakedPassageHandleTokens(
+        "Combined claim [p1, p2]. Malformed source [p51-p5ern].",
+        [],
+        registry,
+    );
+
+    assert.equal(result.text, "Combined claim. [1, 2] Malformed source.");
+    assert.equal(result.converted, 2);
+    assert.equal(result.dropped, 1);
+    assert.deepEqual(
+        result.citations.map((citation) => citation.ref),
+        [1, 2],
+    );
+    assert.doesNotMatch(result.text, /\[p/i);
+});
+
+test("a passage leaked three times at supported locations becomes three linked markers", () => {
+    const registry = new PassageRegistry();
+    registry.registerChunk({
+        docId: "doc-0",
+        documentId: "document-a",
+        versionId: "version-a",
+        chunkId: "chunk-repeated-leak",
+        page: 4,
+        content:
+            "The repeated source statement independently supports each comparison row.",
+    });
+    const statement =
+        "The repeated source statement independently supports each comparison row";
+    const converted = convertLeakedPassageHandleTokens(
+        `${statement} [p1].\n${statement} [p1].\n${statement} [p1].`,
+        [],
+        registry,
+    );
+    const enforced = assignCitationSupportByOccurrence(
+        converted.text,
+        converted.citations,
+    );
+
+    assert.equal(converted.converted, 3);
+    assert.deepEqual(citationMarkerRefs(enforced.text), [1, 2, 3]);
+    assert.deepEqual(
+        enforced.citations.map((citation) => citation.ref),
+        [1, 2, 3],
+    );
+    assert.equal(
+        countOrphanCitationMarkers(enforced.text, enforced.citations),
+        0,
+    );
+    assert.equal(enforced.citationsVerified, 3);
+    assert.equal(enforced.citationsUnconfirmed, 0);
+});
+
 test("renumberCitations compacts surviving refs and rewrites markers", () => {
     const compacted = renumberCitations("Alpha [1]. Gamma [3].", [
         { ref: 1, quote: "alpha" },
@@ -1060,11 +1491,10 @@ test("renumberCitations compacts surviving refs and rewrites markers", () => {
 });
 
 test("orphan citation marker count uses distinct visible refs", () => {
-    assert.deepEqual(citationMarkerRefs("Alpha [1]. Both [2, 3]. Again [2]."), [
-        1,
-        2,
-        3,
-    ]);
+    assert.deepEqual(
+        citationMarkerRefs("Alpha [1]. Both [2, 3]. Again [2]."),
+        [1, 2, 3],
+    );
     assert.equal(
         countOrphanCitationMarkers("Alpha [1]. Missing block [2].", []),
         2,
@@ -1074,10 +1504,7 @@ test("orphan citation marker count uses distinct visible refs", () => {
         (_, index) => `Claim [${index + 1}].`,
     ).join(" ");
     assert.equal(countOrphanCitationMarkers(elevenMarkers, []), 11);
-    assert.equal(
-        countOrphanCitationMarkers(elevenMarkers, [{ ref: 1 }]),
-        10,
-    );
+    assert.equal(countOrphanCitationMarkers(elevenMarkers, [{ ref: 1 }]), 10);
     assert.equal(
         countOrphanCitationMarkers("Alpha [1]. Partial [2]. More [3].", [
             { ref: 1 },
@@ -1134,6 +1561,232 @@ test("duplicate adjacent citation evidence collapses to one marker", () => {
                 { ref: 1, doc_id: "doc-0", page: 1, quote: "same evidence" },
             ],
         },
+    );
+});
+
+test("duplicate marker occurrences keep both evidence destinations with honest tiers", () => {
+    const result = assignCitationSupportByOccurrence(
+        [
+            "Plaintiff says the registration list was inaccurate [1].",
+            "Defendant confirms no demographic tags appeared on these phone lists [1].",
+        ].join("\n"),
+        [
+            {
+                ref: 1,
+                quote: "No demographic tags appeared on these phone lists.",
+            },
+        ],
+    );
+
+    assert.match(result.text, /inaccurate \[1\]/);
+    assert.match(result.text, /phone lists \[2\]/);
+    assert.deepEqual(result.citations, [
+        {
+            ref: 1,
+            quote: "No demographic tags appeared on these phone lists.",
+            support: "unconfirmed",
+        },
+        {
+            ref: 2,
+            quote: "No demographic tags appeared on these phone lists.",
+            support: "verified",
+        },
+    ]);
+    assert.equal(result.citationsVerified, 1);
+    assert.equal(result.citationsUnconfirmed, 1);
+});
+
+test("supported repeat occurrences clone identical evidence under distinct refs", () => {
+    const citation = {
+        ref: 1,
+        doc_id: "doc-0",
+        document_id: "document-a",
+        page: 9,
+        quote: "The same source sentence supports this repeated claim.",
+        chunk_id: "chunk-repeat",
+        quote_start: 40,
+        quote_end: 94,
+        protocol: "handle" as const,
+    };
+    const result = assignCitationSupportByOccurrence(
+        [
+            "The same source sentence supports this repeated claim [1].",
+            "The same source sentence supports this repeated claim [1].",
+            "The same source sentence supports this repeated claim [1].",
+        ].join("\n"),
+        [citation],
+    );
+
+    assert.equal(
+        result.text,
+        [
+            "The same source sentence supports this repeated claim [1].",
+            "The same source sentence supports this repeated claim [2].",
+            "The same source sentence supports this repeated claim [3].",
+        ].join("\n"),
+    );
+    assert.deepEqual(
+        result.citations.map(({ ref }) => ref),
+        [1, 2, 3],
+    );
+    assert.deepEqual(
+        result.citations.map(
+            ({ ref: _ref, support: _support, ...evidence }) => evidence,
+        ),
+        [citation, citation, citation].map(({ ref: _ref, ...evidence }) => ({
+            ...evidence,
+        })),
+    );
+    assert.deepEqual(
+        result.citations.map((citation) => citation.support),
+        ["verified", "verified", "verified"],
+    );
+    assert.equal(result.citationsVerified, 3);
+    assert.equal(result.citationsUnconfirmed, 0);
+    assert.equal(countOrphanCitationMarkers(result.text, result.citations), 0);
+});
+
+test("mixed repeat support assigns the correct tier to every occurrence", () => {
+    const result = assignCitationSupportByOccurrence(
+        [
+            "The verified source says randomized telephone numbers were used [1].",
+            "An unrelated plaintiff claim concerns registration records, procedural history, filing dates, docket management, scheduling orders, discovery deadlines, witness lists, exhibit numbering, hearing logistics, administrative notices, and other matters that do not repeat the verified proposition [1].",
+            "Again, randomized telephone numbers were used [1].",
+        ].join("\n"),
+        [
+            {
+                ref: 1,
+                quote: "Randomized telephone numbers were used.",
+                doc_id: "doc-6",
+                chunk_id: "chunk-defense",
+                quote_start: 10,
+                quote_end: 49,
+            },
+        ],
+    );
+
+    assert.match(result.text, /were used \[1\]/);
+    assert.match(result.text, /verified proposition \[2\]/);
+    assert.match(
+        result.text,
+        /Again, randomized telephone numbers were used \[3\]/,
+    );
+    assert.deepEqual(
+        result.citations.map(({ ref }) => ref),
+        [1, 2, 3],
+    );
+    assert.deepEqual(
+        result.citations.map((citation) => citation.support),
+        ["verified", "unconfirmed", "verified"],
+    );
+    assert.equal(result.citationsVerified, 2);
+    assert.equal(result.citationsUnconfirmed, 1);
+    assert.equal(countOrphanCitationMarkers(result.text, result.citations), 0);
+});
+
+test("single supported citation marker occurrence is scored", () => {
+    const citations = [{ ref: 1, quote: "The exact supported statement." }];
+    assert.deepEqual(
+        assignCitationSupportByOccurrence(
+            "The exact supported statement [1].",
+            citations,
+        ),
+        {
+            text: "The exact supported statement [1].",
+            citations: [
+                {
+                    ref: 1,
+                    quote: "The exact supported statement.",
+                    support: "verified",
+                },
+            ],
+            citationsVerified: 1,
+            citationsUnconfirmed: 0,
+        },
+    );
+});
+
+test("single unsupported citation stays clickable as unconfirmed", () => {
+    const result = assignCitationSupportByOccurrence(
+        "The filing concerned registration records [1].",
+        [
+            {
+                ref: 1,
+                quote: "Randomized telephone numbers were used.",
+                doc_id: "doc-6",
+        },
+        ],
+    );
+
+    assert.equal(result.text, "The filing concerned registration records [1].");
+    assert.deepEqual(result.citations, [
+        {
+            ref: 1,
+            quote: "Randomized telephone numbers were used.",
+            doc_id: "doc-6",
+            support: "unconfirmed",
+        },
+    ]);
+    assert.equal(result.citationsVerified, 0);
+    assert.equal(result.citationsUnconfirmed, 1);
+    assert.equal(countOrphanCitationMarkers(result.text, result.citations), 0);
+});
+
+test("unsupported occurrences remain linked but are never verified", () => {
+    const result = assignCitationSupportByOccurrence(
+        "Unrelated first claim [1]. Another unrelated claim [1].",
+        [{ ref: 1, quote: "Completely different source language." }],
+    );
+    assert.equal(
+        result.text,
+        "Unrelated first claim [1]. Another unrelated claim [2].",
+    );
+    assert.deepEqual(result.citations, [
+        {
+            ref: 1,
+            quote: "Completely different source language.",
+            support: "unconfirmed",
+        },
+        {
+            ref: 2,
+            quote: "Completely different source language.",
+            support: "unconfirmed",
+        },
+    ]);
+    assert.equal(result.citationsVerified, 0);
+    assert.equal(result.citationsUnconfirmed, 2);
+});
+
+test("distinct citation source counting ignores cloned refs and preserves incomplete entries", () => {
+    const sharedSource = {
+        doc_id: "doc-0",
+        document_id: "document-a",
+        chunk_id: "chunk-a",
+        quote_start: 10,
+        quote_end: 30,
+    };
+    assert.equal(
+        countDistinctCitationSources([
+            { ref: 1, ...sharedSource },
+            { ref: 2, ...sharedSource },
+            {
+                ref: 3,
+                ...sharedSource,
+                quote_start: 31,
+                quote_end: 50,
+            },
+            { ref: 4, doc_id: "doc-legacy" },
+            { ref: 5, doc_id: "doc-legacy" },
+            {
+                ref: 6,
+                document_id: "document-b",
+                chunk_id: "chunk-b",
+                quote_start: 0,
+                quote_end: 10,
+                support: "unconfirmed",
+            },
+        ]),
+        4,
     );
 });
 
@@ -1400,11 +2053,11 @@ test("brief sequence workflow uses the evidence-backed novelty recipe", () => {
         workflow?.prompt_md ?? "",
         /same party_side, and a lower brief_sequence/,
     );
+    assert.match(workflow?.prompt_md ?? "", /NEW.*ELABORATED.*REPEATED/s);
     assert.match(
         workflow?.prompt_md ?? "",
-        /NEW.*ELABORATED.*REPEATED/s,
+        /wording change alone is never NEW/,
     );
-    assert.match(workflow?.prompt_md ?? "", /wording change alone is never NEW/);
     assert.match(
         workflow?.prompt_md ?? "",
         /Never assert novelty without evidence/,
