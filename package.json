@@ -61,6 +61,14 @@
     ],
     "extraResources": [
       {
+        "from": "LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "THIRD-PARTY-NOTICES.md",
+        "to": "THIRD-PARTY-NOTICES.md"
+      },
+      {
         "from": "backend/.dist-bundle/dist",
         "to": "backend/dist"
       },

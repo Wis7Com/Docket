@@ -17,8 +17,21 @@ the notices those licenses ask for. It is partly generated: run
 
 The desktop shell is [Electron](https://github.com/electron/electron)
 (MIT), which embeds Chromium (BSD-3-Clause and a large set of compatible
-third-party licenses) and Node.js (MIT). Electron's own aggregated license
-file ships inside the installed application as `LICENSES.chromium.html`.
+third-party licenses) and Node.js (MIT). Electron's aggregated license text
+lives in `LICENSE` and `LICENSES.chromium.html` in the `electron`
+package; electron-builder does not copy them into the macOS `.app`, so this
+file and the repository stand in for them there. Chromium's full notice set
+is at <https://chromium.googlesource.com/chromium/src/+/main/LICENSE>.
+
+### Fonts
+
+The UI self-hosts three font families, all under the **SIL Open Font License
+1.1**: **Inter** and **EB Garamond** (fetched at build time by
+`next/font/google` and served from the app's own origin, not from Google)
+and the **KaTeX** math fonts that ship with the `katex` package. OFL-1.1
+permits bundling and redistribution; it forbids selling the fonts on their
+own and requires this notice to travel with them. License text:
+<https://openfontlicense.org/>.
 
 ### LibreOffice — Windows installer only
 
@@ -28,8 +41,12 @@ licensed under the **Mozilla Public License v2.0**, with portions under the
 GNU Lesser General Public License; see
 <https://www.libreoffice.org/download/license/>. The unmodified upstream MSI is
 downloaded at build time by `scripts/fetch-libreoffice.js` and extracted into
-the installer — Docket does not patch it. LibreOffice is a trademark of The
-Document Foundation; Docket is not affiliated with or endorsed by The Document
+the installer — Docket does not patch it. Docket never links against
+LibreOffice: `backend/src/lib/convert.ts` runs the `soffice` binary as a
+separate child process, so the two are aggregated on a storage medium rather
+than combined into one work, and MPL-2.0's source obligation stays with the
+unmodified upstream files. LibreOffice is a trademark of The Document
+Foundation; Docket is not affiliated with or endorsed by The Document
 Foundation.
 
 macOS and Linux builds do not bundle LibreOffice; they use a system install if
@@ -142,8 +159,16 @@ against a libvips of your choosing. libvips source:
 
 #### UNKNOWN
 
-These packages declare no SPDX identifier in their `package.json`. Consult the
-LICENSE file inside each package before relying on it.
+These packages declare no SPDX identifier in their `package.json`. Most are
+optional peers that npm does not install on this platform and that carry a
+license in their own manifest once installed.
+
+One is a real gap: **`buffers@0.1.1`** (a 2011 package by James Halliday,
+reached through `exceljs` → `unzipper` → `binary`) ships with no license
+field, no LICENSE file, and an upstream repository that no longer exists.
+Strictly it grants no rights. It is a 60-line Buffer helper with no practical
+alternative short of replacing `exceljs`; the exposure is noted here rather
+than left silent.
 
 `@modelcontextprotocol/sdk@*`, `@opentelemetry/api@*`, `@playwright/test@*`, `buffers@0.1.1`, `bufferutil@*`, `sass@*`, `utf-8-validate@*`
 
