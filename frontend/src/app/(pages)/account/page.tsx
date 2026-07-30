@@ -227,8 +227,36 @@ export default function AccountPage() {
           <p>
             Original Mike portions © the Mike contributors. Desktop port
             portions © the mikelocal contributors. Docket modifications © 2026
-            the Docket contributors. Source code, including the full license
-            text, is available in the project repository.
+            the Docket contributors. Docket has modified the mikelocal sources
+            continuously since June 2026.
+          </p>
+          <p>
+            The built-in workflows, other than Issue-by-Issue Comparison and New
+            Arguments Across Brief Sequence, are Open Legal Products&apos; work,
+            reproduced with light edits from{" "}
+            <a
+              href="https://github.com/Open-Legal-Products/mike-workflows"
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-gray-900"
+            >
+              mike-workflows
+            </a>{" "}
+            under the MIT license.
+          </p>
+          <p>
+            Complete corresponding source, the full license text, and the
+            notices for bundled third-party components (LibreOffice, Electron,
+            the OCR models, and the npm dependency tree) are available at{" "}
+            <a
+              href="https://github.com/Wis7Com/Docket"
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-gray-900"
+            >
+              github.com/Wis7Com/Docket
+            </a>
+            .
           </p>
         </div>
       </div>

@@ -28,6 +28,7 @@
     "pretest:e2e-interactive": "node scripts/check-node-version.js",
     "test:e2e-interactive": "npm run build:electron && node scripts/interactive-e2e.js",
     "fetch:libreoffice": "node scripts/fetch-libreoffice.js",
+    "notices": "node scripts/generate-third-party-notices.js",
     "dist": "npm run fetch:libreoffice && npm run build && electron-builder",
     "dist:trace": "npm run fetch:libreoffice && npm run build && electron-builder --publish never",
     "prerebuild-native": "node scripts/check-node-version.js",

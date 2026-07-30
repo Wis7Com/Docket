@@ -20,6 +20,7 @@ import { useDirectoryData } from "../shared/useDirectoryData";
 import { FileDirectory } from "../shared/FileDirectory";
 import type { DocketProject } from "../shared/types";
 import { useChatHistoryContext } from "@/app/contexts/ChatHistoryContext";
+import { WorkflowAttributionNote } from "./WorkflowAttributionNote";
 
 interface Props {
     workflows: DocketWorkflow[];
@@ -175,10 +176,14 @@ function MarkdownBody({ content }: { content: string }) {
 function AssistantPanel({ workflow }: { workflow: DocketWorkflow }) {
     return (
         <div className="flex-1 border-l border-t border-gray-200 flex flex-col overflow-hidden px-3 pb-3">
-            <div className="py-3 shrink-0">
+            <div className="py-3 shrink-0 flex items-baseline justify-between gap-3">
                 <p className="text-xs font-medium text-gray-700">
                     Workflow Prompt
                 </p>
+                <WorkflowAttributionNote
+                    attribution={workflow.attribution}
+                    className="truncate"
+                />
             </div>
             <div className="flex-1 overflow-y-auto px-4 py-3 text-sm border border-gray-200 rounded-md text-gray-600 leading-relaxed font-serif bg-gray-50">
                 <MarkdownBody
@@ -200,8 +205,12 @@ function TabularPanel({ workflow }: { workflow: DocketWorkflow }) {
 
     return (
         <div className="flex-1 border-l border-t border-gray-200 flex flex-col overflow-hidden px-3 pb-3">
-            <div className="py-3 shrink-0">
+            <div className="py-3 shrink-0 flex items-baseline justify-between gap-3">
                 <p className="text-xs font-medium text-gray-700">Columns</p>
+                <WorkflowAttributionNote
+                    attribution={workflow.attribution}
+                    className="truncate"
+                />
             </div>
             <div className="flex-1 overflow-y-auto border border-gray-200 rounded-md bg-gray-50">
                 {columns.length === 0 ? (

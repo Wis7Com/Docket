@@ -827,6 +827,11 @@ legal platform. All three are licensed under **AGPL-3.0-only**. See
 `LICENSE` for the full text. All derivative source remains open under
 the same terms.
 
+**Docket has modified the mikelocal sources continuously since
+2026-06-25.** Roughly 32,000 lines of the upstream tree survive
+unmodified; the Next.js + Express architecture, the chat and tabular
+review UI, and the workflow system are upstream work.
+
 - Original Mike portions © the Mike contributors.
 - Desktop port portions (Electron shell, SQLite/filesystem/auth
   rewiring, Windows packaging) © the mikelocal contributors.
@@ -834,9 +839,30 @@ the same terms.
   search, local OCR, PDF annotation workflow, annotation- and
   document-scoped chat, local providers, rebrand) © 2026 the Docket
   contributors.
+- **Built-in workflows** — every built-in workflow except
+  *Issue-by-Issue Comparison* and *New Arguments Across Brief Sequence*
+  is Open Legal Products' work, reproduced with light edits (tool names
+  and citation requirements adapted to Docket's retrieval tools) from
+  [mike-workflows](https://github.com/Open-Legal-Products/mike-workflows)
+  under the **MIT** license. The workflow UI credits the author
+  per workflow; the MIT notice is reproduced in
+  `THIRD-PARTY-NOTICES.md`.
 - Parts of the product design were inspired by
   [Docufinder](https://github.com/chrisryugj/Docufinder); Docket contains
   no Docufinder code.
 - "Mike" is the upstream project's name; Docket is an independent
   derivative and is not affiliated with or endorsed by the Mike or
   mikelocal projects.
+
+### Third-party components
+
+`LICENSE` covers Docket's own source. The installer also bundles other
+people's work with its own notice requirements — Electron and Chromium,
+LibreOffice (MPL-2.0, Windows only), the PaddleOCR models fetched at run
+time (Apache-2.0), the libvips shared libraries behind `sharp`
+(LGPL-3.0-or-later), and ~866 npm packages. All of it is itemised in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md), regenerated with:
+
+```bash
+npm run notices
+```

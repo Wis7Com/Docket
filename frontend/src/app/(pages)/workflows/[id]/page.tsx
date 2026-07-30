@@ -16,6 +16,7 @@ import {
 } from "@/app/components/workflows/builtinWorkflows";
 import { formatIcon, formatLabel } from "@/app/components/tabular/columnFormat";
 import { RenameableTitle } from "@/app/components/shared/RenameableTitle";
+import { WorkflowAttributionNote } from "@/app/components/workflows/WorkflowAttributionNote";
 // dynamic import keeps Tiptap (browser-only) out of the SSR bundle
 const WorkflowPromptEditor = dynamic(
     () =>
@@ -301,8 +302,9 @@ export default function WorkflowDetailPage({ params }: Props) {
 
             {/* Read-only badge for built-in workflows */}
             {readOnly && (
-                <div className="flex items-center h-10 px-8 border-b border-gray-200">
+                <div className="flex items-center justify-between gap-3 h-10 px-8 border-b border-gray-200">
                     <span className="text-xs text-gray-400">Read-only</span>
+                    <WorkflowAttributionNote attribution={workflow.attribution} />
                 </div>
             )}
 

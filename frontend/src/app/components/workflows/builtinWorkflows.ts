@@ -1,4 +1,21 @@
-import type { DocketWorkflow } from "../shared/types";
+import type { DocketWorkflow, WorkflowAttribution } from "../shared/types";
+
+/**
+ * Most built-in prompts are Open Legal Products' work, published as SKILL.md
+ * files under MIT and reproduced here with light edits (tool names and citation
+ * requirements adapted to Docket's retrieval tools). Credit them in the UI.
+ */
+const OPEN_LEGAL_PRODUCTS: WorkflowAttribution = {
+    author: "Open Legal Products",
+    license: "MIT",
+    url: "https://github.com/Open-Legal-Products/mike-workflows",
+};
+
+/** Written for Docket, and covered by the repository's AGPL-3.0-only license. */
+const DOCKET: WorkflowAttribution = {
+    author: "Docket",
+    license: "AGPL-3.0-only",
+};
 
 export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
     {
@@ -9,6 +26,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Generate CP Checklist",
         type: "assistant",
         practice: "General Transactions",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md:
             "## Generate Conditions Precedent Checklist\n\n" +
             "Review the uploaded credit agreement or financing document and generate a comprehensive " +
@@ -34,6 +52,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Issue-by-Issue Comparison",
         type: "assistant",
         practice: "General Transactions",
+        attribution: DOCKET,
         prompt_md:
             "## Issue-by-Issue Comparison\n\n" +
             "Compare two or more selected documents, or two sides' briefs, issue-by-issue. If it is unclear which documents or sides the user wants compared, ask once before proceeding.\n\n" +
@@ -54,6 +73,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Change of Control Review",
         type: "tabular",
         practice: "Corporate",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md:
             "## Change of Control Due Diligence Review\n\n" +
             "This workflow performs a change of control due diligence review across the selected documents.",
@@ -111,6 +131,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Credit Agreement Summary",
         type: "assistant",
         practice: "Finance",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md:
             "## Credit Agreement Summary\n\n" +
             "Review the uploaded credit agreement and produce a comprehensive legal summary covering the following topics. " +
@@ -149,6 +170,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Commercial Agreement Review",
         type: "tabular",
         practice: "General Transactions",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -271,6 +293,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Credit Agreement Review",
         type: "tabular",
         practice: "Finance",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -411,6 +434,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "E-Discovery Review",
         type: "tabular",
         practice: "Litigation",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -467,6 +491,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Supply Agreement Review",
         type: "tabular",
         practice: "General Transactions",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -565,6 +590,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "SPA Review",
         type: "tabular",
         practice: "Corporate",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -657,6 +683,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "NDA Review",
         type: "tabular",
         practice: "General Transactions",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -726,6 +753,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Commercial Lease Review",
         type: "tabular",
         practice: "Real Estate",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -860,6 +888,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Limited Partnership Agreement Review",
         type: "tabular",
         practice: "Private Equity",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -994,6 +1023,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Shareholder Agreement Summary",
         type: "assistant",
         practice: "Corporate",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md:
             "## Shareholder Agreement Summary\n\n" +
             "Review the uploaded shareholder agreement and produce a comprehensive legal summary covering the following topics. " +
@@ -1026,6 +1056,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Shareholder Agreement Review",
         type: "tabular",
         practice: "Corporate",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {
@@ -1160,6 +1191,7 @@ export const BUILT_IN_WORKFLOWS: DocketWorkflow[] = [
         title: "Employment Agreement Review",
         type: "tabular",
         practice: "Employment",
+        attribution: OPEN_LEGAL_PRODUCTS,
         prompt_md: null,
         columns_config: [
             {

@@ -31,6 +31,31 @@ test("frontend built-in workflows keep the upstream Mike catalog ids", () => {
     }
 });
 
+test("every built-in workflow credits whoever wrote its prompt", () => {
+    // Most built-in prompts are Open Legal Products' MIT-licensed work. A new
+    // built-in shipping without attribution would silently present someone
+    // else's prompt as Docket's, so require the field rather than defaulting it.
+    const DOCKET_AUTHORED = new Set(["builtin-issue-comparison"]);
+
+    for (const workflow of BUILT_IN_WORKFLOWS) {
+        const attribution = workflow.attribution;
+        assert.ok(attribution, `${workflow.id} needs an attribution`);
+        assert.ok(
+            attribution.author.trim(),
+            `${workflow.id} needs an attribution author`,
+        );
+        assert.ok(
+            attribution.license.trim(),
+            `${workflow.id} needs an attribution license`,
+        );
+        assert.equal(
+            attribution.author,
+            DOCKET_AUTHORED.has(workflow.id) ? "Docket" : "Open Legal Products",
+            `${workflow.id} is credited to the wrong author`,
+        );
+    }
+});
+
 test("assistant and tabular built-in workflows remain executable", () => {
     const assistant = BUILT_IN_WORKFLOWS.filter(
         (workflow) => workflow.type === "assistant",

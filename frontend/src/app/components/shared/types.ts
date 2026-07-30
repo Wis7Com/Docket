@@ -439,6 +439,18 @@ export interface TabularCell {
 
 // Workflows
 
+/**
+ * Who wrote a workflow's prompt, and under what terms. The Source column shows
+ * how a workflow reached your workspace (built-in / mine / shared); this is the
+ * separate question of authorship, which matters because most built-in prompts
+ * are third-party work. See THIRD-PARTY-NOTICES.md.
+ */
+export interface WorkflowAttribution {
+    author: string;
+    license: string;
+    url?: string;
+}
+
 export interface DocketWorkflow {
     id: string;
     user_id: string | null;
@@ -452,6 +464,7 @@ export interface DocketWorkflow {
     shared_by_name?: string | null;
     allow_edit?: boolean;
     is_owner?: boolean;
+    attribution?: WorkflowAttribution | null;
 }
 
 // API helpers
