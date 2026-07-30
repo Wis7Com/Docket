@@ -525,19 +525,14 @@ async function runSessionFeatureSmoke(
       summary: `project_folder_imported=${projectFolderInspection.imported} project_folder_index_ready=${projectFolderInspection.indexReady} project_folder_index_failed=${projectFolderInspection.indexFailed} project_folder_search=${projectFolderInspection.searchResults} project_folder_citations=${projectFolderInspection.citationButtonCount} project_folder_temp_highlights=${projectFolderInspection.temporaryHighlightCount} project_folder_promotions=${projectFolderInspection.citationPromotionCount} project_folder_ui_highlights=${projectFolderInspection.userHighlightCount} project_folder_ui_comments=${projectFolderInspection.userCommentCount} project_folder_no_doc_labels=${projectFolderInspection.answerAvoidsDocLabels} project_folder_citation_error=${Boolean(projectFolderInspection.citationError)}`,
     };
   }
-  const sourceDir = process.env.DOCKET_SESSION_CHECK_SOURCE_DIR;
-  if (!sourceDir) return { ok: true, summary: "skipped" };
   const projectPath = process.env.DOCKET_SESSION_CHECK_PROJECT_PATH;
-  if (!projectPath) {
-    throw new Error("DOCKET_SESSION_CHECK_PROJECT_PATH is required for feature smoke");
-  }
+  if (!projectPath) return { ok: true, summary: "skipped" };
   const result = await w.webContents.executeJavaScript(
     `
       (async () => {
         const token = await window.docket?.getToken?.();
         if (!token) throw new Error("session smoke token missing");
         const base = "http://localhost:${port}";
-        const sourceDir = ${JSON.stringify(sourceDir)};
         const projectPath = ${JSON.stringify(projectPath)};
         async function request(path, init = {}) {
           const response = await fetch(base + path, {
@@ -593,20 +588,30 @@ async function runSessionFeatureSmoke(
         }
         const markdownDoc = await markdownResponse.json();
         if (!markdownDoc?.id) throw new Error("markdown upload did not return a document id");
-        const linked = await request("/projects/" + project.id + "/source-folders", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: sourceDir }),
-        });
-        if (linked.imported?.length !== 1) {
-          throw new Error("expected one linked-folder import");
+        // The project folder is its own source folder — the scan that runs on
+        // open is what links session-source.pdf. There is no separate
+        // link-an-outside-folder door to exercise any more. The session may
+        // already have opened (and scanned) this folder before the smoke ran,
+        // so accept the file as either a fresh import or an unchanged one.
+        const scan = project.scan ?? {};
+        const scanSawSourcePdf =
+          (scan.imported ?? []).some((row) => row.filename === "session-source.pdf") ||
+          (scan.unchanged ?? []).includes("session-source.pdf");
+        if (!scanSawSourcePdf) {
+          throw new Error("project-folder scan did not pick up session-source.pdf: " + JSON.stringify(scan));
         }
-        const doc = linked.imported[0];
+        const projectDocuments = await request("/projects/" + project.id + "/documents");
+        const doc = (projectDocuments ?? []).find(
+          (row) => row.filename === "session-source.pdf",
+        );
         if (!doc?.id || !doc?.current_version_id) {
-          throw new Error("linked import missing document/version id");
+          throw new Error("scanned source PDF missing document/version id");
+        }
+        if (!project.source_folder?.id) {
+          throw new Error("open-folder response did not return a source folder");
         }
         const rescan = await request(
-          "/projects/" + project.id + "/source-folders/" + linked.source_folder.id + "/rescan",
+          "/projects/" + project.id + "/source-folders/" + project.source_folder.id + "/rescan",
           { method: "POST" },
         );
         if (!rescan.unchanged?.includes("session-source.pdf")) {
@@ -664,14 +669,18 @@ async function runSessionFeatureSmoke(
           docId: doc.id,
           markdownDocId: markdownDoc.id,
           versionId: comment.version_id || annotationVersionId,
-          sourceFolderId: linked.source_folder.id,
-          imported: linked.imported.length,
+          sourceFolderId: project.source_folder.id,
+          scanned: (scan.imported ?? []).length + (scan.unchanged ?? []).length,
           unchanged: rescan.unchanged.length,
+          unchangedFiles: rescan.unchanged,
           annotations: annotations.length,
         };
       })()
     `,
     true,
+  );
+  console.log(
+    `[session-check] rescan unchanged: ${(result.unchangedFiles ?? []).join(", ")}`,
   );
   const uiRescan = await inspectProjectSourceFolderRescanDom(
     w,
@@ -758,7 +767,7 @@ async function runSessionFeatureSmoke(
   }
   return {
     ok: true,
-    summary: `imported=${result.imported} unchanged=${result.unchanged} ui_rescan=${uiRescan.summaryText} annotations=${result.annotations} dom_canvas=${domInspection.canvasCount} dom_overlays=${domInspection.savedAnnotationCount} text_select=${domInspection.textLayerSelection.pointerEvents}/${domInspection.textLayerSelection.userSelect}/${domInspection.textLayerSelection.spanUserSelect} ui_highlight=${domInspection.highlightAnnotationCount} ui_comment=${domInspection.commentAnnotationCount} selection_annotations=${domInspection.annotationCountAfterSelection} citation_highlights=${citationInspection.temporaryHighlightCount} citation_promotions=${citationInspection.citationPromotionCount} real_prompt_citations=${realPromptInspection.citationButtonCount} real_prompt_highlights=${realPromptInspection.temporaryHighlightCount} real_prompt_answer=${realPromptInspection.answerIncludesQuote} real_prompt_answer_reload=${realPromptInspection.answerSurvivesReload} project_tabs=${realPromptInspection.tabCount} project_tab_nav=${realPromptInspection.tabNavigationVerified} project_tab_overflow=${realPromptInspection.tabStripOverflow}${projectFolderInspection ? ` project_folder_imported=${projectFolderInspection.imported} project_folder_index_ready=${projectFolderInspection.indexReady} project_folder_index_failed=${projectFolderInspection.indexFailed} project_folder_search=${projectFolderInspection.searchResults} project_folder_citations=${projectFolderInspection.citationButtonCount} project_folder_temp_highlights=${projectFolderInspection.temporaryHighlightCount} project_folder_promotions=${projectFolderInspection.citationPromotionCount} project_folder_ui_highlights=${projectFolderInspection.userHighlightCount} project_folder_ui_comments=${projectFolderInspection.userCommentCount} project_folder_no_doc_labels=${projectFolderInspection.answerAvoidsDocLabels} project_folder_citation_error=${Boolean(projectFolderInspection.citationError)}` : ""} pdf_button_export=${exportResult.clickedExportButton} exported_v=${exportResult.exportedVersion} pdf_bytes=${pdfInspection.byteLength}`,
+    summary: `scanned=${result.scanned} unchanged=${result.unchanged} ui_rescan=${uiRescan.summaryText} annotations=${result.annotations} dom_canvas=${domInspection.canvasCount} dom_overlays=${domInspection.savedAnnotationCount} text_select=${domInspection.textLayerSelection.pointerEvents}/${domInspection.textLayerSelection.userSelect}/${domInspection.textLayerSelection.spanUserSelect} ui_highlight=${domInspection.highlightAnnotationCount} ui_comment=${domInspection.commentAnnotationCount} selection_annotations=${domInspection.annotationCountAfterSelection} citation_highlights=${citationInspection.temporaryHighlightCount} citation_promotions=${citationInspection.citationPromotionCount} real_prompt_citations=${realPromptInspection.citationButtonCount} real_prompt_highlights=${realPromptInspection.temporaryHighlightCount} real_prompt_answer=${realPromptInspection.answerIncludesQuote} real_prompt_answer_reload=${realPromptInspection.answerSurvivesReload} project_tabs=${realPromptInspection.tabCount} project_tab_nav=${realPromptInspection.tabNavigationVerified} project_tab_overflow=${realPromptInspection.tabStripOverflow}${projectFolderInspection ? ` project_folder_imported=${projectFolderInspection.imported} project_folder_index_ready=${projectFolderInspection.indexReady} project_folder_index_failed=${projectFolderInspection.indexFailed} project_folder_search=${projectFolderInspection.searchResults} project_folder_citations=${projectFolderInspection.citationButtonCount} project_folder_temp_highlights=${projectFolderInspection.temporaryHighlightCount} project_folder_promotions=${projectFolderInspection.citationPromotionCount} project_folder_ui_highlights=${projectFolderInspection.userHighlightCount} project_folder_ui_comments=${projectFolderInspection.userCommentCount} project_folder_no_doc_labels=${projectFolderInspection.answerAvoidsDocLabels} project_folder_citation_error=${Boolean(projectFolderInspection.citationError)}` : ""} pdf_button_export=${exportResult.clickedExportButton} exported_v=${exportResult.exportedVersion} pdf_bytes=${pdfInspection.byteLength}`,
   };
 }
 

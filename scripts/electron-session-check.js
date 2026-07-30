@@ -20,9 +20,6 @@ const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "docket-session-check-
 const userDataRoot = fs.mkdtempSync(
   path.join(os.tmpdir(), "docket-session-user-data-"),
 );
-const sourceRoot = fs.mkdtempSync(
-  path.join(os.tmpdir(), "docket-session-source-"),
-);
 const promptSourceRoot = fs.mkdtempSync(
   path.join(os.tmpdir(), "docket-session-prompt-source-"),
 );
@@ -36,7 +33,9 @@ async function main() {
   fs.mkdirSync(path.join(projectRoot, ".docket"), { recursive: true });
   fs.mkdirSync(path.join(projectRoot, "files"), { recursive: true });
   if (!defaultSessionCheck) {
-    await writeSamplePdf(path.join(sourceRoot, "session-source.pdf"));
+    // Lives in the project folder itself: a project *is* its folder, so the
+    // scan that runs on open is the only way documents get linked now.
+    await writeSamplePdf(path.join(projectRoot, "session-source.pdf"));
     await writePromptSourceFolder(promptSourceRoot);
   }
   // Bookmark-less PDF with numbered/large headings across two pages. The
@@ -56,7 +55,6 @@ async function main() {
       }
     : {
         DOCKET_SESSION_CHECK_PROJECT_PATH: projectRoot,
-        DOCKET_SESSION_CHECK_SOURCE_DIR: sourceRoot,
         DOCKET_SESSION_CHECK_PROMPT_SOURCE_DIR: promptSourceRoot,
         DOCKET_SESSION_CHECK_OUTLINE_PDF_B64: outlinePdfB64,
       };
@@ -519,7 +517,6 @@ function stopFrontend() {
 function cleanupTempDirs() {
   fs.rmSync(projectRoot, { recursive: true, force: true });
   fs.rmSync(userDataRoot, { recursive: true, force: true });
-  fs.rmSync(sourceRoot, { recursive: true, force: true });
   fs.rmSync(promptSourceRoot, { recursive: true, force: true });
   console.log("[session-check] temporary directories cleaned up");
 }
