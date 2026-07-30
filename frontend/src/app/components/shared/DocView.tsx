@@ -39,6 +39,10 @@ import {
     updatePdfAnnotation,
 } from "@/app/lib/docketApi";
 import { useSelectedModel } from "@/app/hooks/useSelectedModel";
+import {
+    browserSavePdfDeps,
+    savePdfToChosenFolder,
+} from "@/app/lib/savePdfAs";
 import { DocxView } from "./DocxView";
 import { MarkdownDocView } from "./MarkdownDocView";
 import { ImageDocView } from "./ImageDocView";
@@ -2636,15 +2640,18 @@ export function DocView({
                     null,
             );
             const resolved = await getDocumentUrl(doc.document_id, version.id);
-            const a = document.createElement("a");
-            a.href = resolved.url;
-            a.download = resolved.filename;
-            a.rel = "noopener";
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
+            showAnnotationStatus("Choose where to save...");
+            const outcome = await savePdfToChosenFolder(
+                resolved.url,
+                resolved.filename,
+                browserSavePdfDeps(),
+            );
             setSelectedAnnotationId(null);
-            showAnnotationStatus(`Exported ${resolved.filename}`, 2400);
+            if (outcome.status === "canceled") {
+                showAnnotationStatus(null);
+                return;
+            }
+            showAnnotationStatus(`Saved ${resolved.filename}`, 2400);
         } catch (err) {
             showAnnotationStatus(null);
             setAnnotationError(

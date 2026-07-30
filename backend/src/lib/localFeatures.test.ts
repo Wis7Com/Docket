@@ -1364,7 +1364,13 @@ test("PDF annotation routes keep metadata separate until explicit export", async
         annotation_type: "highlight",
         color: "#ffe066",
         quote: "version one",
-        rects: [{ page: 1, x: 72, y: 690, width: 160, height: 20 }],
+        // Three rects, as a highlight dragged across three wrapped lines
+        // produces. Export must still emit ONE annotation covering all three.
+        rects: [
+          { page: 1, x: 72, y: 690, width: 160, height: 20 },
+          { page: 1, x: 72, y: 668, width: 160, height: 20 },
+          { page: 1, x: 72, y: 646, width: 90, height: 20 },
+        ],
         source: "citation_promotion",
         source_citation: { ref: 1, document_id: documentId, page: 1 },
       }),
@@ -1555,6 +1561,14 @@ test("PDF annotation routes keep metadata separate until explicit export", async
         (a) => a.subtype === "/Highlight" && a.contents.includes("version one"),
       ),
       "highlight annotation should preserve quote contents",
+    );
+    const exportedHighlight = exportedAnnots.find(
+      (a) => a.subtype === "/Highlight",
+    );
+    assert.equal(
+      exportedHighlight?.quadPointCount,
+      3,
+      "a highlight covering three lines should export as one annotation with three quads, not three annotations",
     );
     assert.ok(
       exportedAnnots.some(
@@ -1752,12 +1766,19 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 
 function readPdfAnnotations(
   annots: PDFArray,
-): { subtype: string; contents: string; name: string; flags: number }[] {
+): {
+  subtype: string;
+  contents: string;
+  name: string;
+  flags: number;
+  quadPointCount: number;
+}[] {
   const rows: {
     subtype: string;
     contents: string;
     name: string;
     flags: number;
+    quadPointCount: number;
   }[] = [];
   for (let i = 0; i < annots.size(); i += 1) {
     const annot = annots.lookup(i, PDFDict);
@@ -1769,11 +1790,14 @@ function readPdfAnnotations(
     );
     const name = annot.lookupMaybe(PDFName.of("NM"), PDFString, PDFHexString);
     const flags = annot.lookupMaybe(PDFName.of("F"), PDFNumber);
+    const quads = annot.lookupMaybe(PDFName.of("QuadPoints"), PDFArray);
     rows.push({
       subtype,
       contents: contents?.decodeText() ?? "",
       name: name?.decodeText() ?? "",
       flags: flags?.asNumber() ?? 0,
+      // Eight numbers per covered quad.
+      quadPointCount: quads ? quads.size() / 8 : 0,
     });
   }
   return rows;

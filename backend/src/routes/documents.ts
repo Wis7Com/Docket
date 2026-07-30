@@ -1312,11 +1312,22 @@ function addEditablePdfAnnotations(
 ): void {
   for (const ann of annotations) {
     const color = parseHexColor(ann.color);
-    ann.rects.forEach((rect, rectIndex) => {
-      if (rect.page < 1 || rect.page > pdfDoc.getPageCount()) return;
-      const page = pdfDoc.getPage(rect.page - 1);
-      addPdfAnnotationObject(pdfDoc, page, ann, rect, color, rectIndex);
-    });
+    // One PDF annotation per page, not per rect. A highlight spanning three
+    // lines has three rects, and emitting one annotation each made external
+    // readers show it as three separate highlights with three duplicate
+    // comments. A Highlight annotation is designed for exactly this: one
+    // object whose QuadPoints list every covered quad.
+    const rectsByPage = new Map<number, PdfAnnotationRect[]>();
+    for (const rect of ann.rects) {
+      if (rect.page < 1 || rect.page > pdfDoc.getPageCount()) continue;
+      const pageRects = rectsByPage.get(rect.page) ?? [];
+      pageRects.push(rect);
+      rectsByPage.set(rect.page, pageRects);
+    }
+    for (const [pageNumber, pageRects] of rectsByPage) {
+      const page = pdfDoc.getPage(pageNumber - 1);
+      addPdfAnnotationObject(pdfDoc, page, ann, pageRects, color, pageNumber);
+    }
   }
 }
 
@@ -1470,8 +1481,9 @@ async function readPdfAnnotationsForSync(
       const dict = candidate;
       const subtype = String(dict.get(PDFName.of("Subtype")));
       if (subtype !== "/Highlight" && subtype !== "/Text") continue;
-      const rect = readRectFromAnnotation(dict, pageIndex + 1);
-      if (!rect) continue;
+      const rects = readRectsFromAnnotation(dict, pageIndex + 1);
+      if (rects.length === 0) continue;
+      const rect = rects[0];
       const contents = readPdfText(dict.get(PDFName.of("Contents")));
       const annotationType = subtype === "/Text" ? "comment" : "highlight";
       const color = readColorFromAnnotation(dict);
@@ -1494,7 +1506,7 @@ async function readPdfAnnotationsForSync(
         comment: annotationType === "comment" ? contents : null,
         rects: [],
       };
-      next.rects.push(rect);
+      next.rects.push(...rects);
       grouped.set(id, next);
     }
   }
@@ -1525,12 +1537,25 @@ function addPdfAnnotationObject(
   pdfDoc: PDFDocument,
   page: PDFPage,
   ann: FormattedPdfAnnotation,
-  rect: PdfAnnotationRect,
+  rects: PdfAnnotationRect[],
   color: { r: number; g: number; b: number },
-  rectIndex: number,
+  pageNumber: number,
 ): void {
+  if (rects.length === 0) return;
   const annots = ensurePageAnnots(pdfDoc, page);
-  const bounds = [rect.x, rect.y, rect.x + rect.width, rect.y + rect.height];
+  // A highlight's /Rect must enclose every quad it covers. A comment is an
+  // icon, not a span, so it stays anchored at the first rect — one marker
+  // where the annotated text begins rather than one per line.
+  const anchor = rects[0];
+  const bounds =
+    ann.annotation_type === "comment"
+      ? [anchor.x, anchor.y, anchor.x + anchor.width, anchor.y + anchor.height]
+      : [
+          Math.min(...rects.map((r) => r.x)),
+          Math.min(...rects.map((r) => r.y)),
+          Math.max(...rects.map((r) => r.x + r.width)),
+          Math.max(...rects.map((r) => r.y + r.height)),
+        ];
   const contents =
     ann.comment?.trim() || ann.quote?.trim() || "Docket annotation";
   const subtype =
@@ -1543,7 +1568,7 @@ function addPdfAnnotationObject(
     Rect: bounds,
     C: [color.r, color.g, color.b],
     Contents: PDFHexString.fromText(contents),
-    NM: PDFHexString.fromText(`docket:${ann.id}:${rectIndex}`),
+    NM: PDFHexString.fromText(`docket:${ann.id}:${pageNumber}`),
     T: PDFHexString.fromText("Docket Local"),
     M: PDFHexString.fromText(
       new Date(ann.updated_at || ann.created_at).toISOString(),
@@ -1556,16 +1581,20 @@ function addPdfAnnotationObject(
   if (ann.annotation_type === "highlight") {
     dict.set(
       PDFName.of("QuadPoints"),
-      pdfDoc.context.obj([
-        rect.x,
-        rect.y + rect.height,
-        rect.x + rect.width,
-        rect.y + rect.height,
-        rect.x,
-        rect.y,
-        rect.x + rect.width,
-        rect.y,
-      ]),
+      // Eight numbers per covered quad, in the spec's corner order:
+      // upper-left, upper-right, lower-left, lower-right.
+      pdfDoc.context.obj(
+        rects.flatMap((rect) => [
+          rect.x,
+          rect.y + rect.height,
+          rect.x + rect.width,
+          rect.y + rect.height,
+          rect.x,
+          rect.y,
+          rect.x + rect.width,
+          rect.y,
+        ]),
+      ),
     );
     dict.set(PDFName.of("CA"), pdfDoc.context.obj(0.34));
   } else {
@@ -1610,6 +1639,35 @@ function docketAnnotationIdFromDict(dict: PDFDict): string | null {
   const raw = readPdfText(dict.get(PDFName.of("NM")));
   const match = raw.match(/^docket:([^:]+)(?::\d+)?$/);
   return match?.[1] ?? null;
+}
+
+// A highlight carries one quad per covered line in /QuadPoints, while /Rect is
+// only their bounding box. Reading /Rect alone would turn a three-line
+// highlight into one block covering the margins between those lines, so prefer
+// the quads and fall back to /Rect when an annotation has none.
+function readRectsFromAnnotation(
+  dict: PDFDict,
+  pageNumber: number,
+): PdfAnnotationRect[] {
+  const quads = dict.get(PDFName.of("QuadPoints"));
+  if (quads instanceof PDFArray) {
+    const values = readPdfNumberArray(quads);
+    const rects: PdfAnnotationRect[] = [];
+    for (let i = 0; i + 8 <= values.length; i += 8) {
+      const xs = [values[i], values[i + 2], values[i + 4], values[i + 6]];
+      const ys = [values[i + 1], values[i + 3], values[i + 5], values[i + 7]];
+      const x = Math.min(...xs);
+      const y = Math.min(...ys);
+      const width = Math.max(...xs) - x;
+      const height = Math.max(...ys) - y;
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      if (width <= 0 || height <= 0) continue;
+      rects.push({ page: pageNumber, x, y, width, height });
+    }
+    if (rects.length > 0) return rects;
+  }
+  const rect = readRectFromAnnotation(dict, pageNumber);
+  return rect ? [rect] : [];
 }
 
 function readRectFromAnnotation(

@@ -79,6 +79,8 @@ contextBridge.exposeInMainWorld("docket", {
     }
   },
   pickSourceFolder: () => ipcRenderer.invoke("docket:pickSourceFolder"),
+  // Export PDF — main shows the save dialog so the user chooses the folder.
+  savePdfAs: (payload) => ipcRenderer.invoke("docket:savePdfAs", payload),
   authorizeProjectFolder: (payload) =>
     ipcRenderer.invoke("docket:authorizeProjectFolder", payload),
 });
