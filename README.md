@@ -17,7 +17,8 @@ Docket extends that desktop base with self-contained local project
 folders (app-level state under Electron `userData`, project data under
 each project's `.docket/` directory), hybrid document indexing and
 search with optional embeddings, local OCR for scanned PDFs and images,
-a full PDF annotation workflow
+native support for HWPX (Hancom Office / 한글) documents alongside PDF
+and Word, a full PDF annotation workflow
 (highlights, comments, citation promotion, PDF export), annotation- and
 document-scoped chat, and a bundled-LibreOffice installer — see
 the feature overview below.
@@ -243,6 +244,32 @@ citation has no PDF text layer to match, clicking the citation retrieves
 those local regions and paints the cited passage in the existing PDF
 highlight overlay.
 
+### HWPX (Hancom Office) documents
+
+`.hwpx` files — the Hancom Office (한글) format widely used by Korean
+courts, agencies, and law firms — upload, display, index, and answer
+questions like any PDF or Word file: folder scan, upload, the viewer, keyword and
+semantic search, page-numbered citations, document chat, and tabular
+review.
+
+LibreOffice cannot open HWPX, so Docket reads the format itself. Text is
+extracted straight from the document's XML; for display the document is
+rebuilt as a DOCX and rendered to PDF through the same LibreOffice
+pipeline Word files use, carrying tables (merged cells, borders,
+shading), images, indents, and fonts. Without LibreOffice the document
+still opens in the built-in DOCX viewer.
+
+Two details matter for legal text and are handled rather than lost:
+HWP generates list numbers (`1.`, `가.`) and footnote numbers only when
+it draws the page — they are not in the stored text — so Docket
+regenerates them, which keeps references like "청구취지 2.나." intact.
+Password-protected or renamed files are refused at upload with the
+reason instead of being stored unreadable.
+
+HWPX is read-only (tracked-change editing remains DOCX-only), and the
+older binary `.hwp` format is not supported — save it as `.hwpx` from
+Hancom Office first.
+
 ### PDF annotation workflow: highlights, comments, citations, export
 
 Text-selection highlights and comments stored as app-owned metadata,
@@ -404,18 +431,18 @@ directly on launch; use your OS account, disk encryption, and normal file
 permissions to protect app data and project folders.
 
 **Windows**: LibreOffice ships bundled with the installer (~330 MB
-extracted), so DOCX/DOC files render as PDF previews out of the box. No
+extracted), so DOCX/DOC/HWPX files render as PDF previews out of the box. No
 separate install needed.
 
 **macOS / Linux**: LibreOffice is *not* bundled (bundling is Windows-only
-by design — see `scripts/fetch-libreoffice.js`). DOCX→PDF conversion
+by design — see `scripts/fetch-libreoffice.js`). DOCX/HWPX→PDF conversion
 falls back to a system-installed LibreOffice if one is found at
 `/Applications/LibreOffice.app`, `/usr/local/bin/soffice`,
-`/usr/bin/soffice`, or on `PATH`. Without one, DOCX files still upload
-and the assistant can still read/edit them — only the rendered PDF
-preview is unavailable. Install
+`/usr/bin/soffice`, or on `PATH`. Without one, DOCX and HWPX files
+still upload and the assistant can still read them (and edit DOCX) —
+only the rendered PDF preview is unavailable. Install
 [LibreOffice](https://www.libreoffice.org/download/download/) separately
-if you need DOCX preview rendering.
+if you need DOCX/HWPX preview rendering.
 
 ### Backing up
 
@@ -454,8 +481,9 @@ registry/profile/session state, delete Electron's `userData` directory.
   or embedding run finishes — click through to the result.
 - **Built-in legal workflows**: prebuilt prompt templates for common
   document-review tasks (contract review, NDA triage, etc.).
-- **DOCX conversion** via bundled LibreOffice, so Word files render as
-  PDFs inside the app.
+- **DOCX and HWPX conversion** via bundled LibreOffice, so Word and
+  Hancom Office (한글) files render as PDFs inside the app. HWPX is read
+  by Docket's own parser first, since LibreOffice cannot open it.
 - **No telemetry, no analytics, no remote calls** beyond the model
   provider you configured.
 
@@ -483,7 +511,7 @@ keep the CPU-only rows entirely local.
 | Projects, folders, per-project organisation | ✅ | — |
 | Document upload & viewing (PDF, DOCX, DOC, HWPX, TXT, PNG/JPEG, TIFF, BMP, WebP) | ✅ | — |
 | Local OCR for scanned PDFs and images | ✅ | — |
-| DOCX/DOC → PDF conversion (bundled LibreOffice) | ✅ | — |
+| DOCX/DOC/HWPX → PDF conversion (bundled LibreOffice) | ✅ | — |
 | Highlights, comments, annotations | ✅ | — |
 | Keyword / full-text search (SQLite FTS5 + trigram, BM25) | ✅ | — |
 | Heuristic document outline | ✅ | — |
@@ -611,6 +639,12 @@ extracts via `msiexec /a`). The backend probes for `soffice.exe` at
 `<process.resourcesPath>/libreoffice/program/soffice.exe` first, with a
 dev-fallback to the repo-root `vendor/` copy.
 
+LibreOffice has no HWPX import filter, so an `.hwpx` is parsed in-process
+(`backend/src/lib/hwpx/`), rebuilt as a DOCX, and only then handed to the
+same conversion path. The parser caps decompressed XML and image sizes
+while inflating — not from the sizes the archive declares — so a crafted
+zip cannot expand into memory.
+
 Conversions are wrapped with:
 - A 60-second timeout (kills the soffice child if exceeded).
 - A 200 MB output cap (rejects any conversion that produces a runaway
@@ -703,7 +737,7 @@ never as path components.
 └── files/                   app-level generated/downloadable files
 
 <project folder>/
-├── original matter files     PDFs/DOCX/TXT/etc. owned by the project
+├── original matter files     PDFs/DOCX/HWPX/TXT/etc. owned by the project
 ├── .docket/
 │   ├── project.db           SQLite — project documents, chats, reviews,
 │   │                        source folder metadata, index metadata, …
@@ -921,6 +955,7 @@ docket-desktop/
 | OCR          | Apple Vision (macOS) + local PP-OCR models through ONNX Runtime |
 | LLM          | `@anthropic-ai/sdk`, `@google/generative-ai`                  |
 | DOCX→PDF     | LibreOffice 25.8.6 bundled via `libreoffice-convert`          |
+| HWPX         | In-process OWPML parser (`jszip` + `fast-xml-parser`), DOCX bridge via `docx` |
 | Packaging    | electron-builder + NSIS (Windows) / DMG + ZIP (macOS)         |
 | Dev tooling  | concurrently, wait-on, cross-env, tsx, electron-rebuild       |
 
@@ -956,6 +991,12 @@ Current highlights:
   skew, language mix, and source contrast. Search remains available
   when individual regions are imperfect, but important quoted text
   should still be checked against the displayed scan.
+- **HWPX rendering fidelity**: the preview is LibreOffice's rendering of
+  a rebuilt DOCX, so layout is approximate, and when a document's Hancom
+  fonts are not installed, font substitution can occasionally leave a
+  run undrawn. The text is still in the PDF's text layer and in
+  extracted text, so search, citations, and chat are unaffected. Legacy
+  binary `.hwp` is not supported.
 - **Next.js 16.0.3 has a security advisory (CVE-2025-66478)**. Bumping
   to the latest 16.x patch is on the to-do list. Lower urgency for
   this loopback-only deployment but worth tracking.
