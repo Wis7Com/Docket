@@ -44,6 +44,9 @@ async function main() {
   const outlinePdfB64 = defaultSessionCheck
     ? ""
     : Buffer.from(await buildOutlineFixturePdfBytes()).toString("base64");
+  const hwpxB64 = defaultSessionCheck
+    ? ""
+    : (await buildHwpxFixtureBytes()).toString("base64");
   await startFakeOpenAiServer();
   frontendPort = await getFreePort();
   frontendUrl = `http://127.0.0.1:${frontendPort}`;
@@ -57,6 +60,8 @@ async function main() {
         DOCKET_SESSION_CHECK_PROJECT_PATH: projectRoot,
         DOCKET_SESSION_CHECK_PROMPT_SOURCE_DIR: promptSourceRoot,
         DOCKET_SESSION_CHECK_OUTLINE_PDF_B64: outlinePdfB64,
+        DOCKET_SESSION_CHECK_HWPX_B64: hwpxB64,
+        DOCKET_SESSION_CHECK_HWPX_TEXT: HWPX_FIXTURE_TEXT,
       };
 
   const proc = spawn(electron, [path.join(root, "dist-electron", "main.js")], {
@@ -71,7 +76,11 @@ async function main() {
         ? {}
         : { DOCKET_SESSION_CHECK_EXPECT_PROJECT_PATH: projectRoot }),
       ...sessionEnv,
-      DOCKET_SKIP_LIBREOFFICE_PROBE: "1",
+      // Off by default so the smoke never depends on a LibreOffice install.
+      // DOCKET_SESSION_CHECK_USE_LIBREOFFICE=1 exercises the real PDF
+      // rendition path (DOCX/HWPX → PDF) on machines that have one.
+      DOCKET_SKIP_LIBREOFFICE_PROBE:
+        process.env.DOCKET_SESSION_CHECK_USE_LIBREOFFICE === "1" ? "0" : "1",
       DOCKET_FRONTEND_PORT: String(frontendPort),
       DOCKET_FRONTEND_URL: frontendUrl,
       DOCKET_DEBUG_INSERT_DELAY_MS:
@@ -268,6 +277,26 @@ async function buildOutlineFixturePdfBytes() {
   }
   const bytes = await pdf.save();
   return bytes;
+}
+
+const HWPX_FIXTURE_TEXT = "한글 문서 세션 점검용 본문";
+
+// Smallest package the HWPX reader accepts: a mimetype entry plus one body
+// section. No header.xml, so the text renders with default formatting.
+async function buildHwpxFixtureBytes() {
+  const JSZip = require(path.join(root, "backend", "node_modules", "jszip"));
+  const ns =
+    'xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" ' +
+    'xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section"';
+  const zip = new JSZip();
+  zip.file("mimetype", "application/hwp+zip");
+  zip.file(
+    "Contents/section0.xml",
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><hs:sec ${ns}>` +
+      `<hp:p id="0" paraPrIDRef="0" styleIDRef="0"><hp:run charPrIDRef="0">` +
+      `<hp:t>${HWPX_FIXTURE_TEXT}</hp:t></hp:run></hp:p></hs:sec>`,
+  );
+  return zip.generateAsync({ type: "nodebuffer" });
 }
 
 async function writePromptSourceFolder(rootDir) {

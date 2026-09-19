@@ -17,7 +17,8 @@ import {
   type PartyRole,
 } from "../documentClassification";
 import { classifyDocumentCoverWithLlm } from "../documentClassification.llm";
-import { isImageDocumentType } from "../documentTypes";
+import { isImageDocumentType, usesPdfRendition } from "../documentTypes";
+import { extractHwpxText } from "../hwpx";
 import {
   buildChunkSearchText,
   buildPlainTextLines,
@@ -53,7 +54,7 @@ type VersionRow = {
 };
 
 /**
- * DOCX/DOC index from their PDF rendition (when one exists) so chunks carry the
+ * DOCX/DOC/HWPX index from their PDF rendition (when one exists) so chunks carry the
  * same `[Page N]` pagination the viewer shows. Everything else indexes its own
  * bytes. Falling back to the raw file keeps documents indexable when LibreOffice
  * was unavailable at import time.
@@ -63,7 +64,7 @@ export function resolveIndexSource(
   version: { storage_path: string; pdf_storage_path: string | null },
 ): { storagePath: string; indexFileType: string } {
   const ft = (fileType ?? "").toLowerCase();
-  if ((ft === "docx" || ft === "doc") && version.pdf_storage_path) {
+  if (usesPdfRendition(ft) && version.pdf_storage_path) {
     return { storagePath: version.pdf_storage_path, indexFileType: "pdf" };
   }
   return { storagePath: version.storage_path, indexFileType: ft };
@@ -241,6 +242,8 @@ export async function extractStructuredTextFromBytes(
     const mammoth = await import("mammoth");
     const result = await mammoth.extractRawText({ buffer: Buffer.from(raw) });
     text = normalizeIndexText(result.value);
+  } else if (fileType === "hwpx") {
+    text = normalizeIndexText(await extractHwpxText(Buffer.from(raw)));
   }
   const lines = buildPlainTextLines(text);
   return { text, lines, sections: detectDocumentSections(text, lines) };

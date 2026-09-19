@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { X, Upload } from "lucide-react";
+import { newVersionAccept } from "@/app/lib/documentTypes";
 import { listDocumentVersions } from "@/app/lib/docketApi";
 import type { DocketDocument } from "./types";
 
@@ -52,7 +53,7 @@ export function UploadNewVersionModal({ open, onClose, doc, onSubmit }: Props) {
 
     if (!open || !doc) return null;
 
-    const accept = doc.file_type === "pdf" ? ".pdf" : ".docx,.doc";
+    const accept = newVersionAccept(doc.file_type);
 
     function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
         const file = e.target.files?.[0] ?? null;

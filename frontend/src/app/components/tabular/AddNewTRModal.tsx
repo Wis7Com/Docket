@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, Loader2, Upload, X } from "lucide-react";
+import { UPLOAD_ACCEPT } from "@/app/lib/documentTypes";
 import type { DocketDocument, DocketProject, DocketWorkflow } from "../shared/types";
 import {
     getProject,
@@ -485,7 +486,7 @@ export function AddNewTRModal({
                             <input
                                 ref={fileInputRef}
                                 type="file"
-                                accept=".pdf,.docx,.doc,.txt,.png,.jpg,.jpeg,.tiff,.bmp,.webp"
+                                accept={UPLOAD_ACCEPT}
                                 multiple
                                 className="hidden"
                                 onChange={handleUpload}

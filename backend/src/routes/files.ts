@@ -16,6 +16,7 @@ const EXT_CONTENT_TYPE: Record<string, string> = {
   ".docx":
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   ".doc": "application/msword",
+  ".hwpx": "application/hwp+zip",
   ".txt": "text/plain; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
   ".json": "application/json",

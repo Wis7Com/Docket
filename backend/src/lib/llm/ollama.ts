@@ -38,10 +38,16 @@ type OllamaChatStreamChunk = OllamaChatResponse & {
 
 const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
 const OLLAMA_RESPONSE_START_TIMEOUT_ENV = "OLLAMA_RESPONSE_START_TIMEOUT_MS";
-// Measured against gemma4:12b on Korean/English legal text: ~1.9-2.0 chars per
-// token (delta method, prompt_eval_count). 2.5 over-fills batches for CJK-heavy
-// input; 1.9 keeps a small safety margin. Override with OLLAMA_CHARS_PER_TOKEN.
-const DEFAULT_OLLAMA_CHARS_PER_TOKEN = 1.9;
+// Sizes summary batches and picks the num_ctx bucket, so it has to be a lower
+// bound across models and languages, not an average. Measured by delta method
+// on prompt_eval_count: dense Korean legal text is 1.61 chars/token on
+// nemotron-3.5-lightning and 1.65 on gemma4:26b-a4b, below the ~1.9-2.0 that
+// gemma4:12b showed on mixed Korean/English. At 1.9 the resulting batch
+// overflows its own window, and Ollama's context shift discards the oldest half
+// silently rather than erroring — the model then summarizes a document whose
+// opening it never saw. 1.5 keeps a margin under the densest measurement.
+// Override with OLLAMA_CHARS_PER_TOKEN.
+const DEFAULT_OLLAMA_CHARS_PER_TOKEN = 1.5;
 const DEFAULT_OLLAMA_MAX_NUM_CTX = 16_384;
 const DEFAULT_OLLAMA_NUM_PREDICT = 1_024;
 const OLLAMA_CONTEXT_SAFETY_OVERHEAD = 768;

@@ -9,7 +9,8 @@ import {
   attachLatestVersionNumbers,
 } from "../lib/documentVersions";
 import { storageKey, uploadFile } from "../lib/storage";
-import { docxToPdf, convertedPdfKey } from "../lib/convert";
+import { renderPdfRendition, convertedPdfKey } from "../lib/convert";
+import { extractHwpxText, hwpxUploadProblem } from "../lib/hwpx";
 import { checkProjectAccess } from "../lib/access";
 import { singleFileUpload } from "../lib/upload";
 import {
@@ -45,9 +46,11 @@ import {
 import { getAppDb, runWithDatabaseContext } from "../db/sqlite";
 import {
   IMAGE_DOCUMENT_TYPES,
+  PDF_RENDITION_TYPES,
   isAllowedDocumentType,
   isImageDocumentType,
   mimeTypeForDocumentType,
+  usesPdfRendition,
 } from "../lib/documentTypes";
 import {
   briefSequenceNullableSchema,
@@ -72,8 +75,7 @@ const embeddingModelOverrideSchema = z.object({
 });
 const ALLOWED_TYPES = new Set([
   "pdf",
-  "docx",
-  "doc",
+  ...PDF_RENDITION_TYPES,
   "txt",
   "md",
   ...IMAGE_DOCUMENT_TYPES,
@@ -1234,8 +1236,11 @@ export async function handleDocumentUpload(
     : "";
   if (!isAllowedDocumentType(suffix) || !ALLOWED_TYPES.has(suffix))
     return void res.status(400).json({
-      detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc, txt, md, ${IMAGE_DOCUMENT_TYPES.join(", ")}`,
+      detail: `Unsupported file type: ${suffix}. Allowed: ${[...ALLOWED_TYPES].join(", ")}`,
     });
+
+  const hwpxProblem = await hwpxUploadProblem(suffix, file.buffer);
+  if (hwpxProblem) return void res.status(400).json({ detail: hwpxProblem });
 
   const content = file.buffer;
   if (projectId) {
@@ -1318,9 +1323,9 @@ export async function handleDocumentUpload(
 
     // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;
-    if (suffix === "docx" || suffix === "doc") {
+    if (usesPdfRendition(suffix)) {
       try {
-        const pdfBuf = await docxToPdf(content);
+        const pdfBuf = await renderPdfRendition(content, suffix);
         const pdfKey = convertedPdfKey(userId, docId);
         await uploadFile(
           pdfKey,
@@ -1333,7 +1338,7 @@ export async function handleDocumentUpload(
         pdfStoragePath = pdfKey;
       } catch (err) {
         console.error(
-          `[upload] DOCX→PDF conversion failed for ${filename}:`,
+          `[upload] ${suffix.toUpperCase()}→PDF conversion failed for ${filename}:`,
           err,
         );
       }
@@ -1453,11 +1458,15 @@ async function extractStructureTree(
         children: [],
       }));
     } else {
-      const mammoth = await import("mammoth");
-      const result = await mammoth.extractRawText({
-        buffer: Buffer.from(content),
-      });
-      const lines = result.value.split("\n").filter((l) => l.trim());
+      const rawText =
+        fileType === "hwpx"
+          ? await extractHwpxText(Buffer.from(content))
+          : (
+              await (
+                await import("mammoth")
+              ).extractRawText({ buffer: Buffer.from(content) })
+            ).value;
+      const lines = rawText.split("\n").filter((l) => l.trim());
       const nodes = lines.slice(0, 30).map((line, i) => ({
         id: `h1-${i}`,
         title: line.slice(0, 100),

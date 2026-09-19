@@ -23,6 +23,7 @@ import {
     Upload,
     X,
 } from "lucide-react";
+import { UPLOAD_ACCEPT } from "@/app/lib/documentTypes";
 import {
     deleteDocument,
     getChat,
@@ -165,6 +166,9 @@ function AssistantSearchDocIcon({ fileType }: { fileType: string | null }) {
     }
     if (fileType === "docx" || fileType === "doc") {
         return <File className="h-4 w-4 shrink-0 text-blue-600" />;
+    }
+    if (fileType === "hwpx") {
+        return <File className="h-4 w-4 shrink-0 text-sky-600" />;
     }
     if (fileType === "md" || fileType === "txt") {
         return <FileText className="h-4 w-4 shrink-0 text-emerald-600" />;
@@ -1547,7 +1551,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                     <input
                                         ref={fileInputRef}
                                         type="file"
-                                        accept=".pdf,.docx,.doc,.txt,.png,.jpg,.jpeg,.tiff,.bmp,.webp"
+                                        accept={UPLOAD_ACCEPT}
                                         multiple
                                         className="hidden"
                                         onChange={(e) =>
@@ -1636,6 +1640,7 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                         <option value="pdf">PDF</option>
                                         <option value="docx">DOCX</option>
                                         <option value="doc">DOC</option>
+                                        <option value="hwpx">HWPX</option>
                                         <option value="txt">TXT</option>
                                         <option value="md">MD</option>
                                     </select>
@@ -1983,7 +1988,9 @@ export default function ProjectAssistantChatPage({ params }: Props) {
                                             ? "text-red-500"
                                             : ext === "doc" || ext === "docx"
                                               ? "text-blue-500"
-                                              : "text-gray-400";
+                                              : ext === "hwpx"
+                                                ? "text-sky-500"
+                                                : "text-gray-400";
                                     // Pull the doc's latest_version_number out
                                     // of the project state so the tab shows V#
                                     // whenever the doc has been edited.

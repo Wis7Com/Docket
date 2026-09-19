@@ -2,10 +2,10 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import type { createServerSupabase } from "./supabase";
-import { docxToPdf } from "./convert";
+import { renderPdfRendition } from "./convert";
 import { enqueueDocumentIndex } from "./indexing/indexer";
 import { linkedSourceKey, uploadFile } from "./storage";
-import { isAllowedDocumentType } from "./documentTypes";
+import { isAllowedDocumentType, usesPdfRendition } from "./documentTypes";
 import {
   inferBriefSequence,
   inferDocRole,
@@ -103,11 +103,11 @@ async function buildPdfRendition(args: {
   versionNumber: number;
 }): Promise<string | null> {
   if (args.fileType === "pdf") return args.storageKey;
-  if (args.fileType !== "docx" && args.fileType !== "doc") return null;
+  if (!usesPdfRendition(args.fileType)) return null;
 
   try {
     const buf = fs.readFileSync(args.realFile);
-    const pdfBuf = await docxToPdf(buf);
+    const pdfBuf = await renderPdfRendition(buf, args.fileType);
     const pdfKey = `converted-pdfs/${args.userId}/${args.documentId}/source-v${args.versionNumber}.pdf`;
     await uploadFile(
       pdfKey,
@@ -120,7 +120,7 @@ async function buildPdfRendition(args: {
     return pdfKey;
   } catch (err) {
     console.warn(
-      `[source-folder] DOCX/DOC PDF rendition failed for ${args.relativePath}:`,
+      `[source-folder] PDF rendition failed for ${args.relativePath}:`,
       err,
     );
     return null;

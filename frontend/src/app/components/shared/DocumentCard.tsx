@@ -17,6 +17,9 @@ function FileIcon({ fileType }: { fileType: string | null }) {
   if (fileType === "docx" || fileType === "doc") {
     return <File className="h-4 w-4 text-blue-600 shrink-0" />;
   }
+  if (fileType === "hwpx") {
+    return <File className="h-4 w-4 text-sky-600 shrink-0" />;
+  }
   return <File className="h-4 w-4 text-gray-500 shrink-0" />;
 }
 

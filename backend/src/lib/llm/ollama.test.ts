@@ -151,8 +151,12 @@ test("resolveOllamaNumCtx buckets estimates, clamps max context, and honors over
       4_096,
     );
     assert.equal(
-      resolveOllamaNumCtx({ promptChars: 10_000, maxTokens: 1_536 }),
+      resolveOllamaNumCtx({ promptChars: 5_000, maxTokens: 1_536 }),
       8_192,
+    );
+    assert.equal(
+      resolveOllamaNumCtx({ promptChars: 10_000, maxTokens: 1_536 }),
+      16_384,
     );
     assert.equal(
       resolveOllamaNumCtx({ promptChars: 20_000, maxTokens: 1_536 }),

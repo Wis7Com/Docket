@@ -163,7 +163,7 @@ async function startServer(): Promise<void> {
     console.log(
       p.available
         ? `[startup] LibreOffice detected: ${p.version}`
-        : "[startup] LibreOffice not detected (DOC/DOCX → PDF rendition disabled)",
+        : "[startup] LibreOffice not detected (DOC/DOCX/HWPX → PDF rendition disabled)",
     );
   });
 

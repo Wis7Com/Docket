@@ -8,6 +8,7 @@ import {
     Loader2Icon,
     FolderOpen,
 } from "lucide-react";
+import { UPLOAD_ACCEPT } from "@/app/lib/documentTypes";
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -65,7 +66,7 @@ export function AddDocButton({
             <input
                 ref={fileInputRef}
                 type="file"
-                accept=".pdf,.docx,.doc,.txt,.png,.jpg,.jpeg,.tiff,.bmp,.webp"
+                accept={UPLOAD_ACCEPT}
                 multiple
                 className="hidden"
                 onChange={handleUpload}

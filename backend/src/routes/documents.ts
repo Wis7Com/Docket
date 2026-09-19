@@ -22,7 +22,13 @@ import {
   uploadFile,
   versionStorageKey,
 } from "../lib/storage";
-import { docxToPdf, convertedPdfKey } from "../lib/convert";
+import { renderPdfRendition, convertedPdfKey } from "../lib/convert";
+import {
+  extractHwpxText,
+  HwpxError,
+  hwpxToDocx,
+  hwpxUploadProblem,
+} from "../lib/hwpx";
 import {
   extractTrackedChangeIds,
   resolveTrackedChange,
@@ -56,9 +62,11 @@ import { getUserModelSettings } from "../lib/userSettings";
 import { resolveModel } from "../lib/llm";
 import {
   IMAGE_DOCUMENT_TYPES,
+  PDF_RENDITION_TYPES,
   isAllowedDocumentType,
   isImageDocumentType,
   mimeTypeForDocumentType,
+  usesPdfRendition,
 } from "../lib/documentTypes";
 import { findMatchingOcrRegions } from "../lib/ocr/ocrRegions";
 import {
@@ -70,8 +78,7 @@ import {
 export const documentsRouter = Router();
 const ALLOWED_TYPES = new Set([
   "pdf",
-  "docx",
-  "doc",
+  ...PDF_RENDITION_TYPES,
   "txt",
   "md",
   ...IMAGE_DOCUMENT_TYPES,
@@ -216,9 +223,9 @@ documentsRouter.get("/:documentId/display", requireAuth, async (req, res) => {
     return void res.status(404).json({ detail: "No file available" });
 
   const fileType = (doc.file_type as string) ?? "";
-  const isDocx = fileType === "docx" || fileType === "doc";
+  const isDocx = usesPdfRendition(fileType);
 
-  // For DOCX, prefer the per-version PDF rendition if one exists.
+  // For DOCX/DOC/HWPX, prefer the per-version PDF rendition if one exists.
   const servePath =
     isDocx && active.pdf_storage_path
       ? active.pdf_storage_path
@@ -279,7 +286,8 @@ documentsRouter.get("/:documentId/display", requireAuth, async (req, res) => {
     );
     res.send(Buffer.from(raw));
   } else {
-    // Fallback: serve raw DOCX (mammoth will handle it client-side)
+    // Fallback: no PDF rendition. The client only reads the content type
+    // here, then loads /docx — which also converts HWPX — into docx-preview.
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -509,6 +517,9 @@ documentsRouter.get("/:documentId/url", requireAuth, async (req, res) => {
 // specific tracked-changes version. Unlike /url, this bypasses R2 (avoids
 // the browser CORS problem on signed URLs) so the frontend docx-preview
 // viewer can load tracked-change documents directly.
+//
+// An HWPX has no .docx bytes of its own; it is converted on the fly so the
+// same viewer still works when there is no PDF rendition (LibreOffice absent).
 documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
@@ -519,7 +530,7 @@ documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
 
   const { data: doc, error } = await db
     .from("documents")
-    .select("id, filename, user_id, project_id")
+    .select("id, filename, file_type, user_id, project_id")
     .eq("id", documentId)
     .single();
   if (error || !doc)
@@ -538,22 +549,41 @@ documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
       .status(404)
       .json({ detail: "Document bytes not available" });
 
+  const isHwpx =
+    ((doc.file_type as string | null) ?? "").toLowerCase() === "hwpx";
+  let docxBytes: Buffer;
+  try {
+    docxBytes = isHwpx
+      ? await hwpxToDocx(Buffer.from(raw))
+      : Buffer.from(raw);
+  } catch (err) {
+    console.error(`[docx] HWPX conversion failed for ${doc.filename}:`, err);
+    return void res.status(422).json({
+      detail:
+        err instanceof HwpxError
+          ? err.message
+          : "This HWPX file could not be converted for display.",
+    });
+  }
+
   res.setHeader(
     "Content-Type",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+  const downloadName = resolveDownloadFilename(
+    doc.filename as string,
+    active.display_name,
+    active.version_number,
   );
   res.setHeader(
     "Content-Disposition",
     buildContentDisposition(
       "inline",
-      resolveDownloadFilename(
-        doc.filename as string,
-        active.display_name,
-        active.version_number,
-      ),
+      // The bytes are a DOCX even when the document is an HWPX.
+      isHwpx ? downloadName.replace(/\.hwpx$/i, ".docx") : downloadName,
     ),
   );
-  res.send(Buffer.from(raw));
+  res.send(docxBytes);
 });
 
 // GET /single-documents/:documentId/annotations
@@ -1864,6 +1894,9 @@ documentsRouter.post(
           detail: `Uploaded file type (${suffix}) does not match document type (${doc.file_type}).`,
         });
       }
+      const hwpxProblem = await hwpxUploadProblem(suffix, file.buffer);
+      if (hwpxProblem)
+        return void res.status(400).json({ detail: hwpxProblem });
 
       // Peg the new version into a predictable /versions/:id path under the
       // existing document folder so ops can spot the history in storage.
@@ -1895,9 +1928,9 @@ documentsRouter.post(
       // historical versions without on-demand conversion. Same logic as the
       // initial-upload pipeline; failures don't block the version row.
       let pdfStoragePath: string | null = null;
-      if (suffix === "docx" || suffix === "doc") {
+      if (usesPdfRendition(suffix)) {
         try {
-          const pdfBuf = await docxToPdf(file.buffer);
+          const pdfBuf = await renderPdfRendition(file.buffer, suffix);
           const pdfKey = `converted-pdfs/${userId}/${documentId}/${versionSlug}.pdf`;
           await uploadFile(
             pdfKey,
@@ -1910,7 +1943,7 @@ documentsRouter.post(
           pdfStoragePath = pdfKey;
         } catch (err) {
           console.error(
-            `[versions/upload] DOCX→PDF conversion failed for ${file.originalname}:`,
+            `[versions/upload] ${suffix.toUpperCase()}→PDF conversion failed for ${file.originalname}:`,
             err,
           );
         }
@@ -2327,8 +2360,11 @@ async function handleDocumentUpload(
     : "";
   if (!isAllowedDocumentType(suffix) || !ALLOWED_TYPES.has(suffix))
     return void res.status(400).json({
-      detail: `Unsupported file type: ${suffix}. Allowed: pdf, docx, doc, txt, md, ${IMAGE_DOCUMENT_TYPES.join(", ")}`,
+      detail: `Unsupported file type: ${suffix}. Allowed: ${[...ALLOWED_TYPES].join(", ")}`,
     });
+
+  const hwpxProblem = await hwpxUploadProblem(suffix, file.buffer);
+  if (hwpxProblem) return void res.status(400).json({ detail: hwpxProblem });
 
   const content = file.buffer;
   const roleGuess = inferDocRole({ filename });
@@ -2393,9 +2429,9 @@ async function handleDocumentUpload(
 
     // Convert DOCX/DOC → PDF for display. PDFs are their own rendition.
     let pdfStoragePath: string | null = null;
-    if (suffix === "docx" || suffix === "doc") {
+    if (usesPdfRendition(suffix)) {
       try {
-        const pdfBuf = await docxToPdf(content);
+        const pdfBuf = await renderPdfRendition(content, suffix);
         const pdfKey = convertedPdfKey(userId, docId);
         await uploadFile(
           pdfKey,
@@ -2408,7 +2444,7 @@ async function handleDocumentUpload(
         pdfStoragePath = pdfKey;
       } catch (err) {
         console.error(
-          `[upload] DOCX→PDF conversion failed for ${filename}:`,
+          `[upload] ${suffix.toUpperCase()}→PDF conversion failed for ${filename}:`,
           err,
         );
       }
@@ -2525,11 +2561,15 @@ async function extractStructureTree(
         children: [],
       }));
     } else {
-      const mammoth = await import("mammoth");
-      const result = await mammoth.extractRawText({
-        buffer: Buffer.from(content),
-      });
-      const lines = result.value.split("\n").filter((l) => l.trim());
+      const rawText =
+        fileType === "hwpx"
+          ? await extractHwpxText(Buffer.from(content))
+          : (
+              await (
+                await import("mammoth")
+              ).extractRawText({ buffer: Buffer.from(content) })
+            ).value;
+      const lines = rawText.split("\n").filter((l) => l.trim());
       const nodes = lines.slice(0, 30).map((line, i) => ({
         id: `h1-${i}`,
         title: line.slice(0, 100),

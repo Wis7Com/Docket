@@ -182,6 +182,8 @@ function DocIcon({ fileType }: { fileType: string | null }) {
     return <FileText className="h-4 w-4 text-red-600 shrink-0" />;
   if (fileType === "docx" || fileType === "doc")
     return <File className="h-4 w-4 text-blue-600 shrink-0" />;
+  if (fileType === "hwpx")
+    return <File className="h-4 w-4 text-sky-600 shrink-0" />;
   if (fileType === "md" || fileType === "txt")
     return <FileText className="h-4 w-4 text-emerald-600 shrink-0" />;
   return <File className="h-4 w-4 text-gray-500 shrink-0" />;
@@ -3256,6 +3258,7 @@ export function ProjectPage({ projectId }: Props) {
               <option value="pdf">PDF</option>
               <option value="docx">DOCX</option>
               <option value="doc">DOC</option>
+              <option value="hwpx">HWPX</option>
               <option value="txt">TXT</option>
               <option value="md">MD</option>
             </select>

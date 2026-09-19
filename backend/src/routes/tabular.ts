@@ -4,6 +4,7 @@ import { createServerSupabase } from "../lib/supabase";
 import { downloadFile } from "../lib/storage";
 import { loadActiveVersion } from "../lib/documentVersions";
 import { normalizeDocxZipPaths } from "../lib/convert";
+import { extractHwpxText } from "../lib/hwpx";
 import {
     runLLMStream,
     TABULAR_TOOLS,
@@ -646,10 +647,10 @@ tabularRouter.post(
             const buf = await downloadFile(docActive.storage_path);
             if (buf) {
                 try {
-                    markdown =
-                        (doc.file_type as string) === "pdf"
-                            ? await extractPdfMarkdown(buf)
-                            : await extractDocxMarkdown(buf);
+                    markdown = await extractDocumentMarkdown(
+                        buf,
+                        doc.file_type as string,
+                    );
                 } catch (err) {
                     console.error(
                         `[regenerate-cell] extraction error doc=${document_id}`,
@@ -774,10 +775,10 @@ tabularRouter.post("/:reviewId/generate", requireAuth, async (req, res) => {
                     const buf = await downloadFile(active.storage_path);
                     if (buf) {
                         try {
-                            markdown =
-                                (doc.file_type as string) === "pdf"
-                                    ? await extractPdfMarkdown(buf)
-                                    : await extractDocxMarkdown(buf);
+                            markdown = await extractDocumentMarkdown(
+                                buf,
+                                doc.file_type as string,
+                            );
                         } catch (err) {
                             console.error(
                                 `[tabular/generate] extraction error doc=${docId}`,
@@ -1572,6 +1573,20 @@ Rules:
 
     if (contentBuffer.trim()) pending.push(processLine(contentBuffer));
     await Promise.all(pending);
+}
+
+async function extractDocumentMarkdown(
+    buf: ArrayBuffer,
+    fileType: string | null,
+): Promise<string> {
+    switch ((fileType ?? "").toLowerCase()) {
+        case "pdf":
+            return extractPdfMarkdown(buf);
+        case "hwpx":
+            return extractHwpxText(Buffer.from(buf));
+        default:
+            return extractDocxMarkdown(buf);
+    }
 }
 
 async function extractPdfMarkdown(buf: ArrayBuffer): Promise<string> {

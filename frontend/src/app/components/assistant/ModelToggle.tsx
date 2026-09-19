@@ -51,6 +51,21 @@ export const MODELS: ModelOption[] = [
     group: "Local",
   },
   {
+    id: "ollama:nemotron-3.5-lightning:30b-a3b-q4_K_M",
+    label: "Ollama Nemotron 3.5 30B",
+    group: "Local",
+  },
+  {
+    id: "ollama:qwen3.5:35b",
+    label: "Ollama Qwen3.5 35B MoE",
+    group: "Local",
+  },
+  {
+    id: "ollama:qwen3.6:35b",
+    label: "Ollama Qwen3.6 35B MoE",
+    group: "Local",
+  },
+  {
     id: "mlx:mlx-community/gemma-4-26b-a4b-it-4bit",
     label: "MLX Gemma 4 26B",
     group: "Local",

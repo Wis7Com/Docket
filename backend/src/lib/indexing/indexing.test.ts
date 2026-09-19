@@ -6,7 +6,12 @@ import * as os from "os";
 import * as path from "path";
 import { closeDb, getDb, runWithDatabaseContext } from "../../db/sqlite";
 import { runMigrations } from "../../db/migrate";
-import { chunkTextForIndex, resolveIndexSource } from "./extractors";
+import {
+  chunkTextForIndex,
+  extractStructuredTextFromBytes,
+  resolveIndexSource,
+} from "./extractors";
+import { buildHwpxFixture } from "../hwpx/testFixture";
 import {
   setEmbeddingAdapterOverrideForTests,
   vectorToBlob,
@@ -1101,4 +1106,34 @@ test("searchProjectIndex normalizes English possessives without matching the str
   assert.equal(results[0].basic_match, false);
   assert.match(results[0].snippet, /\[\[HL\]\]judge\[\[\/HL\]\]'s/i);
   assert.match(results[0].snippet, /\[\[HL\]\]discretion\[\[\/HL\]\]/i);
+});
+
+test("resolveIndexSource prefers the PDF rendition for HWPX", () => {
+  assert.deepEqual(
+    resolveIndexSource("hwpx", {
+      storage_path: "docs/a.hwpx",
+      pdf_storage_path: "converted-pdfs/a.pdf",
+    }),
+    { storagePath: "converted-pdfs/a.pdf", indexFileType: "pdf" },
+  );
+  assert.deepEqual(
+    resolveIndexSource("hwpx", {
+      storage_path: "docs/a.hwpx",
+      pdf_storage_path: null,
+    }),
+    { storagePath: "docs/a.hwpx", indexFileType: "hwpx" },
+  );
+});
+
+test("HWPX without a rendition still indexes from its own bytes", async () => {
+  const fixture = await buildHwpxFixture();
+  const raw = fixture.buffer.slice(
+    fixture.byteOffset,
+    fixture.byteOffset + fixture.byteLength,
+  ) as ArrayBuffer;
+  const structured = await extractStructuredTextFromBytes(raw, "hwpx");
+  assert.match(structured.text, /손해배상 청구의 소/);
+  const chunks = chunkTextForIndex(structured.text, structured.sections);
+  assert.ok(chunks.length > 0);
+  assert.ok(chunks.some((chunk) => chunk.content.includes("대법원 2020다12345")));
 });

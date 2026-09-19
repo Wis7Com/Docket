@@ -441,7 +441,7 @@ registry/profile/session state, delete Electron's `userData` directory.
   (Ollama or any OpenAI-compatible server such as LM Studio) or with
   cloud Anthropic Claude / Google Gemini models — with conversation
   history, tool use, and reasoning streams either way.
-- **Document workflows**: upload PDF, DOCX, DOC, TXT, PNG, JPG/JPEG,
+- **Document workflows**: upload PDF, DOCX, DOC, HWPX, TXT, PNG, JPG/JPEG,
   TIFF, BMP, and WebP files; the
   assistant can read, edit, and produce annotated revisions of them
   with track-changes-style UI.
@@ -481,7 +481,7 @@ keep the CPU-only rows entirely local.
 | Feature | CPU only | Local LLM or API needed |
 |---|:---:|---|
 | Projects, folders, per-project organisation | ✅ | — |
-| Document upload & viewing (PDF, DOCX, DOC, TXT, PNG/JPEG, TIFF, BMP, WebP) | ✅ | — |
+| Document upload & viewing (PDF, DOCX, DOC, HWPX, TXT, PNG/JPEG, TIFF, BMP, WebP) | ✅ | — |
 | Local OCR for scanned PDFs and images | ✅ | — |
 | DOCX/DOC → PDF conversion (bundled LibreOffice) | ✅ | — |
 | Highlights, comments, annotations | ✅ | — |
@@ -876,6 +876,7 @@ docket-desktop/
 │   │   │   ├── storage.ts       local-FS storage with realpath traversal guard
 │   │   │   ├── upload.ts        multer wrapper (100 MB cap)
 │   │   │   ├── convert.ts       LibreOffice DOCX→PDF (60s timeout, 200 MB cap)
+│   │   │   ├── hwpx/            HWPX (Hancom) reader: text extraction + DOCX bridge
 │   │   │   ├── downloadTokens.ts HMAC-signed download URLs
 │   │   │   ├── safeSpawn.ts     env-scrubbed child spawn helper
 │   │   │   ├── libreofficeStatus.ts  bundled-soffice probe

@@ -107,7 +107,7 @@ function requireSofficePath(): string {
   const found = sofficePath();
   if (found) return found;
   throw new Error(
-    "LibreOffice was not found, so DOC/DOCX→PDF conversion is unavailable. " +
+    "LibreOffice was not found, so DOC/DOCX/HWPX→PDF conversion is unavailable. " +
       "Install LibreOffice and retry — Settings › System reports what the app detects.",
   );
 }
@@ -156,6 +156,37 @@ export async function docxToPdf(buffer: Buffer): Promise<Buffer> {
   const next = convertChain.then(run, run);
   convertChain = next.catch(() => undefined);
   return next;
+}
+
+/**
+ * LibreOffice has no HWPX import filter ("source file could not be loaded"),
+ * so an HWPX is first rebuilt as a DOCX from its parsed content and that is
+ * what gets rendered. Layout is approximate; text, tables, and images carry.
+ */
+export async function hwpxToPdf(buffer: Buffer): Promise<Buffer> {
+  // Fail before parsing when there is nothing to render with.
+  requireSofficePath();
+  const { hwpxToDocx } = await import("./hwpx");
+  return docxToPdf(await hwpxToDocx(buffer));
+}
+
+/**
+ * PDF rendition for any type in PDF_RENDITION_TYPES. Callers gate on
+ * usesPdfRendition(); an unsupported type here is a programming error.
+ */
+export async function renderPdfRendition(
+  buffer: Buffer,
+  fileType: string,
+): Promise<Buffer> {
+  switch (fileType.toLowerCase()) {
+    case "docx":
+    case "doc":
+      return docxToPdf(buffer);
+    case "hwpx":
+      return hwpxToPdf(buffer);
+    default:
+      throw new Error(`No PDF rendition is defined for .${fileType} files`);
+  }
 }
 
 export function convertedPdfKey(userId: string, docId: string): string {

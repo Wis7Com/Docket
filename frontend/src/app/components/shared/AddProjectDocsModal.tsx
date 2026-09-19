@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, Loader2, Search, Upload, X } from "lucide-react";
+import { UPLOAD_ACCEPT } from "@/app/lib/documentTypes";
 import { getProject, uploadProjectDocument } from "@/app/lib/docketApi";
 import type { DocketDocument } from "./types";
 import { DocFileIcon } from "./FileDirectory";
@@ -253,7 +254,7 @@ export function AddProjectDocsModal({
                         <input
                             ref={fileInputRef}
                             type="file"
-                            accept=".pdf,.docx,.doc,.txt,.png,.jpg,.jpeg,.tiff,.bmp,.webp"
+                            accept={UPLOAD_ACCEPT}
                             multiple
                             className="hidden"
                             onChange={handleUpload}

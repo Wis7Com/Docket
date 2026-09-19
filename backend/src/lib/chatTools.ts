@@ -561,7 +561,7 @@ export const PROJECT_EXTRA_TOOLS = [
                         type: "array",
                         items: { type: "string" },
                         description:
-                            "Optional file type filters such as ['pdf', 'docx', 'txt', 'md'].",
+                            "Optional file type filters such as ['pdf', 'docx', 'hwpx', 'txt', 'md'].",
                     },
                     folder_id: {
                         type: "string",
@@ -2085,6 +2085,12 @@ async function readDocumentContent(
                     `[read_document] docx mammoth fallback length=${text.length} for filename="${docInfo.filename}"`,
                 );
             }
+        } else if (docInfo.file_type === "hwpx") {
+            const { extractHwpxText } = await import("./hwpx");
+            text = await extractHwpxText(Buffer.from(raw));
+            console.log(
+                `[read_document] hwpx extracted length=${text.length} for filename="${docInfo.filename}"`,
+            );
         } else {
             console.log(
                 `[read_document] unknown file_type="${docInfo.file_type}" for filename="${docInfo.filename}", trying mammoth`,

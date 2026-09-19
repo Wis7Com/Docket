@@ -13,6 +13,7 @@ function contentTypeFor(filename: string): string {
     if (lower.endsWith(".docx"))
         return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
     if (lower.endsWith(".pdf")) return "application/pdf";
+    if (lower.endsWith(".hwpx")) return "application/hwp+zip";
     if (lower.endsWith(".xlsx"))
         return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
     return "application/octet-stream";

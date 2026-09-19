@@ -7,10 +7,15 @@ export const IMAGE_DOCUMENT_TYPES = [
   "webp",
 ] as const;
 
+/**
+ * Office formats the viewer can't draw itself. They are converted to a PDF
+ * rendition at import time, and that PDF is what gets displayed and indexed.
+ */
+export const PDF_RENDITION_TYPES = ["docx", "doc", "hwpx"] as const;
+
 const DOCUMENT_TYPES = [
   "pdf",
-  "docx",
-  "doc",
+  ...PDF_RENDITION_TYPES,
   "txt",
   "md",
   ...IMAGE_DOCUMENT_TYPES,
@@ -18,6 +23,12 @@ const DOCUMENT_TYPES = [
 
 export function isImageDocumentType(value: string): boolean {
   return (IMAGE_DOCUMENT_TYPES as readonly string[]).includes(
+    value.toLowerCase(),
+  );
+}
+
+export function usesPdfRendition(value: string): boolean {
+  return (PDF_RENDITION_TYPES as readonly string[]).includes(
     value.toLowerCase(),
   );
 }
@@ -36,6 +47,8 @@ export function mimeTypeForDocumentType(value: string): string {
       return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
     case "doc":
       return "application/msword";
+    case "hwpx":
+      return "application/hwp+zip";
     case "txt":
       return "text/plain";
     case "md":

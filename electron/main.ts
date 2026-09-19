@@ -714,6 +714,12 @@ async function runSessionFeatureSmoke(
       `[session-check] pdf outline generation complete: items=${pdfOutlineInspection.itemCount} before=${pdfOutlineInspection.beforeScrollTop} after=${pdfOutlineInspection.afterScrollTop}`,
     );
   }
+  const hwpxInspection = await inspectHwpxUploadDom(w, port, result.projectId);
+  if (hwpxInspection) {
+    console.log(
+      `[session-check] hwpx complete: file_type=${hwpxInspection.fileType} rendition=${hwpxInspection.rendition}`,
+    );
+  }
   const citationChatId = seedSessionCitationChat({
     projectId: result.projectId,
     docId: result.docId,
@@ -1474,6 +1480,94 @@ async function inspectProjectMarkdownNavigationDom(
     collapsed: boolean;
     reopened: boolean;
   }>;
+}
+
+/**
+ * Uploads an HWPX and opens it in the viewer. With LibreOffice available the
+ * viewer gets a PDF rendition; without it (the smoke default) the backend
+ * converts to DOCX on the fly and docx-preview draws it. Either way the
+ * document's own text has to end up on screen.
+ */
+async function inspectHwpxUploadDom(
+  w: BrowserWindow,
+  port: number,
+  projectId: string,
+): Promise<{ fileType: string; rendition: "pdf" | "docx" } | null> {
+  const hwpxB64 = process.env.DOCKET_SESSION_CHECK_HWPX_B64;
+  const expectedText = process.env.DOCKET_SESSION_CHECK_HWPX_TEXT;
+  if (!hwpxB64 || !expectedText) return null;
+
+  const uploaded = (await w.webContents.executeJavaScript(
+    `
+      (async () => {
+        const token = await window.docket?.getToken?.();
+        if (!token) throw new Error("session smoke token missing before HWPX upload");
+        const base = "http://localhost:${port}";
+        const headers = { Authorization: "Bearer " + token };
+        const bin = atob(${JSON.stringify(hwpxB64)});
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const form = new FormData();
+        form.append("file", new File([bytes], "session-fixture.hwpx", { type: "application/hwp+zip" }));
+        const response = await fetch(base + "/projects/" + ${JSON.stringify(projectId)} + "/documents", {
+          method: "POST",
+          headers,
+          body: form,
+        });
+        if (!response.ok) {
+          throw new Error("HWPX upload failed: " + response.status + " " + await response.text());
+        }
+        const doc = await response.json();
+        if (!doc?.id) throw new Error("HWPX upload did not return a document id");
+        if (doc.file_type !== "hwpx") {
+          throw new Error("HWPX upload stored file_type=" + doc.file_type);
+        }
+        const display = await fetch(base + "/single-documents/" + doc.id + "/display", { headers });
+        if (!display.ok) throw new Error("HWPX display failed: " + display.status);
+        const contentType = display.headers.get("content-type") || "";
+        await display.arrayBuffer();
+        return {
+          docId: doc.id,
+          fileType: doc.file_type,
+          rendition: contentType.includes("application/pdf") ? "pdf" : "docx",
+        };
+      })()
+    `,
+    true,
+  )) as { docId: string; fileType: string; rendition: "pdf" | "docx" };
+
+  await w.loadURL(
+    `${FRONTEND_URL}/document-viewer?document_id=${encodeURIComponent(uploaded.docId)}&filename=session-fixture.hwpx`,
+  );
+  await w.webContents.executeJavaScript(
+    `
+      (async () => {
+        const expected = ${JSON.stringify(expectedText)};
+        const selector = ${JSON.stringify(
+          uploaded.rendition === "pdf"
+            ? '[data-session-check="doc-view"]'
+            : ".docx-view-container",
+        )};
+        const compact = (value) => (value || "").replace(/\\s+/g, "");
+        const deadline = Date.now() + 60000;
+        while (Date.now() < deadline) {
+          const viewer = document.querySelector(selector);
+          if (viewer && compact(viewer.textContent).includes(compact(expected))) return true;
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        throw new Error(
+          "HWPX text never appeared in " + selector + ": " +
+            JSON.stringify({
+              url: location.href,
+              found: Boolean(document.querySelector(selector)),
+              body: document.body.innerText.slice(0, 300),
+            }),
+        );
+      })()
+    `,
+    true,
+  );
+  return { fileType: uploaded.fileType, rendition: uploaded.rendition };
 }
 
 async function inspectPdfOutlineGenerationDom(

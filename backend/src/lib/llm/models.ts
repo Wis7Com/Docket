@@ -27,6 +27,18 @@ export const OLLAMA_MAIN_MODELS = [
   "ollama:gemma4:26b-a4b-it-q4_K_M",
   "ollama:gemma4:26b-claude-32k",
   "ollama:gemma4:26b-claude-64k",
+  // Long-document lane: Mamba-2 hybrid MoE (32.9B total / 3B active). Holds
+  // prefill far better than Gemma as input grows, but scores lower on quality
+  // benchmarks — prefer it for long input with mechanical output.
+  "ollama:nemotron-3.5-lightning:30b-a3b-q4_K_M",
+  // Strongest local lane on quality benchmarks, and the default citation-repair
+  // model. 36B MoE, 262K context, vision-capable.
+  "ollama:qwen3.5:35b",
+  // Structured-extraction lane. Same 36B MoE shape and speed as Qwen3.5, same
+  // accuracy ceiling, but it budgets reasoning differently: ~0.6x the tokens on
+  // schema-constrained JSON and ~5x on code generation. Prefer it for
+  // extraction, Qwen3.5 for anything code-shaped.
+  "ollama:qwen3.6:35b",
 ] as const;
 export const OPENAI_COMPATIBLE_MAIN_MODELS = [
   "openai:gpt-4o-mini",

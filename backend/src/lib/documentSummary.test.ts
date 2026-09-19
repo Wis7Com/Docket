@@ -29,11 +29,11 @@ test("summary batch bounds derive Ollama capacity without changing other provide
     delete process.env.OLLAMA_CHARS_PER_TOKEN;
     assert.deepEqual(
       defaultDocumentSummaryBatchBounds("ollama:gemma4:12b-mlx"),
-      { maxBatchCharacters: 24_806, maxBatchPages: 15 },
+      { maxBatchCharacters: 19_584, maxBatchPages: 12 },
     );
     assert.deepEqual(
       defaultDocumentSummaryBatchBounds("ollama:gemma4:26b-claude-32k"),
-      { maxBatchCharacters: 24_806, maxBatchPages: 15 },
+      { maxBatchCharacters: 19_584, maxBatchPages: 12 },
     );
     assert.deepEqual(defaultDocumentSummaryBatchBounds("mlx:local-model"), {
       maxBatchCharacters: 26_000,
@@ -43,7 +43,7 @@ test("summary batch bounds derive Ollama capacity without changing other provide
     process.env.OLLAMA_MAX_NUM_CTX = "32768";
     assert.deepEqual(
       defaultDocumentSummaryBatchBounds("ollama:gemma4:12b-mlx"),
-      { maxBatchCharacters: 55_936, maxBatchPages: 34 },
+      { maxBatchCharacters: 44_160, maxBatchPages: 27 },
     );
     assert.deepEqual(defaultDocumentSummaryBatchBounds("mlx:local-model"), {
       maxBatchCharacters: 26_000,
@@ -53,13 +53,13 @@ test("summary batch bounds derive Ollama capacity without changing other provide
     process.env.OLLAMA_MAX_NUM_CTX = "65536";
     assert.deepEqual(
       defaultDocumentSummaryBatchBounds("ollama:gemma4:12b-mlx"),
-      { maxBatchCharacters: 55_936, maxBatchPages: 34 },
+      { maxBatchCharacters: 44_160, maxBatchPages: 27 },
     );
 
     process.env.OLLAMA_NUM_CTX = "8192";
     assert.deepEqual(
       defaultDocumentSummaryBatchBounds("ollama:gemma4:12b-mlx"),
-      { maxBatchCharacters: 9_241, maxBatchPages: 5 },
+      { maxBatchCharacters: 7_296, maxBatchPages: 4 },
     );
     assert.deepEqual(
       defaultDocumentSummaryBatchBounds("free-router:free-router/best"),
