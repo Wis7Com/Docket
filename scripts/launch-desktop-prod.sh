@@ -44,7 +44,9 @@ if [[ -f "$PID_FILE" ]]; then
     if [[ "$previous_command" == *"$ROOT/scripts/launch-desktop-dev.sh"* ]] ||
        [[ "$previous_command" == *"$ROOT/scripts/launch-desktop-prod.sh"* ]]; then
       kill -TERM "$previous_pid" 2>/dev/null || true
-      for _ in {1..50}; do
+      # Longer than cleanup's own wait below, so the old Electron has released
+      # its single-instance lock before ours starts.
+      for _ in {1..100}; do
         kill -0 "$previous_pid" 2>/dev/null || break
         sleep 0.1
       done
@@ -52,13 +54,40 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 fi
 
+# Every pid under $1, deepest first.
+descendants() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    descendants "$child"
+    echo "$child"
+  done
+}
+
+build_pid=""
 frontend_pid=""
 electron_pid=""
 cleanup() {
-  for pid in "$electron_pid" "$frontend_pid"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
+  # Signal whole trees, not just the pids we started: `npm run` does not pass
+  # SIGTERM down its `sh -c` chain, so killing only the npm pid left Electron
+  # running with its frontend gone. The next launch's Electron then lost the
+  # single-instance lock and quit at once, and the orphan's window came back
+  # blank. Collect before signalling — reparented children are unreachable
+  # through pgrep -P afterwards.
+  local pids=() pid
+  for pid in "$electron_pid" "$frontend_pid" "$build_pid"; do
+    [[ -n "$pid" ]] || continue
+    pids+=($(descendants "$pid") "$pid")
+  done
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for _ in {1..50}; do
+    local alive=0
+    for pid in ${pids[@]+"${pids[@]}"}; do
+      kill -0 "$pid" 2>/dev/null && alive=1 && break
+    done
+    (( alive )) || break
+    sleep 0.1
   done
   if [[ -f "$PID_FILE" ]] && [[ "$(cat "$PID_FILE" 2>/dev/null || true)" == "$$" ]]; then
     rm -f "$PID_FILE"
@@ -106,7 +135,13 @@ fi
 if (( needs_build )); then
   printf '[%s] Frontend changed since last build — rebuilding (this takes a minute or two)\n' \
     "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
-  npm run build:frontend >> "$LOG_FILE" 2>&1
+  # In the background so a TERM from the next launch runs cleanup now: bash
+  # defers traps until a foreground child exits, and a build left running
+  # holds Next's build lock against the new launch's own build.
+  npm run build:frontend >> "$LOG_FILE" 2>&1 &
+  build_pid="$!"
+  wait "$build_pid"
+  build_pid=""
   touch "$STAMP"
 fi
 

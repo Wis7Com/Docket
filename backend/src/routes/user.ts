@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { z } from "zod";
 import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
 import { enqueueEmptyPdfIndexes } from "../lib/indexing/indexer";
@@ -7,6 +8,7 @@ import {
   projectContextFor,
 } from "../lib/projectRegistry";
 import { runWithDatabaseContext } from "../db/sqlite";
+import { RERANK_DEPTH_CHOICES, getRerankStatus } from "../lib/indexing/rerank";
 
 export const userRouter = Router();
 
@@ -77,8 +79,54 @@ const ALLOWED_FIELDS = new Set([
   "ocr_max_pages_per_doc",
   "ocr_gpu_endpoint",
   "ocr_external_provider",
+  "reranker_enabled",
+  "reranker_depth",
+  "reranker_base_url",
+  "reranker_model_path",
   "message_credits_used",
 ]);
+
+// NULL means "use the default", so every reranker field accepts null. Checked
+// here rather than in SQL so a bad value never reaches the profile row.
+const RERANKER_SCHEMAS: Record<string, z.ZodType<unknown>> = {
+  reranker_enabled: z
+    .union(
+      [z.boolean().transform((v) => (v ? 1 : 0)), z.literal(0), z.literal(1)],
+      {
+        error: "must be true, false, 0, 1 or null",
+      },
+    )
+    .nullable(),
+  reranker_depth: z
+    .union(
+      [
+        z.literal(RERANK_DEPTH_CHOICES[0]),
+        z.literal(RERANK_DEPTH_CHOICES[1]),
+        z.literal(RERANK_DEPTH_CHOICES[2]),
+      ],
+      { error: `must be one of ${RERANK_DEPTH_CHOICES.join(", ")} or null` },
+    )
+    .nullable(),
+  reranker_base_url: z
+    .string({ error: "must be a string or null" })
+    .trim()
+    .regex(/^https?:\/\/\S+$/i, "must be an http:// or https:// URL")
+    .nullable(),
+  reranker_model_path: z
+    .string({ error: "must be a string or null" })
+    .trim()
+    .refine(
+      (v) => v.startsWith("/") || v === "~" || v.startsWith("~/"),
+      "must be an absolute path or start with ~/",
+    )
+    .nullable(),
+};
+
+// Whitespace-only text means "clear", same as the empty string the generic
+// handler already maps to null.
+function blankToNull(value: unknown): unknown {
+  return typeof value === "string" && value.trim() === "" ? null : value;
+}
 
 userRouter.patch("/profile", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
@@ -89,6 +137,15 @@ userRouter.patch("/profile", requireAuth, async (req, res) => {
   }
   if (Object.keys(update).length === 0) {
     return void res.status(400).json({ detail: "No allowed fields in body" });
+  }
+  for (const [field, schema] of Object.entries(RERANKER_SCHEMAS)) {
+    if (!Object.hasOwn(update, field)) continue;
+    const parsed = schema.safeParse(blankToNull(update[field]));
+    if (!parsed.success) {
+      const reason = parsed.error.issues[0]?.message ?? "invalid value";
+      return void res.status(400).json({ detail: `${field}: ${reason}` });
+    }
+    update[field] = parsed.data;
   }
   update.updated_at = new Date().toISOString();
 
@@ -138,6 +195,13 @@ userRouter.patch("/profile", requireAuth, async (req, res) => {
     }
   }
   res.json(data);
+});
+
+// GET /user/reranker/status — what the Models page shows: whether the reranker
+// would run right now and, if not, which piece is missing.
+userRouter.get("/reranker/status", requireAuth, (_req, res) => {
+  const userId = res.locals.userId as string;
+  res.json(getRerankStatus(userId));
 });
 
 // DELETE /user/account — local "delete account" reduces to clearing the

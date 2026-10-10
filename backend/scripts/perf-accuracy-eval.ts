@@ -55,11 +55,13 @@ const VALUE_OPTIONS = new Set([
   "--output-dir",
   "--top-k",
 ]);
-const FLAG_OPTIONS = new Set(["--live", "--help"]);
+const FLAG_OPTIONS = new Set(["--live", "--help", "--rerank"]);
 
 type CliOptions = {
   live: boolean;
   help: boolean;
+  /** Route each query through searchProjectIndex({ rerank: true }). */
+  rerank: boolean;
   evalsetPath?: string;
   projectPath?: string;
   appDataPath?: string;
@@ -107,6 +109,7 @@ function parseCli(argv: readonly string[]): CliOptions {
   return {
     live: flags.has("--live"),
     help: flags.has("--help"),
+    rerank: flags.has("--rerank"),
     evalsetPath: values.get("--evalset"),
     projectPath: values.get("--project-path"),
     appDataPath: values.get("--app-data-path"),
@@ -125,8 +128,10 @@ function usage(): string {
     "Live retrieval evaluation:",
     "  APP_DATA_PATH=/path/to/app-data node --import tsx scripts/perf-accuracy-eval.ts \\",
     "    --live --evalset /path/to/evalset.json --project-path /path/to/project \\",
-    "    [--top-k 8] [--output-dir /path/to/results]",
+    "    [--top-k 8] [--rerank] [--output-dir /path/to/results]",
     "",
+    "--rerank routes each query through searchProjectIndex({ rerank: true }); it",
+    "only takes effect when the reranker is enabled and reachable.",
     "Use --app-data-path instead of APP_DATA_PATH when preferred. JSON and",
     "Markdown report files are created only with an explicit --output-dir.",
   ].join("\n");
@@ -337,6 +342,7 @@ async function runLive(options: CliOptions): Promise<void> {
           query: qa.question,
           limit: options.topK,
           includeNeighbors: false,
+          rerank: options.rerank,
         });
         const wallTimeMs = performance.now() - started;
         qaResults.push({

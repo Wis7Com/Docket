@@ -108,7 +108,10 @@ export type SearchResult = {
     | "semantic"
     | "filename"
     | "basic"
+    | "rerank"
   )[];
+  /** Cross-encoder relevance when the row went through the reranker. */
+  rerank_score?: number | null;
   grouped_chunk_count?: number;
   basic_match: boolean;
 };

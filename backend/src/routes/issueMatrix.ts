@@ -618,6 +618,7 @@ issueMatrixRouter.post("/:matrixId/generate", requireAuth, async (req, res) => {
             limit: 10,
             documentIds: side.doc_ids,
             docRoles: ["brief"],
+            rerank: true,
           });
           if (!hits.length)
             throw new Error(

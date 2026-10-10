@@ -22,6 +22,7 @@ import {
   OLLAMA_EMBEDDING_MODEL_OPTIONS,
   isOllamaEmbeddingPreset,
 } from "@/app/lib/embeddingModels";
+import { RerankerSection } from "./RerankerSection";
 
 export default function ModelsAndApiKeysPage() {
   const {
@@ -30,6 +31,7 @@ export default function ModelsAndApiKeysPage() {
     updateApiKey,
     updateOpenAICompatibleBaseUrl,
     updateEmbeddingSettings,
+    updateRerankerSettings,
   } = useUserProfile();
 
   return (
@@ -66,6 +68,8 @@ export default function ModelsAndApiKeysPage() {
         profile={profile}
         onSave={updateEmbeddingSettings}
       />
+
+      <RerankerSection profile={profile} onSave={updateRerankerSettings} />
 
       {/* API Keys */}
       <div className="py-6">

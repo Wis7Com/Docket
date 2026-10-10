@@ -614,6 +614,9 @@ projectsRouter.get("/:projectId/search", requireAuth, async (req, res) => {
       ? req.query.folder_id.trim()
       : null;
   const group = req.query.group === "documents" ? "documents" : "chunks";
+  // Reranking follows the user's setting unless the caller opts out with
+  // rerank=0 (used by the search box when it wants the instant hybrid order).
+  const rerank = !(req.query.rerank === "0" || req.query.rerank === "false");
   if (!q.trim()) return void res.status(400).json({ detail: "q is required" });
 
   const db = createServerSupabase();
@@ -630,6 +633,7 @@ projectsRouter.get("/:projectId/search", requireAuth, async (req, res) => {
     fileTypes,
     folderId,
     group,
+    rerank,
   });
 
   res.json({

@@ -38,6 +38,11 @@ interface UserProfile {
   chatFullReadMaxTextBytes: number;
   chatFetchMaxDocs: number;
   chatFetchMaxTextBytes: number;
+  // null means "use the default" (on when the model is installed, depth 30).
+  rerankerEnabled: boolean | null;
+  rerankerDepth: number | null;
+  rerankerBaseUrl: string | null;
+  rerankerModelPath: string | null;
 }
 
 interface UserProfileContextType {
@@ -78,6 +83,17 @@ interface UserProfileContextType {
       >
     >,
   ) => Promise<boolean>;
+  updateRerankerSettings: (
+    update: Partial<
+      Pick<
+        UserProfile,
+        | "rerankerEnabled"
+        | "rerankerDepth"
+        | "rerankerBaseUrl"
+        | "rerankerModelPath"
+      >
+    >,
+  ) => Promise<boolean>;
   reloadProfile: () => Promise<void>;
 }
 
@@ -115,6 +131,10 @@ interface ServerProfile {
   chat_full_read_max_text_bytes: number | null;
   chat_fetch_max_docs: number | null;
   chat_fetch_max_text_bytes: number | null;
+  reranker_enabled: number | boolean | null;
+  reranker_depth: number | null;
+  reranker_base_url: string | null;
+  reranker_model_path: string | null;
 }
 
 function toClientProfile(p: ServerProfile | null): UserProfile {
@@ -145,6 +165,11 @@ function toClientProfile(p: ServerProfile | null): UserProfile {
     chatFullReadMaxTextBytes: p?.chat_full_read_max_text_bytes ?? 300000,
     chatFetchMaxDocs: p?.chat_fetch_max_docs ?? 3,
     chatFetchMaxTextBytes: p?.chat_fetch_max_text_bytes ?? 300000,
+    rerankerEnabled:
+      p?.reranker_enabled == null ? null : Boolean(p.reranker_enabled),
+    rerankerDepth: p?.reranker_depth ?? null,
+    rerankerBaseUrl: p?.reranker_base_url ?? null,
+    rerankerModelPath: p?.reranker_model_path ?? null,
   };
 }
 
@@ -332,6 +357,35 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
     [],
   );
 
+  const updateRerankerSettings = useCallback(
+    async (
+      update: Parameters<UserProfileContextType["updateRerankerSettings"]>[0],
+    ): Promise<boolean> => {
+      // Unlike the embedding settings, null is meaningful here ("use the
+      // default"), so a key that is present is always sent, null included.
+      const serverUpdate: Partial<ServerProfile> = {};
+      if ("rerankerEnabled" in update)
+        serverUpdate.reranker_enabled =
+          update.rerankerEnabled == null
+            ? null
+            : update.rerankerEnabled
+              ? 1
+              : 0;
+      if ("rerankerDepth" in update)
+        serverUpdate.reranker_depth = update.rerankerDepth ?? null;
+      if ("rerankerBaseUrl" in update)
+        serverUpdate.reranker_base_url = update.rerankerBaseUrl?.trim() || null;
+      if ("rerankerModelPath" in update)
+        serverUpdate.reranker_model_path =
+          update.rerankerModelPath?.trim() || null;
+      const updated = await patchProfile(serverUpdate);
+      if (!updated) return false;
+      setProfile(toClientProfile(updated));
+      return true;
+    },
+    [],
+  );
+
   const reloadProfile = useCallback(async () => {
     await loadProfile();
   }, [loadProfile]);
@@ -347,6 +401,7 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
         updateApiKey,
         updateOpenAICompatibleBaseUrl,
         updateEmbeddingSettings,
+        updateRerankerSettings,
         reloadProfile,
       }}
     >

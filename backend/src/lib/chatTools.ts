@@ -4102,6 +4102,10 @@ export async function runToolCalls(
                     partyRoles,
                     partySides,
                     group: groupByDocument ? "documents" : "chunks",
+                    // Honoured only when the user's reranker is available.
+                    // Citation rebinding (further down) deliberately stays
+                    // on the plain hybrid ranking.
+                    rerank: true,
                 })
             ).map((result) => {
                 const docId =

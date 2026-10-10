@@ -43,7 +43,14 @@ cp "$ICON" "$DESKTOP_APP/Contents/Resources/docket-local.icns"
 /usr/libexec/PlistBuddy -c 'Delete :CFBundleIconName' "$DESKTOP_APP/Contents/Info.plist" 2>/dev/null || true
 
 xattr -cr "$DESKTOP_APP" 2>/dev/null || true
-/usr/bin/SetFile -a E "$DESKTOP_APP" 2>/dev/null || true
+# osacompile signs the applet ad hoc, and the Info.plist/icon edits above
+# invalidate that seal. macOS 26 still ran such a bundle; macOS 27 starts it
+# but the launcher's process tree dies silently partway through the frontend
+# build, so every launch that needs a rebuild never opens a window. Re-seal
+# after the last bundle edit, and add no xattrs afterwards: `SetFile -a E`
+# used to hide the extension here, but its FinderInfo xattr on the bundle
+# root fails strict verification, and Finder hides `.app` anyway.
+codesign --force --sign - "$DESKTOP_APP"
 touch "$DESKTOP_APP"
 qlmanage -r cache >/dev/null 2>&1 || true
 "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister" \

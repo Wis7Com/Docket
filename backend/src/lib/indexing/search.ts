@@ -12,6 +12,7 @@ import {
   resolveProjectEmbeddingSettings,
 } from "./embeddings";
 import { DOC_ROLES, PARTY_ROLES } from "../documentClassification";
+import { rerankResults, resolveRerankSettings } from "./rerank";
 
 function normalizeQuery(query: string): string {
   return query.normalize("NFC").trim().replace(/\s+/g, " ");
@@ -266,6 +267,12 @@ export async function searchProjectIndex(args: {
   partyRoles?: string[];
   partySides?: string[];
   group?: "chunks" | "documents";
+  /**
+   * Opt in to cross-encoder reranking of the fused candidates. Honoured only
+   * when the calling user's reranker is enabled and reachable; otherwise the
+   * result is byte-for-byte the plain hybrid ranking.
+   */
+  rerank?: boolean;
 }): Promise<SearchResult[]> {
   const query = normalizeQuery(args.query);
   if (!query) return [];
@@ -274,10 +281,17 @@ export async function searchProjectIndex(args: {
     1,
     Math.min(args.limit ?? RETRIEVAL_TOP_K, PROJECT_SEARCH_MAX_RESULTS),
   );
+  const rerankSettings = args.rerank
+    ? resolveRerankSettings(args.userId)
+    : null;
+  const rerankDepth = rerankSettings?.enabled ? rerankSettings.depth : 0;
+  // Reranking only helps if the right passage is somewhere in the pool:
+  // widen every channel to cover the rerank depth, not just the final limit.
+  const poolLimit = Math.max(limit, rerankDepth);
   const db = getDb();
   const ftsQuery = toFtsQuery(query);
   const terms = queryTerms(query);
-  const candidateLimit = candidateLimitForResultLimit(limit);
+  const candidateLimit = candidateLimitForResultLimit(poolLimit);
   const fileTypes = (args.fileTypes ?? [])
     .map((type) => type.trim().toLowerCase())
     .filter((type) => /^[a-z0-9]+$/.test(type));
@@ -466,8 +480,21 @@ export async function searchProjectIndex(args: {
   candidates.push(...semanticCandidates);
 
   let rows = mergeCandidates(candidates, query, terms);
+  let reranked = false;
+  if (rerankSettings && rerankDepth > 0 && rows.length > 0) {
+    const outcome = await rerankResults(query, rows, {
+      depth: rerankDepth,
+      settings: rerankSettings,
+    });
+    rows = outcome.rows;
+    reranked = outcome.reranked;
+  }
   if (args.group === "documents") {
-    rows = aggregateDocumentResults(rows).slice(0, limit);
+    rows = (
+      reranked
+        ? aggregateDocumentResultsInOrder(rows)
+        : aggregateDocumentResults(rows)
+    ).slice(0, limit);
   } else {
     rows = rows.slice(0, limit);
   }
@@ -855,6 +882,30 @@ function aggregateDocumentResults(rows: SearchResult[]): SearchResult[] {
       };
     })
     .sort((a, b) => (b.rank_score ?? 0) - (a.rank_score ?? 0));
+}
+
+/**
+ * Document grouping for reranked rows. The reranker's order is the signal, so
+ * each document takes the position of its best-ranked chunk and no
+ * chunk-count bonus is applied (that bonus re-sorts by RRF score, which would
+ * undo the reranking).
+ */
+function aggregateDocumentResultsInOrder(rows: SearchResult[]): SearchResult[] {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    counts.set(row.document_id, (counts.get(row.document_id) ?? 0) + 1);
+  }
+  const seen = new Set<string>();
+  const out: SearchResult[] = [];
+  for (const row of rows) {
+    if (seen.has(row.document_id)) continue;
+    seen.add(row.document_id);
+    out.push({
+      ...row,
+      grouped_chunk_count: counts.get(row.document_id) ?? 1,
+    });
+  }
+  return out;
 }
 
 function withNeighborChunks(

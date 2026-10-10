@@ -255,10 +255,35 @@ export interface ProjectSearchResult {
   lexical_score?: number | null;
   semantic_score?: number | null;
   match_reasons?: (
-    "exact" | "keyword" | "substring" | "semantic" | "filename" | "basic"
+    | "exact"
+    | "keyword"
+    | "substring"
+    | "semantic"
+    | "filename"
+    | "basic"
+    | "rerank"
   )[];
+  rerank_score?: number | null;
   grouped_chunk_count?: number;
   basic_match: boolean;
+}
+
+export interface RerankerStatus {
+  enabled: boolean;
+  preference: boolean | null;
+  depth: number;
+  binary: "found" | "missing" | "not_needed";
+  model: "found" | "missing" | "not_needed";
+  server: "running" | "starting" | "stopped" | "disabled" | "external";
+  base_url: string | null;
+  model_path: string | null;
+  binary_path: string | null;
+  idle_seconds: number;
+  last_error: string | null;
+}
+
+export async function getRerankerStatus(): Promise<RerankerStatus> {
+  return apiRequest<RerankerStatus>("/user/reranker/status");
 }
 
 export async function getProjectIndexStatus(
